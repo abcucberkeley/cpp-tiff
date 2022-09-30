@@ -2,12 +2,18 @@
 #include <stdint.h>
 #include <math.h>
 #include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <limits.h>
+
 #include "tiffio.h"
 #include "omp.h"
 #include "mex.h"
 //mex -v COPTIMFLAGS="-O3 -DNDEBUG" CFLAGS='$CFLAGS -O3 -fopenmp' LDFLAGS='$LDFLAGS -O3 -fopenmp' '-I/global/home/groups/software/sl-7.x86_64/modules/libtiff/4.1.0/libtiff/' '-L/global/home/groups/software/sl-7.x86_64/modules/libtiff/4.1.0/libtiff/' -ltiff parallelReadTiff.c
 //mex COMPFLAGS='$COMPFLAGS /openmp' '-IC:\Program Files (x86)\tiff\include\' '-LC:\Program Files (x86)\tiff\lib\' -ltiffd.lib C:\Users\Matt\Documents\parallelTiff\main.cpp
 
+//libtiff 4.4.0
+//mex -v COPTIMFLAGS="-O3 -DNDEBUG" CFLAGS='$CFLAGS -O3 -fopenmp' LDFLAGS='$LDFLAGS -O3 -fopenmp' '-I/clusterfs/fiona/matthewmueller/software/tiff-4.4.0/include' '-L/clusterfs/fiona/matthewmueller/software/tiff-4.4.0/lib' -ltiff parallelReadTiff.c
 
 void DummyHandler(const char* module, const char* fmt, va_list ap)
 {
@@ -352,6 +358,109 @@ void readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileName
     }
 }
 
+// Reading images saved by ImageJ
+void readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint8_t flipXY){
+	#ifdef __linux__
+	int fd = open(fileName,O_RDONLY);
+	#endif
+	#ifdef _WIN32
+	int fd = open(fileName,O_RDONLY | O_BINARY);
+	#endif
+	TIFF* tif = TIFFOpen(fileName, "r");
+	uint64_t offset = 0;
+	uint64_t* offsets = NULL;
+	TIFFGetField(tif, TIFFTAG_STRIPOFFSETS, &offsets);
+	if(offsets) offset = offsets[0];
+
+	TIFFClose(tif);
+	lseek(fd, offset, SEEK_SET);
+	uint64_t bytes = bits/8;
+	//#pragma omp parallel for
+	/*
+	   for(uint64_t i = 0; i < z; i++){
+	   uint64_t cOffset = x*y*bytes*i;
+	//pread(fd,tiff+cOffset,x*y*bytes,offset+cOffset);
+	read(fd,tiff+cOffset,x*y*bytes);
+	}*/
+	uint64_t chunk = 0;
+	uint64_t tBytes = x*y*z*bytes;
+	uint64_t bytesRead;
+	uint64_t rBytes = tBytes;
+	if(tBytes < INT_MAX) bytesRead = read(fd,tiff,tBytes);
+	else{
+		while(chunk < tBytes){
+			rBytes = tBytes-chunk;
+			if(rBytes > INT_MAX) bytesRead = read(fd,tiff+chunk,INT_MAX);
+			else bytesRead = read(fd,tiff+chunk,rBytes);
+			chunk += bytesRead;
+		}
+	}
+	close(fd);
+	// Swap endianess for types greater than 8 bits
+	// TODO: May need to change later because we may not always need to swap
+	if(bits > 8){
+	#pragma omp parallel for
+		for(uint64_t i = 0; i < x*y*z; i++){
+			switch(bits){
+				case 16:
+					//((uint16_t*)tiff)[i] = ((((uint16_t*)tiff)[i] & 0xff) >> 8) | (((uint16_t*)tiff)[i] << 8);
+					//((uint16_t*)tiff)[i] = bswap_16(((uint16_t*)tiff)[i]);
+					((uint16_t*)tiff)[i] = ((((uint16_t*)tiff)[i] << 8) & 0xff00) | ((((uint16_t*)tiff)[i] >> 8) & 0x00ff);
+					break;
+				case 32:
+					//((num & 0xff000000) >> 24) | ((num & 0x00ff0000) >> 8) | ((num & 0x0000ff00) << 8) | (num << 24)
+					//((float*)tiff)[i] = bswap_32(((float*)tiff)[i]);
+					((uint32_t*)tiff)[i] = ((((uint32_t*)tiff)[i] << 24) & 0xff000000 ) |
+						((((uint32_t*)tiff)[i] <<  8) & 0x00ff0000 ) |
+						((((uint32_t*)tiff)[i] >>  8) & 0x0000ff00 ) |
+						((((uint32_t*)tiff)[i] >> 24) & 0x000000ff );
+					break;
+				case 64:
+					//((double*)tiff)[i] = bswap_64(((double*)tiff)[i]);
+					((uint64_t*)tiff)[i] = ( (((uint64_t*)tiff)[i] << 56) & 0xff00000000000000UL ) |
+						( (((uint64_t*)tiff)[i] << 40) & 0x00ff000000000000UL ) |
+						( (((uint64_t*)tiff)[i] << 24) & 0x0000ff0000000000UL ) |
+						( (((uint64_t*)tiff)[i] <<  8) & 0x000000ff00000000UL ) |
+						( (((uint64_t*)tiff)[i] >>  8) & 0x00000000ff000000UL ) |
+						( (((uint64_t*)tiff)[i] >> 24) & 0x0000000000ff0000UL ) |
+						( (((uint64_t*)tiff)[i] >> 40) & 0x000000000000ff00UL ) |
+						( (((uint64_t*)tiff)[i] >> 56) & 0x00000000000000ffUL );
+					break;
+			}
+
+		}
+	}
+}
+
+uint8_t isImageJIm(const char* fileName){
+	TIFF* tif = TIFFOpen(fileName, "r");
+	if(!tif) return 0;
+	char* tiffDesc = NULL;
+	if(TIFFGetField(tif, TIFFTAG_IMAGEDESCRIPTION, &tiffDesc)){
+		if(strstr(tiffDesc, "ImageJ")){
+			return 1;
+		}
+	}
+	return 0;
+}
+
+uint64_t imageJImGetZ(const char* fileName){
+	TIFF* tif = TIFFOpen(fileName, "r");
+	if(!tif) return 0;
+	char* tiffDesc = NULL;
+	if(TIFFGetField(tif, TIFFTAG_IMAGEDESCRIPTION, &tiffDesc)){
+		if(strstr(tiffDesc, "ImageJ")){
+			char* nZ = strstr(tiffDesc,"images=");
+			if(nZ){
+				nZ+=7;
+				char* temp;
+				return strtol(nZ,&temp,10);
+			}
+		}
+	}
+	return 0;
+}
+
 void mexFunction(int nlhs, mxArray *plhs[],
                  int nrhs, const mxArray *prhs[])
 {
@@ -412,15 +521,49 @@ void mexFunction(int nlhs, mxArray *plhs[],
     uint64_t stripSize = 1;
     TIFFGetField(tif, TIFFTAG_ROWSPERSTRIP, &stripSize);
     TIFFClose(tif);
+
+    uint8_t imageJIm = 0;
+	if(isImageJIm(fileName)){
+		imageJIm = 1;
+		uint64_t tempZ = imageJImGetZ(fileName);
+		if(tempZ) z = tempZ;
+	}
+
     uint64_t dim[3];
     dim[0] = y;
     dim[1] = x;
     dim[2] = z;
 
-    
+	
 
+    // Case for ImageJ
+	if(imageJIm){
+		if(bits == 8){
+            plhs[0] = mxCreateNumericArray(3,dim,mxUINT8_CLASS, mxREAL);
+            uint8_t* tiff = (uint8_t*)mxGetPr(plhs[0]);
+            readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+        }
+		else if(bits == 16){
+            plhs[0] = mxCreateNumericArray(3,dim,mxUINT16_CLASS, mxREAL);
+            uint16_t* tiff = (uint16_t*)mxGetPr(plhs[0]);
+            readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+		}
+		else if(bits == 32){
+            plhs[0] = mxCreateNumericArray(3,dim,mxSINGLE_CLASS, mxREAL);
+            float* tiff = (float*)mxGetPr(plhs[0]);
+            readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+		}
+		else if(bits == 64){
+            plhs[0] = mxCreateNumericArray(3,dim,mxDOUBLE_CLASS, mxREAL);
+            double* tiff = (double*)mxGetPr(plhs[0]);
+            readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+		}
+		else{
+			mexErrMsgIdAndTxt("tiff:dataTypeError","Data type not suppported");
+		}
+	}
     // Case for 2D
-    if(z <= 1){
+    else if(z <= 1){
         if(bits == 8){
             plhs[0] = mxCreateNumericArray(3,dim,mxUINT8_CLASS, mxREAL);
             uint8_t* tiff = (uint8_t*)mxGetPr(plhs[0]);
@@ -445,7 +588,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
             mexErrMsgIdAndTxt("tiff:dataTypeError","Data type not suppported");
         }
     }
-    // Case for 2D
+    // Case for 3D
     else{
         if(bits == 8){
             plhs[0] = mxCreateNumericArray(3,dim,mxUINT8_CLASS, mxREAL);
