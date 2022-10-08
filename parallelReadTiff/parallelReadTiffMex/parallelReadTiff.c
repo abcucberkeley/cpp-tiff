@@ -95,16 +95,22 @@ void readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileName, 
     char errString[10000];
     #pragma omp parallel for
     for(w = 0; w < numWorkers; w++){
-
+        
+        uint8_t outCounter = 0;
         TIFF* tif = TIFFOpen(fileName, "r");
-        if(!tif){
-            #pragma omp critical
-            {
-                err = 1;
-                sprintf(errString,"Thread %d: File \"%s\" cannot be opened\n",w,fileName);
+        while(!tif){
+            tif = TIFFOpen(fileName, "r");
+            if(outCounter == 3){
+                #pragma omp critical
+                {
+                    err = 1;
+                    sprintf(errString,"Thread %d: File \"%s\" cannot be opened\n",w,fileName);
+                }
+			    continue;
             }
-			continue;
+            outCounter++;
         }
+        
         void* buffer = malloc(x*stripSize*bytes);
         for(int64_t dir = startSlice+(w*batchSize); dir < startSlice+((w+1)*batchSize); dir++){
             if(dir>=z+startSlice || err) break;
@@ -269,14 +275,19 @@ void readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileName
     #pragma omp parallel for
     for(w = 0; w < numWorkers; w++){
 
+        uint8_t outCounter = 0;
         TIFF* tif = TIFFOpen(fileName, "r");
-        if(!tif){
-            #pragma omp critical
-            {
-                err = 1;
-                sprintf(errString,"Thread %d: File \"%s\" cannot be opened\n",w,fileName);
+        while(!tif){
+            tif = TIFFOpen(fileName, "r");
+            if(outCounter == 3){
+                #pragma omp critical
+                {
+                    err = 1;
+                    sprintf(errString,"Thread %d: File \"%s\" cannot be opened\n",w,fileName);
+                }
+			    continue;
             }
-			continue;
+            outCounter++;
         }
 
         void* buffer = malloc(x*stripSize*bytes);
