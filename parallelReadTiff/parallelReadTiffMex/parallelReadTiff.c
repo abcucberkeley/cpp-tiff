@@ -444,6 +444,34 @@ void readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* file
 
 		}
 	}
+    // Find a way to do this in-place without making a copy
+    if(flipXY){
+        uint64_t size = x*y*z*(bits/8);
+        void* tiffC = malloc(size);
+        memcpy(tiffC,tiff,size);
+        #pragma omp parallel for
+        for(uint64_t k = 0; k < z; k++){
+            for(uint64_t j = 0; j < x; j++){
+                for(uint64_t i = 0; i < y; i++){
+                    switch(bits){
+                        case 8:
+                            ((uint8_t*)tiff)[i+(j*y)+(k*x*y)] = ((uint8_t*)tiffC)[j+(i*x)+(k*x*y)];
+                            break;
+                        case 16:
+                            ((uint16_t*)tiff)[i+(j*y)+(k*x*y)] = ((uint16_t*)tiffC)[j+(i*x)+(k*x*y)];
+                            break;
+                        case 32:
+                            ((float*)tiff)[i+(j*y)+(k*x*y)] = ((float*)tiffC)[j+(i*x)+(k*x*y)];
+                            break;
+                        case 64:
+                            ((double*)tiff)[i+(j*y)+(k*x*y)] = ((double*)tiffC)[j+(i*x)+(k*x*y)];
+                            break;
+                    }
+                }
+            }
+        }
+        free(tiffC);
+    }
 }
 
 uint8_t isImageJIm(const char* fileName){
