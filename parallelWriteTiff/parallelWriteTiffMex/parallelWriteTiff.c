@@ -338,6 +338,8 @@ void writeTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileName,
 void mexFunction(int nlhs, mxArray *plhs[],
                  int nrhs, const mxArray *prhs[])
 {
+    if(nrhs < 2) mexErrMsgIdAndTxt("tiff:inputError","This function requires at least 2 arguments");
+
     // Check if the fileName is a char array or matlab style
     char* fileName = NULL;
     if(!mxIsClass(prhs[0], "string")){
