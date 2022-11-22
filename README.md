@@ -22,4 +22,5 @@ size = getImageSize_mex('path/to/file.tif');
 
 #### parallelWriteTiff - Write an array out as a Tiff image
 im = rand(100,100,100);
+
 parallelWriteTiff('path/to/file.tif',im);
