@@ -24,11 +24,10 @@ static void mkdirRecursive(const char *dir) {
     char tmp[8192];
     char *p = NULL;
     size_t len;
-    #ifdef __linux__
-    char fileSep = '/';
-    #endif
     #ifdef _WIN32
     char fileSep = '\\';
+    #else
+    char fileSep = '/';
     #endif
     int status;
     snprintf(tmp, sizeof(tmp),"%s",dir);
@@ -43,23 +42,20 @@ static void mkdirRecursive(const char *dir) {
         if (*p == fileSep) {
             *p = 0;
 
-            #ifdef __linux__
-            mkdir(tmp, 0775);
-            #endif
-
             #ifdef _WIN32
             mkdir(tmp);
+            #else
+            mkdir(tmp, 0775);
             #endif
 
             chmod(tmp, 0775);
             *p = fileSep;
         }
     }
-    #ifdef __linux__
-    mkdir(tmp, 0775);
-    #endif
     #ifdef _WIN32
     mkdir(tmp);
+    #else
+    mkdir(tmp, 0775);
     #endif
     chmod(tmp, 0775);
 }
@@ -359,11 +355,10 @@ void mexFunction(int nlhs, mxArray *plhs[],
     // Check if folder exists, if not then make it (recursive if needed)
     char* folderName = strdup(fileName);
     char *lastSlash = NULL;
-    #ifdef __linux__
-    lastSlash = strrchr(folderName, '/');
-    #endif
     #ifdef _WIN32
     lastSlash = strrchr(folderName, '\\');
+    #else
+    lastSlash = strrchr(folderName, '/');
     #endif
     if(lastSlash){
         *lastSlash = '\0';
