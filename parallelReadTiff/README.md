@@ -1,4 +1,4 @@
-# ParallelReadTiff
+# parallelReadTiff
 
 An optimized and efficient parallel tiff reader that utilizes LibTIFF and OpenMP.
 
