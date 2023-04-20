@@ -53,7 +53,7 @@ main(int argc, char *argv[])
 
     duration = (end.tv_sec - start.tv_sec) * 1e9 + (end.tv_nsec - start.tv_nsec); // calculate duration in nanoseconds
 
-    printf("Read Tiff File Done! Time taken: %.4f nanoseconds\n", duration/1000000);
+    printf("Read Tiff File Done! Time taken: %.4f seconds\n", duration/1e9);
 
     if (!tiff)
         return 1;
