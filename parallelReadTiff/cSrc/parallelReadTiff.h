@@ -11,8 +11,8 @@
 #include <limits.h>
 
 typedef struct {
-    uint64_t *range; 
-    size_t length;
+    uint64_t *range;
+    size_t    length;
 } parallel_tiff_range_t;
 
 /**
