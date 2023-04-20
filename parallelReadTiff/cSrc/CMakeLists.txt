@@ -21,6 +21,19 @@ endforeach()
 
 project(OMP_TIFF C)
 
+# Find OpenMP
+option(USE_SYSTEM_OPENMP "Use system-installed OpenMP." ON)
+if(USE_SYSTEM_OPENMP)
+  find_package(OpenMP REQUIRED)
+  if(OPENMP_FOUND)
+      add_definitions(-DENABLE_OPENMP=1)
+      set(ENABLE_OPENMP 1)
+      set(OPENMP_LIBRARIES "${OpenMP_C_LIBRARIES}")
+  else()
+      message(FATAL_ERROR "OpenMP not found")
+  endif()
+endif()
+
 # Find LibTIFF
 option(USE_LIB_TIFF "Enable LibTiff." ON)
 if(USE_LIB_TIFF)
