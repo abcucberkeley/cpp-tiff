@@ -62,6 +62,7 @@ main(int argc, char *argv[])
     for (i = 0; i < 10; i++) {
         printf("%d ", ((uint8_t *)tiff)[i]);
     }
+    printf("\n");
     free(tiff);
     return 0;
 }
