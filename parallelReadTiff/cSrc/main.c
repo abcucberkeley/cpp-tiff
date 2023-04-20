@@ -32,6 +32,9 @@ main(int argc, char *argv[])
     char *file_name = NULL;
     void *tiff      = NULL;
     int   i         = 0;
+    struct timespec start, end;
+    double duration;
+
     // parse console argument
     int parse_code = parse_console_args(argc, argv, &file_name);
     if (parse_code) {
@@ -41,15 +44,19 @@ main(int argc, char *argv[])
     // print file name for validating purpose
     printf("Filename: %s\n", file_name ? file_name : "(none)");
 
-    clock_t begin = clock();
+    clock_gettime(CLOCK_MONOTONIC, &start); // start timing the operation
+
     // calling tiff loading process.
     parallel_TIFF_load(file_name, &tiff, 1, NULL);
 
+    clock_gettime(CLOCK_MONOTONIC, &end); // end timing the operation
+
+    duration = (end.tv_sec - start.tv_sec) * 1e9 + (end.tv_nsec - start.tv_nsec); // calculate duration in nanoseconds
+
+    printf("Read Tiff File Done! Time taken: %.4f nanoseconds\n", duration/1000000);
+
     if (!tiff)
         return 1;
-    clock_t end        = clock();
-    double  time_spent = (double)(end - begin) / CLOCKS_PER_SEC;
-    printf("Read Tiff File Done! Time spent: %.4f seconds\n", time_spent);
 
     printf("first few bytes ");
     for (i = 0; i < 10; i++) {
