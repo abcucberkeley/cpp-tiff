@@ -14,7 +14,7 @@
 
 //libtiff 4.4.0
 //mex -v COPTIMFLAGS="-O3 -DNDEBUG" LDOPTIMFLAGS="-O3 -DNDEBUG" CFLAGS='$CFLAGS -O3 -fopenmp' LDFLAGS='$LDFLAGS -O3 -fopenmp' '-I/clusterfs/fiona/matthewmueller/software/tiff-4.4.0/include' '-L/clusterfs/fiona/matthewmueller/software/tiff-4.4.0/lib' -ltiff parallelReadTiff.c
-
+//mex -v COPTIMFLAGS="" LDOPTIMFLAGS="" CFLAGS='$CFLAGS -g -fopenmp' LDFLAGS='$LDFLAGS -g -fopenmp' '-I/clusterfs/fiona/matthewmueller/software/tiff-4.4.0/include' '-L/clusterfs/fiona/matthewmueller/software/tiff-4.4.0/lib' -ltiff parallelReadTiff.c
 // Handle the tilde character in filenames on Linux/Mac
 #ifndef _WIN32
 #include <wordexp.h>
