@@ -34,9 +34,19 @@ set(LIBDEFLATE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/libdeflate-1.18")
 add_subdirectory(${LIBDEFLATE_DIR})
 set_property(TARGET libdeflate_static PROPERTY POSITION_INDEPENDENT_CODE ON)
 
-set(ZSTD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/zstd-1.5.5")
-add_subdirectory(${ZSTD_DIR}/build/cmake)
-set_property(TARGET zstd PROPERTY POSITION_INDEPENDENT_CODE ON)
+#set(ZSTD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/zstd-1.5.5")
+#add_subdirectory(${ZSTD_DIR}/build/cmake)
+#set_property(TARGET zstd PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+# Run the script to build ZSTD
+execute_process(
+    COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/dependecies/build_zstd.cmake
+)
+
+#set_property(TARGET libtiff PROPERTY POSITION_INDEPENDENT_CODE ON)
+#add_dependencies(libtiff ZSTD::ZSTD)
+# Create a custom target for libtiff to check for ZSTD
+#add_custom_target(libtiff_check_zstd DEPENDS ZSTD::ZSTD)
 
 # Add libtiff
 include_directories(${ZSTD_DIR}/lib)
@@ -46,10 +56,13 @@ set(Deflate_INCLUDE_DIR  ${LIBDEFLATE_DIR} CACHE STRING "" FORCE)
 set(Deflate_LIBRARY  ${CMAKE_BINARY_DIR}/dependencies/libdeflate-1.18/libdeflate.a CACHE STRING "" FORCE)
 set(ZSTD_INCLUDE_DIR  ${ZSTD_DIR}/lib CACHE STRING "" FORCE)
 set(ZSTD_LIBRARY  ${CMAKE_BINARY_DIR}/dependencies/zstd-1.5.5/libzstd.a CACHE STRING "" FORCE)
-set(LIBTIFF_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/tiff-4.5.1")
+set(LIBTIFF_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/tiff-4.6.0")
 add_subdirectory(${LIBTIFF_DIR})
+set_property(TARGET libtiff PROPERTY POSITION_INDEPENDENT_CODE ON)
+#set_target_properties(libtiff PROPERTIES CMAKE_ORDER_DEPEND libtiff_check_zstd)
+#add_dependencies(libtiff ZSTD::ZSTD)
 # tiff
-set_property(TARGET blosc_static PROPERTY POSITION_INDEPENDENT_CODE ON)
+#set_property(TARGET libtiff PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 set(CBLOSC2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/c-blosc2-2.10.2")
 set(BUILD_SHARED OFF CACHE BOOL "" FORCE)
