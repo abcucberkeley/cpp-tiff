@@ -112,7 +112,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     dim[0] = y;
     dim[1] = x;
     dim[2] = z;
-
+    uint8_t err = 0;
     if(bits == 8){
         uint8_t* tiffOld = (uint8_t*)mxGetPr(prhs[1]);
         uint8_t* tiff = (uint8_t*)malloc(x*y*z*(bits/8));
@@ -125,7 +125,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
                 }
             }
         }
-        writeTiffParallel(x,y,z,fileName, (void*)tiff, (void*)tiffOld, bits, startSlice, stripSize, stripsPerDir, cSizes, mode);
+        err = writeTiffParallel(x,y,z,fileName, (void*)tiff, (void*)tiffOld, bits, startSlice, stripSize, stripsPerDir, cSizes, mode);
         free(tiff);
     }
     else if(bits == 16){
@@ -141,7 +141,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
                 }
             }
         }
-        writeTiffParallel(x,y,z,fileName, (void*)tiff, (void*)tiffOld, bits, startSlice, stripSize, stripsPerDir, cSizes, mode);
+        err = writeTiffParallel(x,y,z,fileName, (void*)tiff, (void*)tiffOld, bits, startSlice, stripSize, stripsPerDir, cSizes, mode);
         free(tiff);
     }
     else if(bits == 32){
@@ -156,7 +156,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
                 }
             }
         }
-        writeTiffParallel(x,y,z,fileName, (void*)tiff, (void*)tiffOld, bits, startSlice, stripSize, stripsPerDir, cSizes, mode);
+        err = writeTiffParallel(x,y,z,fileName, (void*)tiff, (void*)tiffOld, bits, startSlice, stripSize, stripsPerDir, cSizes, mode);
         free(tiff);
     }
     else if(bits == 64){
@@ -171,11 +171,12 @@ void mexFunction(int nlhs, mxArray *plhs[],
                 }
             }
         }
-        writeTiffParallel(x,y,z,fileName, (void*)tiff, (void*)tiffOld, bits, startSlice, stripSize, stripsPerDir, cSizes, mode);
+        err = writeTiffParallel(x,y,z,fileName, (void*)tiff, (void*)tiffOld, bits, startSlice, stripSize, stripsPerDir, cSizes, mode);
         free(tiff);
     }
     else{
         mexErrMsgIdAndTxt("tiff:dataTypeError","Data type not suppported");
     }
     free(cSizes);
+    if(err) mexErrMsgIdAndTxt("tiff:tiffError","An Error occured within the write function");
 }

@@ -6,7 +6,6 @@
 #include "lzwencode.h"
 #include "tiffio.h"
 #include "omp.h"
-#include "mex.h"
 //mex -v COPTIMFLAGS="-O3 -DNDEBUG" CFLAGS='$CFLAGS -O3 -fopenmp' LDFLAGS='$LDFLAGS -O3 -fopenmp' '-I/global/home/groups/software/sl-7.x86_64/modules/libtiff/4.1.0/libtiff/' '-L/global/home/groups/software/sl-7.x86_64/modules/libtiff/4.1.0/libtiff/' -ltiff /clusterfs/fiona/matthewmueller/parallelTiffTesting/main.c
 //mex COMPFLAGS='$COMPFLAGS /openmp' '-IC:\Program Files (x86)\tiff\include\' '-LC:\Program Files (x86)\tiff\lib\' -ltiffd.lib C:\Users\Matt\Documents\parallelTiff\main.cpp
 
@@ -19,7 +18,7 @@
 //libtiff 4.4.0
 //mex -v COPTIMFLAGS="-O3 -DNDEBUG" LDOPTIMFLAGS="-O3 -DNDEBUG" CFLAGS='$CFLAGS -O3 -fopenmp' LDFLAGS='$LDFLAGS -O3 -fopenmp' '-I/clusterfs/fiona/matthewmueller/software/tiff-4.4.0/include' '-L/clusterfs/fiona/matthewmueller/software/tiff-4.4.0/lib' -ltiff parallelWriteTiff.c lzwEncode.c
 
-void writeTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, const void* tiffOld, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint64_t stripsPerDir, uint64_t* cSizes, const char* mode){
+uint8_t writeTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, const void* tiffOld, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint64_t stripsPerDir, uint64_t* cSizes, const char* mode){
     int32_t numWorkers = omp_get_max_threads();
     int32_t batchSize = (z-1)/numWorkers+1;
     int32_t w;
@@ -188,13 +187,15 @@ void writeTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileName,
     if(!strcmp(mode,"w")){
         tif = TIFFOpen(fileName, (cSize < 3.8e9) ? "w" : "w8");
         if(!tif){
-            mexErrMsgIdAndTxt("tiff:threadError","Error: File \"%s\" cannot be opened",fileName);
+            printf("Error: File \"%s\" cannot be opened",fileName);
+			return 1;
         }
     }
     else if(!strcmp(mode,"a")){
         tif = TIFFOpen(fileName, "r");
         if(!tif){
-            mexErrMsgIdAndTxt("tiff:threadError","Error: File \"%s\" cannot be opened",fileName);
+            printf("Error: File \"%s\" cannot be opened",fileName);
+			return 1;
         }
         uint64_t xTemp = 1,yTemp = 1,zTemp = 1;
         TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &xTemp);
@@ -224,12 +225,13 @@ void writeTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileName,
         TIFFClose(tif);
         tif = TIFFOpen(fileName, (cSize < 3.8e9) ? "a" : "a8");
         if(!tif){
-            mexErrMsgIdAndTxt("tiff:threadError","Error: File \"%s\" cannot be opened",fileName);
+            printf("Error: File \"%s\" cannot be opened",fileName);
+			return 1;
         }
     }
     else{
         printf("Error: mode \"%s\" is not supported. Use w or a for mode type", mode);
-        return;
+        return 1;
     }
 
     uint8_t err = 0;
@@ -280,5 +282,5 @@ void writeTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileName,
         free(comprA);
     }
     TIFFClose(tif);
-    //if(err) mexErrMsgIdAndTxt("tiff:threadError",errString);
+	return 0;
 }
