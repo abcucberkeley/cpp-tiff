@@ -4,7 +4,7 @@ An efficient parallel Tiff reader/writer that utilizes LibTIFF and OpenMP.
 ## Quick Start Guide (MATLAB)
 
 ### Prerequisites
-1. None! The parallel reader and writer mex files will work with most recent version of Matlab.
+1. None! The parallel reader and writer mex files will work with the most recent version of Matlab.
 
 ### Download and Install
 1. Download the latest release for your OS from here (windows/linux/mac.zip): https://github.com/abcucberkeley/cpp-tiff/releases
