@@ -37,7 +37,7 @@ set_property(TARGET libdeflate_static PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 set(ZSTD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/zstd-1.5.5")
 add_subdirectory(${ZSTD_DIR}/build/cmake)
-set_property(TARGET zstd PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET libzstd_static PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 # Add libtiff
 include_directories(${ZSTD_DIR}/lib)
@@ -51,11 +51,17 @@ set(LIBTIFF_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/tiff-4.6.0")
 set(tiff-tools OFF CACHE BOOL "" FORCE)
 set(tiff-tests OFF CACHE BOOL "" FORCE)
 set(tiff-contrib OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+# Disable jpeg and lzma until I can add the dependencies
+set(jpeg OFF CACHE BOOL "" FORCE)
+set(lzma OFF CACHE BOOL "" FORCE)
+
+
 add_subdirectory(${LIBTIFF_DIR})
 set_property(TARGET tiff PROPERTY POSITION_INDEPENDENT_CODE ON)
 add_dependencies(tiff zlibstatic)
 add_dependencies(tiff libdeflate_static)
-add_dependencies(tiff zstd)
+add_dependencies(tiff libzstd_static)
 
 
 set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -64,12 +70,12 @@ add_library(cppTiff_shared SHARED ${SRC_DIR}/helperfunctions.cpp  ${SRC_DIR}/lzw
 set_target_properties(cppTiff_shared PROPERTIES OUTPUT_NAME cppTiff)
 add_dependencies(cppTiff_shared zlibstatic)
 add_dependencies(cppTiff_shared libdeflate_static)
-add_dependencies(cppTiff_shared zstd)
+add_dependencies(cppTiff_shared libzstd_static)
 add_dependencies(cppTiff_shared tiff)
 
-set_target_properties(cppTiff_shared PROPERTIES PUBLIC_HEADER "${SRC_DIR}/helperfunctions.h;${SRC_DIR}/lzwencode.h;${SRC_DIR}/parallelreadtiff.h;${SRC_DIR}/parallelwritetiff.h")
+set_target_properties(cppTiff_shared PROPERTIES PUBLIC_HEADER "${ZSTD_DIR}/lib/zstd.h;${SRC_DIR}/helperfunctions.h;${SRC_DIR}/lzwencode.h;${SRC_DIR}/parallelreadtiff.h;${SRC_DIR}/parallelwritetiff.h")
 
-# Include the header files from blosc, blosc2, and json
+# Include the header files
 target_include_directories(cppTiff_shared PRIVATE
     ${ZLIB_DIR}
 	${LIBDEFLATE_DIR} 
@@ -77,12 +83,12 @@ target_include_directories(cppTiff_shared PRIVATE
 	${LIBTIFF_DIR}/libtiff
 )
 
-# Link against the blosc and blosc2 libraries
+# Link against the libraries
 target_link_libraries(cppTiff_shared PRIVATE
+    ${CMAKE_BINARY_DIR}/dependencies/tiff-4.6.0/libtiff/libtiff.a
     ${CMAKE_BINARY_DIR}/dependencies/zlib-1.2.8/${ZLIB_STATIC_NAME}
     ${CMAKE_BINARY_DIR}/dependencies/libdeflate-1.18/libdeflate.a
     ${CMAKE_BINARY_DIR}/dependencies/zstd-1.5.5/build/cmake/lib/libzstd.a
-    ${CMAKE_BINARY_DIR}/dependencies/tiff-4.6.0/libtiff/libtiff.a
     -static-libgcc
     -static-libstdc++
     OpenMP::OpenMP_CXX

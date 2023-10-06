@@ -8,7 +8,7 @@ if isunix && ~ismac
     if debug
         mex -v -g CXXOPTIMFLAGS="" LDOPTIMFLAGS="-g -O0 -Wall -Wextra -Wl',-rpath='''$ORIGIN''''" CXXFLAGS='$CXXFLAGS -Wall -Wextra -g -O0 -fsanitize=address -gdwarf-4 -gstrict-dwarf' LDFLAGS='$LDFLAGS -g -O0 -fopenmp -fsanitize=address' -I'/clusterfs/fiona/matthewmueller/cppZarrTest' -I'/global/home/groups/software/sl-7.x86_64/modules/cBlosc/2.8.0/include/' '-L/global/home/groups/software/sl-7.x86_64/modules/cBlosc/2.8.0/lib64' -lblosc2 -lz -luuid parallelreadzarr.cpp zarr.cpp helperfunctions.cpp parallelreadzarr.cpp
     else
-        mex -outdir ../linux -output parallelWriteTiff.mexa64 -v CXXOPTIMFLAGS="-DNDEBUG -O3" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O3 -DNDEBUG" CXXFLAGS='$CXXFLAGS -fopenmp -O3' LDFLAGS='$LDFLAGS -fopenmp -O3' -I'/global/home/groups/software/sl-7.x86_64/modules/libtiff/4.5.1/include' -L'/global/home/groups/software/sl-7.x86_64/modules/libtiff/4.5.1/lib64' -lstdc++ -ltiff parallelwritetiffmex.cpp ../src/lzwencode.cpp ../src/helperfunctions.cpp ../src/parallelwritetiff.cpp
+        mex -outdir ../linux -output parallelWriteTiff.mexa64 -v CXXOPTIMFLAGS="-DNDEBUG -O3" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O3 -DNDEBUG" CXXFLAGS='$CXXFLAGS -fopenmp -O3' LDFLAGS='$LDFLAGS -fopenmp -O3' -I'/global/home/groups/software/sl-7.x86_64/modules/libtiff/4.6.0/include' -L'/global/home/groups/software/sl-7.x86_64/modules/libtiff/4.6.0/lib64' -lstdc++ -ltiff parallelwritetiffmex.cpp ../src/lzwencode.cpp ../src/helperfunctions.cpp ../src/parallelwritetiff.cpp
     end
 
     % Need to change the library name because matlab preloads their own version
