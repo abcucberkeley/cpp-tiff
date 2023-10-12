@@ -1,11 +1,8 @@
+#include "lzwencode.h"
 #include <math.h>
 #include <stdint.h>
-#include <stdlib.h>
-#include <stdbool.h>
-#include <stdio.h>
 #include <assert.h>
 #include "tiffio.h"
-#include "lzwencode.h"
 #define SIZEOF_WORDTYPE SIZEOF_SIZE_T
 typedef size_t WordType;
 

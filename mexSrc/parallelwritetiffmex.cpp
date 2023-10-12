@@ -8,17 +8,6 @@
 #include "tiffio.h"
 #include "omp.h"
 #include "mex.h"
-//mex -v COPTIMFLAGS="-O3 -DNDEBUG" CFLAGS='$CFLAGS -O3 -fopenmp' LDFLAGS='$LDFLAGS -O3 -fopenmp' '-I/global/home/groups/software/sl-7.x86_64/modules/libtiff/4.1.0/libtiff/' '-L/global/home/groups/software/sl-7.x86_64/modules/libtiff/4.1.0/libtiff/' -ltiff /clusterfs/fiona/matthewmueller/parallelTiffTesting/main.c
-//mex COMPFLAGS='$COMPFLAGS /openmp' '-IC:\Program Files (x86)\tiff\include\' '-LC:\Program Files (x86)\tiff\lib\' -ltiffd.lib C:\Users\Matt\Documents\parallelTiff\main.cpp
-
-//zlib
-//mex -v COPTIMFLAGS="-O3 -DNDEBUG" CFLAGS='$CFLAGS -O3 -fopenmp' LDFLAGS='$LDFLAGS -O3 -fopenmp' '-I/global/home/groups/software/sl-7.x86_64/modules/libtiff/4.1.0/libtiff/' '-I/global/home/groups/consultsw/sl-7.x86_64/modules/zlib/1.2.11/include/' '-L/global/home/groups/consultsw/sl-7.x86_64/modules/zlib/1.2.11/lib' -lz '-L/global/home/groups/software/sl-7.x86_64/modules/libtiff/4.1.0/libtiff/' -ltiff parallelWriteTiff.c
-
-//lzw
-//mex -v CXXOPTIMFLAGS="-O3 -DNDEBUG" CXXFLAGS='$CXXFLAGS -O3 -fopenmp' LDFLAGS='$LDFLAGS -O3 -fopenmp' '-I/global/home/groups/software/sl-7.x86_64/modules/libtiff/4.1.0/libtiff/' '-L/global/home/groups/software/sl-7.x86_64/modules/libtiff/4.1.0/libtiff/' -ltiff parallelWriteTiff.c lzw.c
-
-//libtiff 4.4.0
-//mex -v COPTIMFLAGS="-O3 -DNDEBUG" LDOPTIMFLAGS="-O3 -DNDEBUG" CFLAGS='$CFLAGS -O3 -fopenmp' LDFLAGS='$LDFLAGS -O3 -fopenmp' '-I/clusterfs/fiona/matthewmueller/software/tiff-4.4.0/include' '-L/clusterfs/fiona/matthewmueller/software/tiff-4.4.0/lib' -ltiff parallelWriteTiff.c lzwEncode.c
 
 void mexFunction(int nlhs, mxArray *plhs[],
                  int nrhs, const mxArray *prhs[])
@@ -79,7 +68,6 @@ void mexFunction(int nlhs, mxArray *plhs[],
     uint64_t* dims = (uint64_t*) mxGetDimensions(prhs[1]);
 
 
-
     uint64_t x = dims[1],y = dims[0],z = dims[2],bits = 0, startSlice = 0;
 
     // For 2D images MATLAB passes in the 3rd dim as 0 so we set it to 1;
@@ -101,17 +89,11 @@ void mexFunction(int nlhs, mxArray *plhs[],
         bits = 64;
     }
 
-    //mexErrMsgIdAndTxt("tiff:inputError","TESTING");
-
     uint64_t stripSize = 512;
     uint64_t stripsPerDir = (uint64_t)ceil((double)y/(double)stripSize);
     uint64_t totalStrips = stripsPerDir*z;
     uint64_t* cSizes = (uint64_t*)malloc(totalStrips*sizeof(uint64_t));
 
-    uint64_t dim[3];
-    dim[0] = y;
-    dim[1] = x;
-    dim[2] = z;
     uint8_t err = 0;
     if(bits == 8){
         uint8_t* tiffOld = (uint8_t*)mxGetPr(prhs[1]);
@@ -121,7 +103,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
         for(uint64_t dir = 0; dir < z; dir++){
             for(uint64_t j = 0; j < y; j++){
                 for(uint64_t i = 0; i < x; i++){
-                    ((uint8_t*)tiff)[i+(j*x)+((dir-startSlice)*(x*y))] = ((uint8_t*)tiffOld)[j+(i*y)+((dir-startSlice)*(x*y))];
+                    tiff[i+(j*x)+((dir-startSlice)*(x*y))] = tiffOld[j+(i*y)+((dir-startSlice)*(x*y))];
                 }
             }
         }
@@ -129,18 +111,18 @@ void mexFunction(int nlhs, mxArray *plhs[],
         free(tiff);
     }
     else if(bits == 16){
-
         uint16_t* tiffOld = (uint16_t*)mxGetPr(prhs[1]);
         uint16_t* tiff = (uint16_t*)malloc(x*y*z*(bits/8));
-
+        
         #pragma omp parallel for collapse(3)
         for(uint64_t dir = 0; dir < z; dir++){
             for(uint64_t j = 0; j < y; j++){
                 for(uint64_t i = 0; i < x; i++){
-                    ((uint16_t*)tiff)[i+(j*x)+((dir-startSlice)*(x*y))] = ((uint16_t*)tiffOld)[j+(i*y)+((dir-startSlice)*(x*y))];
+                    tiff[i+(j*x)+((dir-startSlice)*(x*y))] = tiffOld[j+(i*y)+((dir-startSlice)*(x*y))];
                 }
             }
         }
+        
         err = writeTiffParallel(x,y,z,fileName, (void*)tiff, (void*)tiffOld, bits, startSlice, stripSize, stripsPerDir, cSizes, mode);
         free(tiff);
     }
@@ -152,7 +134,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
         for(uint64_t dir = 0; dir < z; dir++){
             for(uint64_t j = 0; j < y; j++){
                 for(uint64_t i = 0; i < x; i++){
-                    ((float*)tiff)[i+(j*x)+((dir-startSlice)*(x*y))] = ((float*)tiffOld)[j+(i*y)+((dir-startSlice)*(x*y))];
+                    tiff[i+(j*x)+((dir-startSlice)*(x*y))] = tiffOld[j+(i*y)+((dir-startSlice)*(x*y))];
                 }
             }
         }
@@ -167,7 +149,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
         for(uint64_t dir = 0; dir < z; dir++){
             for(uint64_t j = 0; j < y; j++){
                 for(uint64_t i = 0; i < x; i++){
-                    ((double*)tiff)[i+(j*x)+((dir-startSlice)*(x*y))] = ((double*)tiffOld)[j+(i*y)+((dir-startSlice)*(x*y))];
+                    tiff[i+(j*x)+((dir-startSlice)*(x*y))] = tiffOld[j+(i*y)+((dir-startSlice)*(x*y))];
                 }
             }
         }

@@ -5,7 +5,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <limits.h>
-
 #include "../src/helperfunctions.h"
 #include "../src/parallelreadtiff.h"
 #include "tiffio.h"

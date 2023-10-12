@@ -2,28 +2,17 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include "lzwencode.h"
 #include "tiffio.h"
 #include "omp.h"
-//mex -v COPTIMFLAGS="-O3 -DNDEBUG" CFLAGS='$CFLAGS -O3 -fopenmp' LDFLAGS='$LDFLAGS -O3 -fopenmp' '-I/global/home/groups/software/sl-7.x86_64/modules/libtiff/4.1.0/libtiff/' '-L/global/home/groups/software/sl-7.x86_64/modules/libtiff/4.1.0/libtiff/' -ltiff /clusterfs/fiona/matthewmueller/parallelTiffTesting/main.c
-//mex COMPFLAGS='$COMPFLAGS /openmp' '-IC:\Program Files (x86)\tiff\include\' '-LC:\Program Files (x86)\tiff\lib\' -ltiffd.lib C:\Users\Matt\Documents\parallelTiff\main.cpp
-
-//zlib
-//mex -v COPTIMFLAGS="-O3 -DNDEBUG" CFLAGS='$CFLAGS -O3 -fopenmp' LDFLAGS='$LDFLAGS -O3 -fopenmp' '-I/global/home/groups/software/sl-7.x86_64/modules/libtiff/4.1.0/libtiff/' '-I/global/home/groups/consultsw/sl-7.x86_64/modules/zlib/1.2.11/include/' '-L/global/home/groups/consultsw/sl-7.x86_64/modules/zlib/1.2.11/lib' -lz '-L/global/home/groups/software/sl-7.x86_64/modules/libtiff/4.1.0/libtiff/' -ltiff parallelWriteTiff.c
-
-//lzw
-//mex -v CXXOPTIMFLAGS="-O3 -DNDEBUG" CXXFLAGS='$CXXFLAGS -O3 -fopenmp' LDFLAGS='$LDFLAGS -O3 -fopenmp' '-I/global/home/groups/software/sl-7.x86_64/modules/libtiff/4.1.0/libtiff/' '-L/global/home/groups/software/sl-7.x86_64/modules/libtiff/4.1.0/libtiff/' -ltiff parallelWriteTiff.c lzw.c
-
-//libtiff 4.4.0
-//mex -v COPTIMFLAGS="-O3 -DNDEBUG" LDOPTIMFLAGS="-O3 -DNDEBUG" CFLAGS='$CFLAGS -O3 -fopenmp' LDFLAGS='$LDFLAGS -O3 -fopenmp' '-I/clusterfs/fiona/matthewmueller/software/tiff-4.4.0/include' '-L/clusterfs/fiona/matthewmueller/software/tiff-4.4.0/lib' -ltiff parallelWriteTiff.c lzwEncode.c
 
 uint8_t writeTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, const void* tiffOld, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint64_t stripsPerDir, uint64_t* cSizes, const char* mode){
     int32_t numWorkers = omp_get_max_threads();
     int32_t batchSize = (z-1)/numWorkers+1;
     int32_t w;
-    int safeMode = 0;
+    uint8_t safeMode = 0;
     uint64_t extraBytes = 2000;
+
     #pragma omp parallel for
     for(w = 0; w < numWorkers; w++){
 
@@ -150,6 +139,7 @@ uint8_t writeTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNa
     if(uncSize*comprFactor < cSize){
         cSize = uncSize;
         compress = 0;
+
         // Restore the array as it may have changed
         if(!safeMode){
             #pragma omp parallel for collapse(3)
@@ -179,10 +169,8 @@ uint8_t writeTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNa
     // Add bytes for some mandatory tags
     uint64_t manBytes = 24;
     cSize += manBytes*z;
-    //printf("Compressed Size is: %llu bytes\n",cSize);
 
-    //mexErrMsgIdAndTxt("tiff:dataTypeError","Data type not suppported. %d %d %d %d",x,y,z,bits);
-    //Close to UINT32_MAX. Want some extra room for incorrect size calculation for now.
+    // Close to UINT32_MAX. Want some extra room for incorrect size calculation for now.
     TIFF* tif = NULL;
     if(!strcmp(mode,"w")){
         tif = TIFFOpen(fileName, (cSize < 3.8e9) ? "w" : "w8");
@@ -234,11 +222,9 @@ uint8_t writeTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNa
         return 1;
     }
 
-    uint8_t err = 0;
-    //char errString[10000];
     uint64_t len = 0;
     for(uint64_t dir = startSlice; dir < z; dir++){
-        if(dir>=z+startSlice || err) break;
+        if(dir>=z+startSlice) break;
         TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, x);
         TIFFSetField(tif, TIFFTAG_IMAGELENGTH, y);
         TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, bits);
@@ -274,6 +260,7 @@ uint8_t writeTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNa
         }
         TIFFWriteDirectory(tif);
     }
+
     if(comprA){
         #pragma omp parallel for
         for(uint64_t i = 0; i < totalStrips; i++){

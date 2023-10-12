@@ -13,8 +13,8 @@ if isunix && ~ismac
 
     % Need to change the library name because matlab preloads their own version
     % of libstdc++
-    % Setting it to libstdc++.so.6.0.30 as of MATLAB R2022b
-    system(['patchelf --replace-needed libstdc++.so.6 libstdc++.so.6.0.30 ' releaseFolder '/getImageSizeMex.mexa64']);
+    % Setting it to libstdc++.so.6.0.32 as of MATLAB R2022b
+    system(['patchelf --replace-needed libstdc++.so.6 libstdc++.so.6.0.32 ' releaseFolder '/getImageSizeMex.mexa64']);
 elseif ismac
     % Might have to do this part in terminal. First change the library
     % linked to libstdc++
