@@ -88,77 +88,13 @@ void mexFunction(int nlhs, mxArray *plhs[],
     else if(mDType == mxDOUBLE_CLASS){
         bits = 64;
     }
-
-    uint64_t stripSize = 512;
-    uint64_t stripsPerDir = (uint64_t)ceil((double)y/(double)stripSize);
-    uint64_t totalStrips = stripsPerDir*z;
-    uint64_t* cSizes = (uint64_t*)malloc(totalStrips*sizeof(uint64_t));
-
-    uint8_t err = 0;
-    if(bits == 8){
-        uint8_t* tiffOld = (uint8_t*)mxGetPr(prhs[1]);
-        uint8_t* tiff = (uint8_t*)malloc(x*y*z*(bits/8));
-
-        #pragma omp parallel for collapse(3)
-        for(uint64_t dir = 0; dir < z; dir++){
-            for(uint64_t j = 0; j < y; j++){
-                for(uint64_t i = 0; i < x; i++){
-                    tiff[i+(j*x)+((dir-startSlice)*(x*y))] = tiffOld[j+(i*y)+((dir-startSlice)*(x*y))];
-                }
-            }
-        }
-        err = writeTiffParallel(x,y,z,fileName, (void*)tiff, (void*)tiffOld, bits, startSlice, stripSize, stripsPerDir, cSizes, mode);
-        free(tiff);
-    }
-    else if(bits == 16){
-        uint16_t* tiffOld = (uint16_t*)mxGetPr(prhs[1]);
-        uint16_t* tiff = (uint16_t*)malloc(x*y*z*(bits/8));
-        
-        #pragma omp parallel for collapse(3)
-        for(uint64_t dir = 0; dir < z; dir++){
-            for(uint64_t j = 0; j < y; j++){
-                for(uint64_t i = 0; i < x; i++){
-                    tiff[i+(j*x)+((dir-startSlice)*(x*y))] = tiffOld[j+(i*y)+((dir-startSlice)*(x*y))];
-                }
-            }
-        }
-        
-        err = writeTiffParallel(x,y,z,fileName, (void*)tiff, (void*)tiffOld, bits, startSlice, stripSize, stripsPerDir, cSizes, mode);
-        free(tiff);
-    }
-    else if(bits == 32){
-        float* tiffOld = (float*)mxGetPr(prhs[1]);
-        float* tiff = (float*)malloc(x*y*z*(bits/8));
-
-        #pragma omp parallel for collapse(3)
-        for(uint64_t dir = 0; dir < z; dir++){
-            for(uint64_t j = 0; j < y; j++){
-                for(uint64_t i = 0; i < x; i++){
-                    tiff[i+(j*x)+((dir-startSlice)*(x*y))] = tiffOld[j+(i*y)+((dir-startSlice)*(x*y))];
-                }
-            }
-        }
-        err = writeTiffParallel(x,y,z,fileName, (void*)tiff, (void*)tiffOld, bits, startSlice, stripSize, stripsPerDir, cSizes, mode);
-        free(tiff);
-    }
-    else if(bits == 64){
-        double* tiffOld = (double*)mxGetPr(prhs[1]);
-        double* tiff = (double*)malloc(x*y*z*(bits/8));
-
-        #pragma omp parallel for collapse(3)
-        for(uint64_t dir = 0; dir < z; dir++){
-            for(uint64_t j = 0; j < y; j++){
-                for(uint64_t i = 0; i < x; i++){
-                    tiff[i+(j*x)+((dir-startSlice)*(x*y))] = tiffOld[j+(i*y)+((dir-startSlice)*(x*y))];
-                }
-            }
-        }
-        err = writeTiffParallel(x,y,z,fileName, (void*)tiff, (void*)tiffOld, bits, startSlice, stripSize, stripsPerDir, cSizes, mode);
-        free(tiff);
-    }
     else{
         mexErrMsgIdAndTxt("tiff:dataTypeError","Data type not suppported");
     }
-    free(cSizes);
+
+    uint64_t stripSize = 512;
+    void* data = (void*)mxGetPr(prhs[1]);
+    uint8_t err = writeTiffParallelWrapper(x,y,z,fileName,data,bits,startSlice,stripSize,mode,true);
+
     if(err) mexErrMsgIdAndTxt("tiff:tiffError","An Error occured within the write function");
 }

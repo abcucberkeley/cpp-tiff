@@ -23,7 +23,6 @@ void mkdirRecursive(const char *dir) {
     #else
     char fileSep = '/';
     #endif
-    int status;
     snprintf(tmp, sizeof(tmp),"%s",dir);
     len = strlen(tmp);
     if (tmp[len - 1] == fileSep)
