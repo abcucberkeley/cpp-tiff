@@ -528,12 +528,13 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
 
 // Reading images saved by ImageJ
 uint8_t readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint8_t flipXY){
-   uint8_t err = 0;
-	#ifdef _WIN32
-    int fd = open(fileName,O_RDONLY | O_BINARY);
-    #else
-    int fd = open(fileName,O_RDONLY);
-    #endif
+    uint8_t err = 0;
+    FILE *fp = fopen(fileName, "rb");
+    if(!fp){ 
+		printf("File \"%s\" cannot be opened from Disk\n",fileName);
+		err = 1;
+		return err;
+	}
     TIFF* tif = TIFFOpen(fileName, "r");
     if(!tif){ 
 		printf("File \"%s\" cannot be opened\n",fileName);
@@ -546,7 +547,9 @@ uint8_t readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* f
     if(offsets) offset = offsets[0];
 
     TIFFClose(tif);
-    lseek64(fd, offset, SEEK_SET);
+
+    fseek(fp, offset, SEEK_SET);
+
     uint64_t bytes = bits/8;
     //#pragma omp parallel for
     /*
@@ -559,16 +562,18 @@ uint8_t readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* f
     uint64_t tBytes = x*y*z*bytes;
     uint64_t bytesRead;
     uint64_t rBytes = tBytes;
-    if(tBytes < INT_MAX) bytesRead = read(fd,tiff,tBytes);
+
+    // Can probably read more than INT_MAX now that we use fread
+    if(tBytes < INT_MAX) bytesRead = fread(tiff,1,tBytes,fp);
     else{
         while(chunk < tBytes){
             rBytes = tBytes-chunk;
-            if(rBytes > INT_MAX) bytesRead = read(fd,tiff+chunk,INT_MAX);
-            else bytesRead = read(fd,tiff+chunk,rBytes);
+            if(rBytes > INT_MAX) bytesRead = fread(tiff+chunk,1,INT_MAX,fp);
+            else bytesRead = fread(tiff+chunk,1,rBytes,fp);
             chunk += bytesRead;
         }
     }
-    close(fd);
+    fclose(fp);
     // Swap endianess for types greater than 8 bits
     // TODO: May need to change later because we may not always need to swap
     if(bits > 8){
