@@ -18,21 +18,23 @@ if isunix && ~ismac
 elseif ismac
     % Might have to do this part in terminal. First change the library
     % linked to libstdc++
+
+    % Can make a custom libtiff dylib where the libaries are linked by
+    % loader path
     
-    mex -v CXX="/usr/local/bin/g++-12" CXXOPTIMFLAGS='-O3 -DNDEBUG' LDOPTIMFLAGS='-O3 -DNDEBUG' CXXFLAGS='-fno-common -arch x86_64 -mmacosx-version-min=10.15 -fexceptions -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -std=c++11 -O3 -fopenmp -DMATLAB_DEFAULT_RELEASE=R2017b  -DUSE_MEX_CMD   -DMATLAB_MEX_FILE' LDFLAGS='$LDFLAGS -O3 -fopenmp' '-I/usr/local/include/' -lstdc++ -lblosc2 -lz -luuid parallelreadzarr.cpp helperfunctions.cpp zarr.cpp parallelreadzarrwrapper.cpp
+    releaseFolder = '../mac';
+    if ~exist(releaseFolder, 'dir')
+        mkdir(releaseFolder);
+    end
+    mex -v -outdir ../mac -output getImageSizeMex.mexw64 CXX="/usr/local/bin/g++-13" CXXOPTIMFLAGS='-O3 -DNDEBUG' LDOPTIMFLAGS='-O3 -DNDEBUG' CXXFLAGS='-fno-common -arch x86_64 -mmacosx-version-min=10.15 -fexceptions -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -std=c++11 -O3 -fopenmp -DMATLAB_DEFAULT_RELEASE=R2017b  -DUSE_MEX_CMD   -DMATLAB_MEX_FILE' LDFLAGS='$LDFLAGS -O3 -fopenmp' '-I/usr/local/include/' -lstdc++ -ltiff getimagesizemex.cpp ../src/helperfunctions.cpp
 
     % We need to change all the current paths to be relative to the mex file
-    system('install_name_tool -change /usr/local/opt/gcc@12/lib/gcc/12/libstdc++.6.dylib @loader_path/libstdc++.6.0.30.dylib parallelreadzarr.mexmaci64');
-    system('install_name_tool -change /usr/local/opt/ossp-uuid/lib/libuuid.16.dylib @loader_path/libuuid.16.22.0.dylib parallelreadzarr.mexmaci64');
-    system('install_name_tool -change /usr/local/opt/gcc@12/lib/gcc/12/libgomp.1.dylib @loader_path/libgomp.1.dylib parallelreadzarr.mexmaci64');
-    system('install_name_tool -change @rpath/libblosc2.2.dylib @loader_path/libblosc2.2.8.0.dylib parallelreadzarr.mexmaci64');
-    system('install_name_tool -change /usr/lib/libz.1.dylib @loader_path/libz.1.2.13.dylib parallelreadzarr.mexmaci64');
-    system('install_name_tool -change /usr/local/opt/gcc@12/lib/gcc/12/libgcc_s.1.1.dylib @loader_path/libgcc_s.1.1.0.dylib parallelreadzarr.mexmaci64');
+    system('install_name_tool -change /usr/local/opt/gcc/lib/gcc/current/libstdc++.6.dylib @loader_path/libstdc++.6.0.32.dylib ../mac/getImageSizeMex.mexmaci64');
+    system('install_name_tool -change /usr/local/opt/gcc/lib/gcc/current/libgomp.1.dylib @loader_path/libgomp.1.dylib ../mac/getImageSizeMex.mexmaci64');
+    system('install_name_tool -change @rpath/libtiff.6.dylib @loader_path/libtiff.6.0.1.dylib ../mac/getImageSizeMex.mexmaci64');
+    system('install_name_tool -change /usr/local/opt/gcc/lib/gcc/current/libgcc_s.1.1.dylib @loader_path/libgcc_s.1.1.dylib ../mac/getImageSizeMex.mexmaci64');
    
-
-    system('chmod 777 parallelreadzarr.mexmaci64');
-    mkdir('../cpp-zarr_mac');
-    movefile('parallelreadzarr.mexmaci64','../cpp-zarr_mac/parallelReadZarr.mexmaci64');
+    system('chmod 777 ../mac/getImageSizeMex.mexmaci64');
 elseif ispc
     setenv('MW_MINGW64_LOC','C:/mingw64');
     releaseFolder = '../windows';

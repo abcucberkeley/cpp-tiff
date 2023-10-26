@@ -112,22 +112,22 @@ void mexFunction(int nlhs, mxArray *plhs[],
     uint8_t err = 0;
     if(imageJIm){
         if(bits == 8){
-            plhs[0] = mxCreateNumericArray(3,dim,mxUINT8_CLASS, mxREAL);
+            plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxUINT8_CLASS, mxREAL);
             uint8_t* tiff = (uint8_t*)mxGetPr(plhs[0]);
             err = readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
         }
         else if(bits == 16){
-            plhs[0] = mxCreateNumericArray(3,dim,mxUINT16_CLASS, mxREAL);
+            plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxUINT16_CLASS, mxREAL);
             uint16_t* tiff = (uint16_t*)mxGetPr(plhs[0]);
             err = readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
         }
         else if(bits == 32){
-            plhs[0] = mxCreateNumericArray(3,dim,mxSINGLE_CLASS, mxREAL);
+            plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxSINGLE_CLASS, mxREAL);
             float* tiff = (float*)mxGetPr(plhs[0]);
             err = readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
         }
         else if(bits == 64){
-            plhs[0] = mxCreateNumericArray(3,dim,mxDOUBLE_CLASS, mxREAL);
+            plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxDOUBLE_CLASS, mxREAL);
             double* tiff = (double*)mxGetPr(plhs[0]);
             err = readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
         }
@@ -138,22 +138,22 @@ void mexFunction(int nlhs, mxArray *plhs[],
     // Case for 2D
     else if(z <= 1){
         if(bits == 8){
-            plhs[0] = mxCreateNumericArray(3,dim,mxUINT8_CLASS, mxREAL);
+            plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxUINT8_CLASS, mxREAL);
             uint8_t* tiff = (uint8_t*)mxGetPr(plhs[0]);
             err = readTiffParallel2D(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
         }
         else if(bits == 16){
-            plhs[0] = mxCreateNumericArray(3,dim,mxUINT16_CLASS, mxREAL);
+            plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxUINT16_CLASS, mxREAL);
             uint16_t* tiff = (uint16_t*)mxGetPr(plhs[0]);
             err = readTiffParallel2D(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
         }
         else if(bits == 32){
-            plhs[0] = mxCreateNumericArray(3,dim,mxSINGLE_CLASS, mxREAL);
+            plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxSINGLE_CLASS, mxREAL);
             float* tiff = (float*)mxGetPr(plhs[0]);
             err = readTiffParallel2D(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
         }
         else if(bits == 64){
-            plhs[0] = mxCreateNumericArray(3,dim,mxDOUBLE_CLASS, mxREAL);
+            plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxDOUBLE_CLASS, mxREAL);
             double* tiff = (double*)mxGetPr(plhs[0]);
             err = readTiffParallel2D(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
         }
@@ -164,22 +164,22 @@ void mexFunction(int nlhs, mxArray *plhs[],
     // Case for 3D
     else{
         if(bits == 8){
-            plhs[0] = mxCreateNumericArray(3,dim,mxUINT8_CLASS, mxREAL);
+            plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxUINT8_CLASS, mxREAL);
             uint8_t* tiff = (uint8_t*)mxGetPr(plhs[0]);
             err = readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
         }
         else if(bits == 16){
-            plhs[0] = mxCreateNumericArray(3,dim,mxUINT16_CLASS, mxREAL);
+            plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxUINT16_CLASS, mxREAL);
             uint16_t* tiff = (uint16_t*)mxGetPr(plhs[0]);
             err = readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
         }
         else if(bits == 32){
-            plhs[0] = mxCreateNumericArray(3,dim,mxSINGLE_CLASS, mxREAL);
+            plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxSINGLE_CLASS, mxREAL);
             float* tiff = (float*)mxGetPr(plhs[0]);
             err = readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
         }
         else if(bits == 64){
-            plhs[0] = mxCreateNumericArray(3,dim,mxDOUBLE_CLASS, mxREAL);
+            plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxDOUBLE_CLASS, mxREAL);
             double* tiff = (double*)mxGetPr(plhs[0]);
             err = readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
         }
