@@ -13,14 +13,14 @@ An efficient parallel Tiff reader/writer that utilizes LibTIFF and OpenMP.
 
 ### Usage
 
-#### parallelReadTiff - Read a Tiff image into an array
-````
-im = parallelReadTiff('path/to/file.tif');
-````
-
 #### getImageSizeMex - Get the dimensions of a Tiff image
 ````
 size = getImageSizeMex('path/to/file.tif');
+````
+
+#### parallelReadTiff - Read a Tiff image into an array
+````
+im = parallelReadTiff('path/to/file.tif');
 ````
 
 #### parallelWriteTiff - Write an array out as a Tiff image
