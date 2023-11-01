@@ -12,15 +12,38 @@ An efficient parallel Tiff reader/writer that utilizes LibTIFF and OpenMP.
 3. You can now put the mex files wherever you'd like and add them to your path if needed
 
 ### Usage
-Note: For filepath separators, on Mac/Linux you can use / and on Windows you can use \
 
 #### parallelReadTiff - Read a Tiff image into an array
+````
 im = parallelReadTiff('path/to/file.tif');
+````
 
 #### getImageSizeMex - Get the dimensions of a Tiff image
+````
 size = getImageSizeMex('path/to/file.tif');
+````
 
 #### parallelWriteTiff - Write an array out as a Tiff image
+````
 im = rand(100,100,100);
-
 parallelWriteTiff('path/to/file.tif',im);
+````
+
+## Compiling with CMake
+
+The C++ library can be compiled using the CMakeLists.txt file
+
+### Prerequisites
+1. Dependencies are included in the dependencies folder
+2. Currently the only officially supported compiler is gcc on Linux and Mac and MinGW on Windows but others may work
+
+### Download and Install
+````
+git clone https://github.com/abcucberkeley/cpp-zarr
+cd cpp-zarr
+mkdir build
+cd build
+cmake ..
+make -j
+make install
+````
