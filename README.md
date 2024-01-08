@@ -48,6 +48,7 @@ cmake ..
 make -j
 make install
 ````
+
 ## Reference
 
 Please cite our software if you find it useful in your work:
