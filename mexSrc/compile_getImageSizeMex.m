@@ -26,7 +26,7 @@ elseif ismac
     if ~exist(releaseFolder, 'dir')
         mkdir(releaseFolder);
     end    
-    mex -v -outdir ../mac -output getImageSizeMex.mexw64 CXX="/usr/local/bin/g++-13" CXXOPTIMFLAGS='-O3 -DNDEBUG' LDOPTIMFLAGS='-O3 -DNDEBUG' CXXFLAGS='-fno-common -arch x86_64 -mmacosx-version-min=10.15 -fexceptions -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -std=c++11 -O3 -fopenmp -DMATLAB_DEFAULT_RELEASE=R2017b  -DUSE_MEX_CMD   -DMATLAB_MEX_FILE' LDFLAGS='$LDFLAGS -O3 -fopenmp' '-I/usr/local/include/' -ltiff getimagesizemex.cpp ../src/helperfunctions.cpp
+    mex -v -outdir ../mac -output getImageSizeMex.mexw64 CXX="/usr/local/bin/g++-13" CXXOPTIMFLAGS='-O3 -DNDEBUG' LDOPTIMFLAGS='-O3 -DNDEBUG' CXXFLAGS='-fno-common -arch x86_64 -mmacosx-version-min=10.15 -fexceptions -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -std=c++11 -O3 -fopenmp -DMATLAB_DEFAULT_RELEASE=R2017b  -DUSE_MEX_CMD   -DMATLAB_MEX_FILE' LDFLAGS='$LDFLAGS -O3 -fopenmp' '-I/usr/local/include/' -lstdc++ -ltiff getimagesizemex.cpp ../src/helperfunctions.cpp
 
     % We need to change all the current paths to be relative to the mex file
     system('install_name_tool -change /usr/local/opt/gcc/lib/gcc/current/libstdc++.6.dylib @loader_path/libstdc++.6.0.32.dylib ../mac/getImageSizeMex.mexmaci64');
