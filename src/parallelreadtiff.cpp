@@ -2,7 +2,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits.h>
-#include "omp.h"
+#include <omp.h>
 #include "tiffio.h"
 
 

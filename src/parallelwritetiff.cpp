@@ -1,7 +1,7 @@
 #include <cstdint>
 #include <cmath>
 #include <cstring>
-#include "omp.h"
+#include <omp.h>
 #include "tiffio.h"
 #include "lzwencode.h"
 
