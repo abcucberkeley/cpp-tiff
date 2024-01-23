@@ -2,6 +2,10 @@
 #include <cstring>
 #include <sys/stat.h>
 #include <string>
+// For std::replace
+#ifdef _WIN32
+#include <algorithm>
+#endif
 #include "tiffio.h"
 #include "helperfunctions.h"
 // Handle the tilde character in filenames on Linux/Mac
@@ -80,10 +84,12 @@ uint8_t isImageJIm(const char* fileName){
             }
             uint16_t compressed = 1;
             TIFFGetField(tif, TIFFTAG_COMPRESSION, &compressed);
+            TIFFClose(tif);
             if(compressed != 1) return 0;
             else return 1;
         }
     }
+    TIFFClose(tif);
     return 0;
 }
 
@@ -95,12 +101,14 @@ uint64_t imageJImGetZ(const char* fileName){
         if(strstr(tiffDesc, "ImageJ")){
             char* nZ = strstr(tiffDesc,"images=");
             if(nZ){
+                TIFFClose(tif);
                 nZ+=7;
                 char* temp;
                 return strtol(nZ,&temp,10);
             }
         }
     }
+    TIFFClose(tif);
     return 0;
 }
 
