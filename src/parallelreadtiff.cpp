@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <omp.h>
 #include "tiffio.h"
+#include "../src/helperfunctions.h"
 
 
 // Backup method in case there are errors reading strips
@@ -635,4 +636,148 @@ uint8_t readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* f
         free(tiffC);
     }
 	return err;
+}
+
+
+// tiff pointer guaranteed to be NULL or the correct size array for the tiff file
+void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t flipXY)
+{
+	TIFFSetWarningHandler(DummyHandler);
+	TIFF* tif = TIFFOpen(fileName, "r");
+	if(!tif) return NULL;
+
+	uint64_t x = 1,y = 1,z = 1,bits = 1, startSlice = 0;
+	TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &x);
+	TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &y);
+
+	uint16_t s = 0, m = 0, t = 1;
+	while(TIFFSetDirectory(tif,t)){
+		s = t;
+		t *= 8;
+		if(s > t){
+			t = 65535;
+			printf("Number of slices > 32768\n");
+			break;
+		}
+	}
+	while(s != t){
+		m = (s+t+1)/2;
+		if(TIFFSetDirectory(tif,m)){
+			s = m;
+		}
+		else{
+			if(m > 0) t = m-1;
+			else t = m;
+		}
+	}
+	z = s+1;
+
+	TIFFGetField(tif, TIFFTAG_BITSPERSAMPLE, &bits);
+	uint64_t stripSize = 1;
+	TIFFGetField(tif, TIFFTAG_ROWSPERSTRIP, &stripSize);
+	TIFFClose(tif);
+
+	// Check if image is an imagej image with imagej metadata
+	// Get the correct
+	uint8_t imageJIm = 0;
+	if(isImageJIm(fileName)){
+		imageJIm = 1;
+		uint64_t tempZ = imageJImGetZ(fileName);
+		if(tempZ) z = tempZ;
+	}
+
+
+	if(imageJIm){
+		if(bits == 8){
+			if(!tiff) tiff = (uint8_t*)malloc(x*y*z*sizeof(uint8_t));
+			readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize,flipXY);
+			return (void*)tiff;
+		}
+		else if(bits == 16){
+			if(!tiff) tiff = (uint16_t*)malloc(x*y*z*sizeof(uint16_t));
+			readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+			return (void*)tiff;
+		}
+		else if(bits == 32){
+			if(!tiff) tiff = (float*)malloc(x*y*z*sizeof(float));
+			readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+			return (void*)tiff;
+		}
+		else if(bits == 64){
+			if(!tiff) tiff = (double*)malloc(x*y*z*sizeof(double));
+			readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+			return (void*)tiff;
+		}
+		else{
+			return NULL;
+		}
+	}
+	else if(z <= 1){
+		if(bits == 8){
+			if(!tiff) tiff = (uint8_t*)malloc(x*y*z*sizeof(uint8_t));
+			readTiffParallel2D(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize,flipXY);
+			return (void*)tiff;
+		}
+		else if(bits == 16){
+			if(!tiff) tiff = (uint16_t*)malloc(x*y*z*sizeof(uint16_t));
+			readTiffParallel2D(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+			return (void*)tiff;
+		}
+		else if(bits == 32){
+			if(!tiff) tiff = (float*)malloc(x*y*z*sizeof(float));
+			readTiffParallel2D(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+			return (void*)tiff;
+		}
+		else if(bits == 64){
+			if(!tiff) tiff = (double*)malloc(x*y*z*sizeof(double));
+			readTiffParallel2D(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+			return (void*)tiff;
+		}
+		else{
+			return NULL;
+		}
+	}
+	else{
+		if(bits == 8){
+			if(!tiff) tiff = (uint8_t*)malloc(x*y*z*sizeof(uint8_t));
+			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+			return (void*)tiff;
+		}
+		else if(bits == 16){
+			if(!tiff) tiff = (uint16_t*)malloc(x*y*z*sizeof(uint16_t));
+			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+			return (void*)tiff;
+		}
+		else if(bits == 32){
+			if(!tiff) tiff = (float*)malloc(x*y*z*sizeof(float));
+			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+			return (void*)tiff;
+		}
+		else if(bits == 64){
+			if(!tiff) tiff = (double*)malloc(x*y*z*sizeof(double));
+			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize,flipXY);
+			return (void*)tiff;
+		}
+		else{
+			return NULL;
+		}
+	}
+
+	// Should never get here but return NULL if we do
+	return NULL;
+}
+
+void* readTiffParallelWrapper(const char* fileName)
+{
+	return readTiffParallelWrapperHelper(fileName,NULL,1);
+}
+
+void* readTiffParallelWrapperNoXYFlip(const char* fileName)
+{
+	return readTiffParallelWrapperHelper(fileName,NULL,0);
+}
+
+// tTiff doesn't matter as tiff is set in the function
+void readTiffParallelWrapperSet(const char* fileName, void* tiff){
+	void* tTiff = readTiffParallelWrapperHelper(fileName,tiff,0);
 }
