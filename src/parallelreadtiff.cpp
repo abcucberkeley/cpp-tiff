@@ -38,7 +38,8 @@ uint8_t readTiffParallelBak(uint64_t x, uint64_t y, uint64_t z, const char* file
             {
                 TIFFReadScanline(tif, buffer, i, 0);
                 if(!flipXY){
-                    memcpy(tiff+((i*x)*bytes),buffer,x*bytes);
+                    // Probably need to fix this
+                    memcpy(tiff+(((i*y)+((dir-startSlice)*(x*y)))*bytes),buffer,x*bytes);
                     continue;
                 }
                 //loading the data into a buffer
@@ -145,7 +146,7 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
                         break;
                     }
                     if(!flipXY){
-                        memcpy(tiff+((i*stripSize*x)*bytes),buffer,cBytes);
+                        memcpy(tiff+(((i*stripSize*x)+((dir-startSlice)*(x*y)))*bytes),buffer,cBytes);
                         continue;
                     }
                     switch(bits){
@@ -755,7 +756,7 @@ void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t fl
 		}
 		else if(bits == 64){
 			if(!tiff) tiff = (double*)malloc(x*y*z*sizeof(double));
-			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize,flipXY);
+			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
 			return (void*)tiff;
 		}
 		else{
