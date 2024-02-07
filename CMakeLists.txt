@@ -43,9 +43,7 @@ add_subdirectory(${ZSTD_DIR}/build/cmake)
 set_property(TARGET libzstd_static PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 # Add libtiff
-if(WIN32)
 include_directories(${CMAKE_BINARY_DIR}/dependencies/tiff-4.6.0/libtiff)
-endif()
 include_directories(${ZSTD_DIR}/lib)
 set(ZLIB_INCLUDE_DIR  ${ZLIB_DIR} CACHE STRING "" FORCE)
 set(ZLIB_LIBRARY  ${CMAKE_BINARY_DIR}/dependencies/zlib-1.2.8/${ZLIB_STATIC_NAME} CACHE STRING "" FORCE)
