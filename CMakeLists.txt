@@ -59,7 +59,7 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 # Disable jpeg and lzma until I can add the dependencies
 set(jpeg OFF CACHE BOOL "" FORCE)
 set(lzma OFF CACHE BOOL "" FORCE)
-
+set(jbig OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(${LIBTIFF_DIR})
 set_property(TARGET tiff PROPERTY POSITION_INDEPENDENT_CODE ON)
