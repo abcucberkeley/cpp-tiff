@@ -1,6 +1,9 @@
 # cpp-tiff
 An efficient parallel Tiff reader/writer that utilizes LibTIFF and OpenMP.
 
+## Limitations
+1. Currently RGB tiffs are not supported but support may be added in the future
+
 ## Quick Start Guide (MATLAB)
 
 ### Prerequisites
