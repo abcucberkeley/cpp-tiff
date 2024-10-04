@@ -4,3 +4,9 @@ requires = [
     "pybind11>=2.10.0",
 ]
 build-backend = "setuptools.build_meta"
+
+[tool.cibuildwheel]
+environment = {CXX="g++", CC="gcc"}
+
+[tool.cibuilddwheel.windows]
+CIBW_USE_MINGW = "true"
