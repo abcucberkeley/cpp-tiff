@@ -4,7 +4,7 @@
 #include "parallelwritetiff.h"
 #include "helperfunctions.h"
 
-pybind11::array read_tiff(const std::string& fileName){
+pybind11::array pybind11_read_tiff(const std::string& fileName){
 	uint64_t* dims = getImageSize(fileName.c_str());
 	size_t size = dims[0]*dims[1]*dims[2];
 	uint64_t dtype = getDataType(fileName.c_str());
@@ -13,19 +13,19 @@ pybind11::array read_tiff(const std::string& fileName){
 	
 	switch (dtype) {
         case 8:  // 8-bit unsigned int
-            return pybind11::array_t<uint8_t>(size, static_cast<uint8_t*>(data));
+            return pybind11::array_t<uint8_t>({dims[0], dims[1], dims[2]}, static_cast<uint8_t*>(data));
         case 16: // 16-bit unsigned int
             return pybind11::array_t<uint16_t>({dims[0], dims[1], dims[2]}, static_cast<uint16_t*>(data));
         case 32: // 32-bit float
-            return pybind11::array_t<float>(size, static_cast<float*>(data));
+            return pybind11::array_t<float>({dims[0], dims[1], dims[2]}, static_cast<float*>(data));
         case 64: // 64-bit double
-            return pybind11::array_t<double>(size, static_cast<double*>(data));
+            return pybind11::array_t<double>({dims[0], dims[1], dims[2]}, static_cast<double*>(data));
         default:
             throw std::runtime_error("Unsupported data type");
     }
 }
 
-void write_tiff(const std::string &fileName, const pybind11::array &data, const bool flipXY = false) {
+void pybind11_write_tiff(const std::string &fileName, const pybind11::array &data, const bool flipXY = false) {
     // Determine the dtype based on the NumPy array type
     pybind11::buffer_info info = data.request();
 
@@ -60,7 +60,7 @@ PYBIND11_MODULE(cpptiff, m) {
 
     m.doc() = "cpp-tiff python bindings";
 
-	m.def("read_tiff", &read_tiff, "Read a tiff file");
+	m.def("pybind11_read_tiff", &pybind11_read_tiff, "Read a tiff file");
 
-	m.def("write_tiff", &write_tiff, pybind11::arg("fileName"), pybind11::arg("data"), pybind11::arg("flipXY") = false, "Write a tiff file");
+	m.def("pybind11_write_tiff", &pybind11_write_tiff, pybind11::arg("fileName"), pybind11::arg("data"), pybind11::arg("flipXY") = false, "Write a tiff file");
 }

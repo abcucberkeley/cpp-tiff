@@ -1,1 +1,1 @@
-from .cpptiff import *
+from .cpptiffwrappers import read_tiff, write_tiff
