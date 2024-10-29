@@ -14,8 +14,11 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
 
 project(
   cpp-tiff
-  VERSION 1.1.0
+  VERSION 1.3.0
   LANGUAGES CXX)
+
+set(TIFF_VER "tiff-4.7.0")
+set(ZSTD_VER "zstd-1.5.6")
 
 # Set the RPATH to $ORIGIN when installing if applicable
 set(CMAKE_INSTALL_RPATH $ORIGIN)
@@ -38,20 +41,20 @@ set(LIBDEFLATE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/libdeflate-1.18")
 add_subdirectory(${LIBDEFLATE_DIR})
 set_property(TARGET libdeflate_static PROPERTY POSITION_INDEPENDENT_CODE ON)
 
-set(ZSTD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/zstd-1.5.5")
+set(ZSTD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/${ZSTD_VER}")
 add_subdirectory(${ZSTD_DIR}/build/cmake)
 set_property(TARGET libzstd_static PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 # Add libtiff
-include_directories(${CMAKE_BINARY_DIR}/dependencies/tiff-4.6.0/libtiff)
+include_directories(${CMAKE_BINARY_DIR}/dependencies/${TIFF_VER}/libtiff)
 include_directories(${ZSTD_DIR}/lib)
 set(ZLIB_INCLUDE_DIR  ${ZLIB_DIR} CACHE STRING "" FORCE)
 set(ZLIB_LIBRARY  ${CMAKE_BINARY_DIR}/dependencies/zlib-1.2.8/${ZLIB_STATIC_NAME} CACHE STRING "" FORCE)
 set(Deflate_INCLUDE_DIR  ${LIBDEFLATE_DIR} CACHE STRING "" FORCE)
 set(Deflate_LIBRARY  ${CMAKE_BINARY_DIR}/dependencies/libdeflate-1.18/libdeflate.a CACHE STRING "" FORCE)
 set(ZSTD_INCLUDE_DIR  ${ZSTD_DIR}/lib CACHE STRING "" FORCE)
-set(ZSTD_LIBRARY  ${CMAKE_BINARY_DIR}/dependencies/zstd-1.5.5/build/cmake/lib/libzstd.a CACHE STRING "" FORCE)
-set(LIBTIFF_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/tiff-4.6.0")
+set(ZSTD_LIBRARY  ${CMAKE_BINARY_DIR}/dependencies/${ZSTD_VER}/build/cmake/lib/libzstd.a CACHE STRING "" FORCE)
+set(LIBTIFF_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/${TIFF_VER}")
 set(tiff-tools OFF CACHE BOOL "" FORCE)
 set(tiff-tests OFF CACHE BOOL "" FORCE)
 set(tiff-contrib OFF CACHE BOOL "" FORCE)
@@ -90,10 +93,10 @@ target_include_directories(cppTiff_shared PRIVATE
 
 # Link against the libraries
 target_link_libraries(cppTiff_shared PRIVATE
-    ${CMAKE_BINARY_DIR}/dependencies/tiff-4.6.0/libtiff/libtiff.a
+    ${CMAKE_BINARY_DIR}/dependencies/${TIFF_VER}/libtiff/libtiff.a
     ${CMAKE_BINARY_DIR}/dependencies/zlib-1.2.8/${ZLIB_STATIC_NAME}
     ${CMAKE_BINARY_DIR}/dependencies/libdeflate-1.18/libdeflate.a
-    ${CMAKE_BINARY_DIR}/dependencies/zstd-1.5.5/build/cmake/lib/libzstd.a
+    ${CMAKE_BINARY_DIR}/dependencies/${ZSTD_VER}/build/cmake/lib/libzstd.a
     -static-libgcc
     -static-libstdc++
     OpenMP::OpenMP_CXX
