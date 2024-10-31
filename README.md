@@ -4,7 +4,57 @@ An efficient parallel Tiff reader/writer that utilizes LibTIFF and OpenMP.
 ## Limitations
 1. Currently RGB tiffs are not supported but support may be added in the future
 
-## Quick Start Guide (MATLAB)
+## Python
+
+A Python version of cpp-tiff is available through pip
+
+### Prerequisites
+1. Linux: All Linux distros made within the past 10 years should work
+2. Mac Apple Silicon (M1, M2, etc.): macOS 13 or newer is required
+3. Mac Intel: macOS 12 or newer is required
+4. Windows: Windows 10 or newer is required
+
+### Installation
+````
+pip install cpp-tiff
+````
+
+### Usage
+
+The reader returns a zyx numpy array for the given tiff file
+
+The writer takes an output filename and a zyx numpy array
+
+By default, the writer uses lzw compression but you can also pass 'none' as the third argument
+
+#### Read and Write a tiff file
+````
+import cpptiff
+im = cpptiff.read_tiff('filename.tif')
+# Do some processing here
+cpptiff.write_tiff('outputFilename.tif', im)
+````
+
+## CMake
+
+The C++ library can be compiled using the CMakeLists.txt file
+
+### Prerequisites
+1. Dependencies are included in the dependencies folder
+2. Currently the only officially supported compiler is gcc on Linux and Mac and MinGW on Windows but others may work
+
+### Download and Install
+````
+git clone https://github.com/abcucberkeley/cpp-zarr
+cd cpp-zarr
+mkdir build
+cd build
+cmake ..
+make -j
+make install
+````
+
+## MATLAB
 
 ### Prerequisites
 1. None! The parallel reader and writer mex files will work with the most recent version of Matlab.
@@ -31,25 +81,6 @@ im = parallelReadTiff('path/to/file.tif');
 ````
 im = rand(100,100,100);
 parallelWriteTiff('path/to/file.tif',im);
-````
-
-## Compiling with CMake
-
-The C++ library can be compiled using the CMakeLists.txt file
-
-### Prerequisites
-1. Dependencies are included in the dependencies folder
-2. Currently the only officially supported compiler is gcc on Linux and Mac and MinGW on Windows but others may work
-
-### Download and Install
-````
-git clone https://github.com/abcucberkeley/cpp-zarr
-cd cpp-zarr
-mkdir build
-cd build
-cmake ..
-make -j
-make install
 ````
 
 ## Reference
