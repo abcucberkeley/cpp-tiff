@@ -1,8 +1,27 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
+#include <vector>
 #include "parallelreadtiff.h"
 #include "parallelwritetiff.h"
 #include "helperfunctions.h"
+
+template <typename T>
+pybind11::array_t<T> create_pybind11_array(void* data, const uint64_t* dims) {
+    auto deleter = [](void* ptr) { free(ptr); };
+
+    std::vector<ssize_t> strides = {
+        static_cast<ssize_t>(sizeof(T)),
+        static_cast<ssize_t>(dims[1] * sizeof(T)),
+        static_cast<ssize_t>(dims[1] * dims[0] * sizeof(T))
+    };
+
+    return pybind11::array_t<T>(
+        {dims[1], dims[0], dims[2]},  // shape (y, x, z)
+        strides,
+        static_cast<T*>(data),
+        pybind11::capsule(data, deleter)
+    );
+}
 
 pybind11::array pybind11_read_tiff(const std::string& fileName){
 	uint64_t* dims = getImageSize(fileName.c_str());
@@ -10,48 +29,15 @@ pybind11::array pybind11_read_tiff(const std::string& fileName){
 
 	void* data = readTiffParallelWrapperNoXYFlip(fileName.c_str());
 
-	// Custom deleter to release memory when Python array is destroyed
-    auto deleter = [](void* ptr) {
-        free(ptr);
-    };
-
 	switch (dtype) {
         case 8:  // 8-bit unsigned int
-            return pybind11::array_t<uint8_t>(
-                {dims[1], dims[0], dims[2]},  // shape (x, y, z)
-                {sizeof(uint8_t),            // strides
-                    dims[1] * sizeof(uint8_t),  
-                    dims[1] * dims[0] * sizeof(uint8_t)},
-                static_cast<uint8_t*>(data),
-                pybind11::capsule(data, deleter)
-            ); 
+            return create_pybind11_array<uint8_t>(data, dims);
 		case 16: // 16-bit unsigned int
-            return pybind11::array_t<uint16_t>(
-                {dims[1], dims[0], dims[2]},  // shape (x, y, z)
-                {sizeof(uint16_t),            // strides
-                    dims[1] * sizeof(uint16_t),
-                    dims[1] * dims[0] * sizeof(uint16_t)},
-                static_cast<uint16_t*>(data),
-                pybind11::capsule(data, deleter)
-            );
+            return create_pybind11_array<uint16_t>(data, dims);
         case 32: // 32-bit float
-            return pybind11::array_t<float>(
-                {dims[1], dims[0], dims[2]},  // shape (x, y, z)
-                {sizeof(float),            // strides
-                    dims[1] * sizeof(float),  
-                    dims[1] * dims[0] * sizeof(float)},
-                static_cast<float*>(data),
-                pybind11::capsule(data, deleter)
-            );
+            return create_pybind11_array<float>(data, dims);
         case 64: // 64-bit double
-            return pybind11::array_t<double>(
-                {dims[1], dims[0], dims[2]},  // shape (x, y, z)
-                {sizeof(double),            // strides
-                    dims[1] * sizeof(double),  
-                    dims[1] * dims[0] * sizeof(double)},
-                static_cast<double*>(data),
-                pybind11::capsule(data, deleter)
-            );
+            return create_pybind11_array<double>(data, dims);
         default:
             throw std::runtime_error("Unsupported data type");
     }

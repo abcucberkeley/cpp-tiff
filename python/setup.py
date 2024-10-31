@@ -67,7 +67,7 @@ ext_modules = [
         library_dirs=['build/install/lib64','build/install/lib'],
         libraries=['cppTiff'],
         sources=["cpptiff.cpp"],
-        extra_link_args=['-static-libstdc++', '-Wl,-rpath,$ORIGIN' if system=="Linux" else ''],
+        extra_link_args=['-static-libstdc++']
     ),
 ]
 
