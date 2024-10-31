@@ -43,6 +43,12 @@ im = cpptiff.read_tiff('filename.tif')
 cpptiff.write_tiff('outputFilename.tif', im)
 ````
 
+#### Get the shape of a tiff file without reading the image
+````
+import cpptiff
+im_shape = cpptiff.get_image_shape('filename.tif')
+````
+
 ## CMake
 
 The C++ library can be compiled using the CMakeLists.txt file
