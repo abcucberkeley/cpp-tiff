@@ -75,8 +75,11 @@ ext_modules = [
 # Packaging for PyPI
 setup(
     name="cpp-tiff",
-    version="1.0.0",
-    description="Python bindings for cpp-tiff",
+    version="1.0.1",
+    description="Python wrappers for cpp-tiff",
+    url='https://github.com/abcucberkeley/cpp-tiff',
+    author='Matthew Mueller',
+    author_email='matthewmueller@berkeley.edu',
     packages=find_packages(),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExt} if system=="Linux" else {"build_ext": build_ext},

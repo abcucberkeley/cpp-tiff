@@ -71,6 +71,14 @@ void pybind11_write_tiff(const std::string &fileName, const pybind11::array &dat
     writeTiffParallelHelper(fileName.c_str(), info.ptr, dtype, "w", dims[0], dims[1], dims[2], 0, 0, compression);
 }
 
+pybind11::tuple pybind11_get_image_shape(const std::string& fileName){
+    uint64_t* dims = getImageSize(fileName.c_str());
+	pybind11::tuple shape = pybind11::make_tuple(dims[2], dims[0], dims[1]);
+    free(dims);
+	return shape;
+}
+
+
 PYBIND11_MODULE(cpptiff, m) {
 	pybind11::module::import("numpy");
 
@@ -79,4 +87,6 @@ PYBIND11_MODULE(cpptiff, m) {
 	m.def("pybind11_read_tiff", &pybind11_read_tiff, "Read a tiff file");
 
 	m.def("pybind11_write_tiff", &pybind11_write_tiff, pybind11::arg("fileName"), pybind11::arg("data"), pybind11::arg("compression"), "Write a tiff file");
+
+	m.def("pybind11_get_image_shape", &pybind11_get_image_shape, "Get the image shape without reading the entire image");
 }
