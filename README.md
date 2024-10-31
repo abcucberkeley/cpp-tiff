@@ -9,10 +9,18 @@ An efficient parallel Tiff reader/writer that utilizes LibTIFF and OpenMP.
 A Python version of cpp-tiff is available through pip
 
 ### Prerequisites
-1. Linux: All Linux distros made within the past 10 years should work
-2. Mac Apple Silicon (M1, M2, etc.): macOS 13 or newer is required
-3. Mac Intel: macOS 12 or newer is required
-4. Windows: Windows 10 or newer is required
+
+#### Python
+Python version >=3.8
+
+#### OS
+Linux: All Linux distros made within the past 10 years should work
+
+Mac Apple Silicon (M1, M2, etc.): macOS 13 or newer is required
+
+Mac Intel: macOS 12 or newer is required
+
+Windows: Windows 10 or newer is required
 
 ### Installation
 ````
