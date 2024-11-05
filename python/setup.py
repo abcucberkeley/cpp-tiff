@@ -29,7 +29,7 @@ class BuildExt(build_ext):
         cmake_build_dir = os.path.join(current_dir, "build")
         install_dir = os.path.join(cmake_build_dir, "install")
 
-        # Step 1: Build and install CMake-based dependency
+        # Build and install CMake-based dependency
         os.makedirs(cmake_build_dir, exist_ok=True)
 
         # Run cmake configuration and build commands
@@ -48,15 +48,7 @@ class BuildExt(build_ext):
             print("Error during CMake build and install:", e)
             raise
 
-        # Step 2: Copy the library to the Python package directory
-        lib_src = os.path.join(install_dir, "lib64", "libcppTiff.so")
-        lib_dst_dir = os.path.join(current_dir, "cpptiff")
-        lib_dst = os.path.join(lib_dst_dir, "libcppTiff.so")
-
-        os.makedirs(lib_dst_dir, exist_ok=True)
-        shutil.copy(lib_src, lib_dst)
-
-        # Step 3: Run the regular build_ext to compile the Python extension
+        # Run the regular build_ext to compile the Python extension
         super().run()
 
 
