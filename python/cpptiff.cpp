@@ -24,7 +24,9 @@ pybind11::array_t<T> create_pybind11_array(void* data, const uint64_t* dims) {
 }
 
 pybind11::array pybind11_read_tiff(const std::string& fileName){
-	uint64_t* dims = getImageSize(fileName.c_str());
+	uint64_t* dimsPtr = getImageSize(fileName.c_str());
+	uint64_t dims[3] = {dimsPtr[0], dimsPtr[1], dimsPtr[2]};
+	free(dimsPtr);
 	uint64_t dtype = getDataType(fileName.c_str());
 
 	void* data = readTiffParallelWrapperNoXYFlip(fileName.c_str());
