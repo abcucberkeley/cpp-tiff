@@ -27,6 +27,10 @@ pybind11::array pybind11_read_tiff(const std::string& fileName){
 	uint64_t* dimsPtr = getImageSize(fileName.c_str());
 	uint64_t dims[3] = {dimsPtr[0], dimsPtr[1], dimsPtr[2]};
 	free(dimsPtr);
+    if(isImageJIm(fileName.c_str())){
+        uint64_t tempZ = imageJImGetZ(fileName.c_str());
+        if(tempZ) dims[2] = tempZ;
+    }
 	uint64_t dtype = getDataType(fileName.c_str());
 
 	void* data = readTiffParallelWrapperNoXYFlip(fileName.c_str());
