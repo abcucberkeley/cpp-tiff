@@ -158,6 +158,8 @@ uint8_t writeTiffThread(const uint64_t x, const uint64_t y, const uint64_t z, co
         }
         TIFFWriteDirectory(tif);
     }
+	free(comprA);
+	free(cSizes);
     TIFFClose(tif);
     return 0;
 }
@@ -202,9 +204,7 @@ uint8_t writeTiffParallel(const uint64_t x, const uint64_t y, const uint64_t z, 
                 cSizes[i+(dir*stripsPerDir)] = lzwEncode((uint8_t*)tiff+((((i*stripSize)*x)+((dir-startSlice)*(x*y)))*(bits/8)),comprA[i+(dir*stripsPerDir)],len+(extraBytes*(bits/8)));
             }
         }
-        free(comprA);
     }
-    free(cSizes);
     return writerThreadResult.get();
 }
 
