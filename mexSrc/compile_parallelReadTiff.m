@@ -41,5 +41,5 @@ elseif ispc
     if ~exist(releaseFolder, 'dir')
         mkdir(releaseFolder);
     end
-    mex  -outdir ../windows -output parallelReadTiff.mexw64 -v CXX="C:/mingw64/bin/g++" -v CXXOPTIMFLAGS="-DNDEBUG -O3" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O3 -DNDEBUG" CXXFLAGS='$CXXFLAGS -fopenmp -O3' LDFLAGS='$LDFLAGS -fopenmp -O3' -I'C:/Program Files (x86)/tiff/include' -L'C:\Program Files (x86)\tiff\lib' -ltiff.dll parallelreadtiffmex.cpp ../src/helperfunctions.cpp ../src/parallelreadtiff.cpp
+    mex  -outdir ../windows -output parallelReadTiff.mexw64 -v CXX="C:/mingw64/bin/g++" -v CXXOPTIMFLAGS="-DNDEBUG -O3" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O3 -DNDEBUG" CXXFLAGS='$CXXFLAGS -fopenmp -O3' LDFLAGS='$LDFLAGS -fopenmp -O3' -I'C:/Users/matt/Documents/GitHub/c-tiff/jenkinsBuild/install/include' -L'C:/Users/matt/Documents/GitHub/c-tiff/jenkinsBuild/install/lib' -lcppTiff.dll parallelreadtiffmex.cpp
 end
