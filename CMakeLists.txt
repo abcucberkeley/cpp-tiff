@@ -82,7 +82,9 @@ add_dependencies(cppTiff_shared libdeflate_static)
 add_dependencies(cppTiff_shared libzstd_static)
 add_dependencies(cppTiff_shared tiff)
 
-set_target_properties(cppTiff_shared PROPERTIES PUBLIC_HEADER "${LIBTIFF_DIR}/libtiff/tiffio.h;${ZSTD_DIR}/lib/zstd.h;${SRC_DIR}/helperfunctions.h;${SRC_DIR}/lzwencode.h;${SRC_DIR}/parallelreadtiff.h;${SRC_DIR}/parallelwritetiff.h")
+file(GLOB LIBTIFF_HEADERS "${LIBTIFF_DIR}/libtiff/*.h")
+
+set_target_properties(cppTiff_shared PROPERTIES PUBLIC_HEADER "${LIBTIFF_HEADERS};${CMAKE_BINARY_DIR}/dependencies/${TIFF_VER}/libtiff/tiffconf.h;${ZSTD_DIR}/lib/zstd.h;${SRC_DIR}/helperfunctions.h;${SRC_DIR}/lzwencode.h;${SRC_DIR}/parallelreadtiff.h;${SRC_DIR}/parallelwritetiff.h")
 
 # Include the header files
 target_include_directories(cppTiff_shared PRIVATE
