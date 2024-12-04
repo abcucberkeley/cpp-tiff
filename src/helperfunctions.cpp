@@ -141,6 +141,7 @@ uint32_t getImageSizeZ(const char* fileName){
         }
     }
     z = s+1;
+    TIFFClose(tif);
     return z;
 }
 
