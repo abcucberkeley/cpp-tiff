@@ -8,6 +8,8 @@ def read_tiff(file_name):
         raise Exception(f'{file_name} does not exist')
     im = pybind11_read_tiff(file_name)
     im = np.transpose(im, (2, 1, 0))
+    if im.shape[0] == 1:
+        im = np.squeeze(im, axis=0)
     return im
 
 

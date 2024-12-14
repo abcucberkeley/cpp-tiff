@@ -67,7 +67,7 @@ ext_modules = [
 # Packaging for PyPI
 setup(
     name="cpp-tiff",
-    version="1.0.9",
+    version="1.0.10",
     description="Python wrappers for cpp-tiff",
     url='https://github.com/abcucberkeley/cpp-tiff',
     author='Matthew Mueller',
