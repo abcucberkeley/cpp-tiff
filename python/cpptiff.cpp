@@ -1,5 +1,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
+#include <pybind11/stl.h>
 #include <vector>
 #include "parallelreadtiff.h"
 #include "parallelwritetiff.h"
@@ -23,7 +24,7 @@ pybind11::array_t<T> create_pybind11_array(void* data, const uint64_t* dims) {
     );
 }
 
-pybind11::array pybind11_read_tiff(const std::string& fileName){
+pybind11::array pybind11_read_tiff(const std::string& fileName, const std::vector<uint64_t> &zRange = {}){
 	uint64_t* dimsPtr = getImageSize(fileName.c_str());
 	uint64_t dims[3] = {dimsPtr[0], dimsPtr[1], dimsPtr[2]};
 	free(dimsPtr);
@@ -33,7 +34,16 @@ pybind11::array pybind11_read_tiff(const std::string& fileName){
     }
 	uint64_t dtype = getDataType(fileName.c_str());
 
-	void* data = readTiffParallelWrapperNoXYFlip(fileName.c_str());
+	void* data = readTiffParallelWrapperNoXYFlip(fileName.c_str(), zRange);
+
+    if(zRange.size()){
+        if(zRange.size() == 2){
+            dims[2] = zRange[1]+1-zRange[0];
+        }
+        else{
+            dims[2] = 1;
+        }
+    }
 
 	switch (dtype) {
         case 8:  // 8-bit unsigned int
