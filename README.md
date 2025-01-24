@@ -54,7 +54,7 @@ im = cpptiff.read_tiff('filename.tif', 0)
 ````
 import cpptiff
 # Read the first two slices
-im = cpptiff.read_tiff('filename.tif', [0, 1])
+im = cpptiff.read_tiff('filename.tif', [0, 2])
 ````
 
 #### Get the shape of a tiff file without reading the image
