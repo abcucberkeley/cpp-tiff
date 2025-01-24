@@ -43,6 +43,20 @@ im = cpptiff.read_tiff('filename.tif')
 cpptiff.write_tiff('outputFilename.tif', im)
 ````
 
+#### Read a single slice of a tiff file
+````
+import cpptiff
+# Read the first slice
+im = cpptiff.read_tiff('filename.tif', 0)
+````
+
+#### Read a specified slice range of a tiff file
+````
+import cpptiff
+# Read the first two slices
+im = cpptiff.read_tiff('filename.tif', [0, 1])
+````
+
 #### Get the shape of a tiff file without reading the image
 ````
 import cpptiff
