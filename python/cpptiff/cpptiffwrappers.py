@@ -5,7 +5,7 @@ from .cpptiff import pybind11_read_tiff, pybind11_write_tiff, pybind11_get_image
 
 def read_tiff(file_name, z_range=None):
     if not os.path.isfile(file_name):
-        raise Exception(f'{file_name} does not exist')
+        raise Exception(f'{file_name} does not exist!')
     if z_range is None:
         z_range = []
     else:
@@ -13,7 +13,12 @@ def read_tiff(file_name, z_range=None):
             if np.isscalar(z_range):
                 z_range = [z_range]
             else:
-                raise Exception(f'z_range must be a number or list of two numbers')
+                raise Exception(f'z_range must be a number or list of two numbers!')
+        elif len(z_range) == 2:
+            if z_range[0] > z_range[1]:
+                raise Exception(f'z_range is invalid! {z_range[0]} > {z_range[1]}')
+            elif z_range[0] == z_range[1]:
+                raise Exception(f'z_range is invalid! {z_range[0]} == {z_range[1]}')
 
     im = pybind11_read_tiff(file_name, z_range)
     im = np.transpose(im, (2, 1, 0))

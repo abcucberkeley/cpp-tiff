@@ -38,7 +38,7 @@ pybind11::array pybind11_read_tiff(const std::string& fileName, const std::vecto
 
     if(zRange.size()){
         if(zRange.size() == 2){
-            dims[2] = zRange[1]+1-zRange[0];
+            dims[2] = zRange[1]-zRange[0];
         }
         else{
             dims[2] = 1;

@@ -595,7 +595,7 @@ void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t fl
     if(zRange.size()){
         if(zRange.size() == 2){
             startSlice = zRange[0];
-            z = zRange[1]+1;
+            z = zRange[1];
         }
         else{
             startSlice = zRange[0];
