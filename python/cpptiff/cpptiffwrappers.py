@@ -28,8 +28,17 @@ def read_tiff(file_name, z_range=None):
 
 
 def write_tiff(file_name, data, compression='lzw'):
-    data = np.transpose(data, (2, 1, 0))
-    pybind11_write_tiff(file_name, data, compression)
+    ndims = data.ndim
+    transpose = False
+    if data.flags['F_CONTIGUOUS'] or not data.flags['C_CONTIGUOUS']:
+        data = np.ascontiguousarray(data)
+    if ndims == 3:
+        data = np.transpose(data, (2, 1, 0))
+    elif ndims == 2:
+        data = np.transpose(data, (1, 0))
+    else:
+        raise Exception(f'data must be 3D or 2D!')
+    pybind11_write_tiff(file_name, data, transpose, compression)
     return
 
 

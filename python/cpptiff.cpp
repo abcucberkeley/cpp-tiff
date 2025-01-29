@@ -59,7 +59,7 @@ pybind11::array pybind11_read_tiff(const std::string& fileName, const std::vecto
     }
 }
 
-void pybind11_write_tiff(const std::string &fileName, const pybind11::array &data, const std::string &compression = "lzw") {
+void pybind11_write_tiff(const std::string &fileName, const pybind11::array &data, const bool transpose = false, const std::string &compression = "lzw") {
     // Determine the dtype based on the NumPy array type
     pybind11::buffer_info info = data.request();
 
@@ -84,7 +84,7 @@ void pybind11_write_tiff(const std::string &fileName, const pybind11::array &dat
     uint64_t dims[3] = {static_cast<uint64_t>(info.shape[0]), static_cast<uint64_t>(info.shape[1]), static_cast<uint64_t>(info.shape[2])};
 
     // Call the function to write the data to a TIFF file
-    writeTiffParallelHelper(fileName.c_str(), info.ptr, dtype, "w", dims[0], dims[1], dims[2], 0, 0, compression);
+    writeTiffParallelHelper(fileName.c_str(), info.ptr, dtype, "w", dims[0], dims[1], dims[2], 0, transpose, compression);
 }
 
 pybind11::tuple pybind11_get_image_shape(const std::string& fileName){
@@ -102,7 +102,7 @@ PYBIND11_MODULE(cpptiff, m) {
 
 	m.def("pybind11_read_tiff", &pybind11_read_tiff, "Read a tiff file");
 
-	m.def("pybind11_write_tiff", &pybind11_write_tiff, pybind11::arg("fileName"), pybind11::arg("data"), pybind11::arg("compression"), "Write a tiff file");
+	m.def("pybind11_write_tiff", &pybind11_write_tiff, pybind11::arg("fileName"), pybind11::arg("data"), pybind11::arg("transpose"), pybind11::arg("compression"), "Write a tiff file");
 
 	m.def("pybind11_get_image_shape", &pybind11_get_image_shape, "Get the image shape without reading the entire image");
 }
