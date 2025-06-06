@@ -84,7 +84,7 @@ uint8_t readTiffParallelBak(uint64_t x, uint64_t y, uint64_t z, const char* file
 // Modified such that the function can read tiff from stack with step size as specified by sliceStep.
 uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint64_t sliceStep, uint64_t stripSize, uint8_t flipXY){
     int32_t numWorkers = omp_get_max_threads();
-    int32_t batchSize = z/numWorkers+1;
+    int32_t batchSize = (z-1)/numWorkers+1;
     uint64_t bytes = bits/8;
 
     int32_t w;
