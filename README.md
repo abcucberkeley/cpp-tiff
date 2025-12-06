@@ -11,7 +11,7 @@ A Python version of cpp-tiff is available through pip
 ### Prerequisites
 
 #### Python
-Python version >=3.8
+1. Python version 3.8-3.13
 
 #### OS
 Linux: All Linux distros made within the past 10 years should work
