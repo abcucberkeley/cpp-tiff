@@ -5,7 +5,8 @@
 #include "../src/helperfunctions.h"
 #include "../src/parallelreadtiff.h"
 
-
+// Modified to read tiff from stack with a step size by accepting [start step end] as second argument.
+// *Read with step is only enabled for the case of 3D, imageJ and 2D case are not touched.
 void mexFunction(int nlhs, mxArray *plhs[],
                  int nrhs, const mxArray *prhs[])
 {
@@ -44,7 +45,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     TIFF* tif = TIFFOpen(fileName, "r");
     if(!tif) mexErrMsgIdAndTxt("tiff:inputError","File \"%s\" cannot be opened",fileName);
 
-    uint64_t x = 1,y = 1,z = 1,bits = 1, startSlice = 0;
+    uint64_t x = 1,y = 1,z = 1,bits = 1, startSlice = 0, sliceStep = 1;
     TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &x);
     TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &y);
     
@@ -58,10 +59,8 @@ void mexFunction(int nlhs, mxArray *plhs[],
         }
     }
     else{
-        if(mxGetN(prhs[1]) != 2){
-            mexErrMsgIdAndTxt("tiff:inputError","Input range is not 2");
-        }
-        else{
+        // Modified for accepting both [start end] and [start step end] as second argument
+        if(mxGetN(prhs[1]) == 2){
             startSlice = (uint64_t)*(mxGetPr(prhs[1]))-1;
             z = (uint64_t)*((mxGetPr(prhs[1])+1))-startSlice;
             uint64_t maxSize = 0;
@@ -73,6 +72,23 @@ void mexFunction(int nlhs, mxArray *plhs[],
             if (startSlice < 0 || startSlice+z > maxSize){
                 mexErrMsgIdAndTxt("tiff:rangeOutOfBound","Range is out of bounds");
             }
+        }
+        else if (mxGetN(prhs[1]) == 3){
+            if(isImageJIm(fileName)){
+                mexErrMsgIdAndTxt("tiff:inputError","Read with step is not supported for ImageJ.");
+            }
+            startSlice = (uint64_t)*(mxGetPr(prhs[1]))-1;
+            sliceStep = (uint64_t)*((mxGetPr(prhs[1])+1));
+            uint64_t endSlice = (uint64_t)*((mxGetPr(prhs[1])+2))-1;
+            z = (endSlice-startSlice)/sliceStep+1;
+
+            uint64_t maxSize = getImageSizeZ(fileName);
+            if (startSlice < 0 || endSlice+1 > maxSize){
+                mexErrMsgIdAndTxt("tiff:rangeOutOfBound","Range is out of bounds");
+            }
+        }
+        else{
+            mexErrMsgIdAndTxt("tiff:inputError","Input range is not 2 or 3");
         }
     }
 
@@ -139,27 +155,27 @@ void mexFunction(int nlhs, mxArray *plhs[],
             mexErrMsgIdAndTxt("tiff:dataTypeError","Data type not suppported");
         }
     }
-    // Case for 3D
+    // Case for 3D, modified to accept sliceStep as extra argument
     else{
         if(bits == 8){
             plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxUINT8_CLASS, mxREAL);
             uint8_t* tiff = (uint8_t*)mxGetPr(plhs[0]);
-            err = readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+            err = readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, sliceStep, stripSize, flipXY);
         }
         else if(bits == 16){
             plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxUINT16_CLASS, mxREAL);
             uint16_t* tiff = (uint16_t*)mxGetPr(plhs[0]);
-            err = readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+            err = readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, sliceStep, stripSize, flipXY);
         }
         else if(bits == 32){
             plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxSINGLE_CLASS, mxREAL);
             float* tiff = (float*)mxGetPr(plhs[0]);
-            err = readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+            err = readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, sliceStep, stripSize, flipXY);
         }
         else if(bits == 64){
             plhs[0] = mxCreateNumericArray(3,(mwSize*)dim,mxDOUBLE_CLASS, mxREAL);
             double* tiff = (double*)mxGetPr(plhs[0]);
-            err = readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+            err = readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, sliceStep, stripSize, flipXY);
         }
         else{
             mexErrMsgIdAndTxt("tiff:dataTypeError","Data type not suppported");

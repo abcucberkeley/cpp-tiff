@@ -45,6 +45,8 @@ set(ZSTD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/${ZSTD_VER}")
 add_subdirectory(${ZSTD_DIR}/build/cmake)
 set_property(TARGET libzstd_static PROPERTY POSITION_INDEPENDENT_CODE ON)
 
+# Added by XS, add zlib for compilation to work
+include_directories(${CMAKE_BINARY_DIR}/dependencies/zlib-1.2.8)
 # Add libtiff
 include_directories(${CMAKE_BINARY_DIR}/dependencies/${TIFF_VER}/libtiff)
 include_directories(${ZSTD_DIR}/lib)

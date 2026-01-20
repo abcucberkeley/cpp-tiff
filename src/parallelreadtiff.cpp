@@ -81,7 +81,8 @@ uint8_t readTiffParallelBak(uint64_t x, uint64_t y, uint64_t z, const char* file
 	return err;
 }
 
-uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint8_t flipXY){
+// Modified such that the function can read tiff from stack with step size as specified by sliceStep.
+uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint64_t sliceStep, uint64_t stripSize, uint8_t flipXY){
     int32_t numWorkers = omp_get_max_threads();
     int32_t batchSize = (z-1)/numWorkers+1;
     uint64_t bytes = bits/8;
@@ -109,8 +110,10 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
         }
 
         void* buffer = malloc(x*stripSize*bytes);
-        for(int64_t dir = startSlice+(w*batchSize); dir < startSlice+((w+1)*batchSize); dir++){
-            if(dir>=z+startSlice || err) break;
+        // Modified to enable looping through tiff dir with user specified steps
+        for(int64_t dir = startSlice+(w*batchSize*sliceStep); dir < startSlice+((w+1)*batchSize*sliceStep); dir = dir+sliceStep){
+            // Modified, (z-1)*sliceStep+startSlice is the last slice to read 
+            if(dir>=z*sliceStep+startSlice || err) break;
 
             uint8_t counter = 0;
             while(!TIFFSetDirectory(tif, (uint64_t)dir) && counter<3){
@@ -148,7 +151,7 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
                         for(int64_t k = 0; k < stripSize; k++){
                             if((k+(i*stripSize)) >= y) break;
                             for(int64_t j = 0; j < x; j++){
-                                ((uint8_t*)tiff)[((j*y)+(k+(i*stripSize)))+((dir-startSlice)*(x*y))] = ((uint8_t*)buffer)[j+(k*x)];
+                                ((uint8_t*)tiff)[((j*y)+(k+(i*stripSize)))+((dir-startSlice)/sliceStep*(x*y))] = ((uint8_t*)buffer)[j+(k*x)];
                             }
                         }
                                 break;
@@ -157,7 +160,7 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
                         for(int64_t k = 0; k < stripSize; k++){
                             if((k+(i*stripSize)) >= y) break;
                             for(int64_t j = 0; j < x; j++){
-                                ((uint16_t*)tiff)[((j*y)+(k+(i*stripSize)))+((dir-startSlice)*(x*y))] = ((uint16_t*)buffer)[j+(k*x)];
+                                ((uint16_t*)tiff)[((j*y)+(k+(i*stripSize)))+((dir-startSlice)/sliceStep*(x*y))] = ((uint16_t*)buffer)[j+(k*x)];
                             }
                         }
                                 break;
@@ -166,7 +169,7 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
                         for(int64_t k = 0; k < stripSize; k++){
                             if((k+(i*stripSize)) >= y) break;
                             for(int64_t j = 0; j < x; j++){
-                                ((float*)tiff)[((j*y)+(k+(i*stripSize)))+((dir-startSlice)*(x*y))] = ((float*)buffer)[j+(k*x)];
+                                ((float*)tiff)[((j*y)+(k+(i*stripSize)))+((dir-startSlice)/sliceStep*(x*y))] = ((float*)buffer)[j+(k*x)];
                             }
                         }
                                 break;
@@ -175,7 +178,7 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
                         for(int64_t k = 0; k < stripSize; k++){
                             if((k+(i*stripSize)) >= y) break;
                             for(int64_t j = 0; j < x; j++){
-                                ((double*)tiff)[((j*y)+(k+(i*stripSize)))+((dir-startSlice)*(x*y))] = ((double*)buffer)[j+(k*x)];
+                                ((double*)tiff)[((j*y)+(k+(i*stripSize)))+((dir-startSlice)/sliceStep*(x*y))] = ((double*)buffer)[j+(k*x)];
                             }
                         }
                                 break;
@@ -185,12 +188,12 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
         free(buffer);
         TIFFClose(tif);
     }
-    if(err){
-        if(errBak) return readTiffParallelBak(x, y, z, fileName, tiff, bits, startSlice, flipXY);
-        else {
-			printf(errString);
-		}
-    }
+    //if(err){
+        //if(errBak) return readTiffParallelBak(x, y, z, fileName, tiff, bits, startSlice, flipXY);
+        //else {
+			//printf(errString);
+		//}
+    //}
 	return err;
 }
 
@@ -565,7 +568,7 @@ uint8_t readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* f
 	return err;
 }
 
-
+// Modified for accepting zRange in the format of both [start end] and [start step end]
 // tiff pointer guaranteed to be NULL or the correct size array for the tiff file
 void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t flipXY, const std::vector<uint64_t> &zRange = {})
 {
@@ -573,7 +576,7 @@ void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t fl
 	TIFF* tif = TIFFOpen(fileName, "r");
 	if(!tif) return NULL;
 
-	uint64_t x = 1,y = 1,z = 1,bits = 1, startSlice = 0;
+	uint64_t x = 1,y = 1,z = 1,bits = 1, startSlice = 0, sliceStep = 1;
 	TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &x);
 	TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &y);
     z = getImageSizeZ(fileName);
@@ -596,6 +599,11 @@ void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t fl
         if(zRange.size() == 2){
             startSlice = zRange[0];
             z = zRange[1];
+        }
+        else if(zRange.size() == 3){
+            startSlice = zRange[0];
+            sliceStep = zRange[1];
+            z = (zRange[2]-zRange[0])/sliceStep+1;
         }
         else{
             startSlice = zRange[0];
@@ -657,22 +665,22 @@ void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t fl
 	else{
 		if(bits == 8){
 			if(!tiff) tiff = (uint8_t*)malloc(x*y*z*sizeof(uint8_t));
-			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, sliceStep, stripSize, flipXY);
 			return (void*)tiff;
 		}
 		else if(bits == 16){
 			if(!tiff) tiff = (uint16_t*)malloc(x*y*z*sizeof(uint16_t));
-			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, sliceStep, stripSize, flipXY);
 			return (void*)tiff;
 		}
 		else if(bits == 32){
 			if(!tiff) tiff = (float*)malloc(x*y*z*sizeof(float));
-			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, sliceStep, stripSize, flipXY);
 			return (void*)tiff;
 		}
 		else if(bits == 64){
 			if(!tiff) tiff = (double*)malloc(x*y*z*sizeof(double));
-			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
+			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, sliceStep, stripSize, flipXY);
 			return (void*)tiff;
 		}
 		else{
