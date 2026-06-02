@@ -8,6 +8,30 @@
 #include "../src/helperfunctions.h"
 
 
+// Cache-blocked x/y transpose of one decoded strip into the column-major
+// (MATLAB) output. The decoded strip `buf` is row-major (buf[j + k*x]); the
+// output is column-major (out[j*y + (k+rowOff) + sliceOff]). A plain nested
+// loop has a large stride (x or y) on whichever array is innermost, so one
+// array is streamed through cache one element per line. Tiling by TILE keeps a
+// TILE x TILE block of BOTH arrays resident, turning the strided accesses into
+// cache hits. j = output column (input x), k = output row within strip (input y).
+template <typename T>
+static inline void flipTransposeStrip(T* out, const T* buf, int64_t x, int64_t y,
+                                      int64_t stripRows, int64_t rowOff, int64_t sliceOff) {
+    constexpr int64_t TILE = 128;
+    for (int64_t jt = 0; jt < x; jt += TILE) {
+        const int64_t jEnd = (jt + TILE < x) ? jt + TILE : x;
+        for (int64_t kt = 0; kt < stripRows; kt += TILE) {
+            const int64_t kEnd = (kt + TILE < stripRows) ? kt + TILE : stripRows;
+            for (int64_t j = jt; j < jEnd; j++) {
+                T* o = out + (j * y) + rowOff + sliceOff;   // contiguous in k
+                const T* b = buf + j;                       // strided in k (step x)
+                for (int64_t k = kt; k < kEnd; k++) o[k] = b[k * x];
+            }
+        }
+    }
+}
+
 // Backup method in case there are errors reading strips
 uint8_t readTiffParallelBak(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint8_t flipXY){
     int32_t numWorkers = omp_get_max_threads();
@@ -146,43 +170,26 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
                 if(!flipXY){
                     continue;
                 }
+                // Flip x/y into the column-major MATLAB output with a cache-
+                // blocked transpose (see flipTransposeStrip). stripRows handles
+                // a partial final strip.
+                int64_t stripRows = y - (i*stripSize);
+                if(stripRows > (int64_t)stripSize) stripRows = (int64_t)stripSize;
+                int64_t rowOff = i*stripSize;
+                int64_t sliceOff = (dir-startSlice)*(x*y);
                 switch(bits){
                     case 8:
-                        // Map Values to flip x and y for MATLAB
-                        for(int64_t k = 0; k < stripSize; k++){
-                            if((k+(i*stripSize)) >= y) break;
-                            for(int64_t j = 0; j < x; j++){
-                                ((uint8_t*)tiff)[((j*y)+(k+(i*stripSize)))+((dir-startSlice)*(x*y))] = ((uint8_t*)buffer)[j+(k*x)];
-                            }
-                        }
-                                break;
+                        flipTransposeStrip<uint8_t>((uint8_t*)tiff,(uint8_t*)buffer,x,y,stripRows,rowOff,sliceOff);
+                        break;
                     case 16:
-                        // Map Values to flip x and y for MATLAB
-                        for(int64_t k = 0; k < stripSize; k++){
-                            if((k+(i*stripSize)) >= y) break;
-                            for(int64_t j = 0; j < x; j++){
-                                ((uint16_t*)tiff)[((j*y)+(k+(i*stripSize)))+((dir-startSlice)*(x*y))] = ((uint16_t*)buffer)[j+(k*x)];
-                            }
-                        }
-                                break;
+                        flipTransposeStrip<uint16_t>((uint16_t*)tiff,(uint16_t*)buffer,x,y,stripRows,rowOff,sliceOff);
+                        break;
                     case 32:
-                        // Map Values to flip x and y for MATLAB
-                        for(int64_t k = 0; k < stripSize; k++){
-                            if((k+(i*stripSize)) >= y) break;
-                            for(int64_t j = 0; j < x; j++){
-                                ((float*)tiff)[((j*y)+(k+(i*stripSize)))+((dir-startSlice)*(x*y))] = ((float*)buffer)[j+(k*x)];
-                            }
-                        }
-                                break;
+                        flipTransposeStrip<float>((float*)tiff,(float*)buffer,x,y,stripRows,rowOff,sliceOff);
+                        break;
                     case 64:
-                        // Map Values to flip x and y for MATLAB
-                        for(int64_t k = 0; k < stripSize; k++){
-                            if((k+(i*stripSize)) >= y) break;
-                            for(int64_t j = 0; j < x; j++){
-                                ((double*)tiff)[((j*y)+(k+(i*stripSize)))+((dir-startSlice)*(x*y))] = ((double*)buffer)[j+(k*x)];
-                            }
-                        }
-                                break;
+                        flipTransposeStrip<double>((double*)tiff,(double*)buffer,x,y,stripRows,rowOff,sliceOff);
+                        break;
                 }
             }
         }
@@ -340,43 +347,24 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
                     memcpy(tiff+((i*stripSize*x)*bytes),buffer,cBytes);
                     continue;
                 }
+                // Same cache-blocked transpose as the 3D path (flipTransposeStrip),
+                // here for a single image so the slice offset is 0.
+                int64_t stripRows = y - (i*stripSize);
+                if(stripRows > (int64_t)stripSize) stripRows = (int64_t)stripSize;
+                int64_t rowOff = i*stripSize;
                 switch(bits){
                     case 8:
-                        // Map Values to flip x and y for MATLAB
-                        for(int64_t k = 0; k < stripSize; k++){
-                            if((k+(i*stripSize)) >= y) break;
-                            for(int64_t j = 0; j < x; j++){
-                                ((uint8_t*)tiff)[((j*y)+(k+(i*stripSize)))] = ((uint8_t*)buffer)[j+(k*x)];
-                            }
-                        }
-                                break;
+                        flipTransposeStrip<uint8_t>((uint8_t*)tiff,(uint8_t*)buffer,x,y,stripRows,rowOff,0);
+                        break;
                     case 16:
-                        // Map Values to flip x and y for MATLAB
-                        for(int64_t k = 0; k < stripSize; k++){
-                            if((k+(i*stripSize)) >= y) break;
-                            for(int64_t j = 0; j < x; j++){
-                                ((uint16_t*)tiff)[((j*y)+(k+(i*stripSize)))] = ((uint16_t*)buffer)[j+(k*x)];
-                            }
-                        }
-                                break;
+                        flipTransposeStrip<uint16_t>((uint16_t*)tiff,(uint16_t*)buffer,x,y,stripRows,rowOff,0);
+                        break;
                     case 32:
-                        // Map Values to flip x and y for MATLAB
-                        for(int64_t k = 0; k < stripSize; k++){
-                            if((k+(i*stripSize)) >= y) break;
-                            for(int64_t j = 0; j < x; j++){
-                                ((float*)tiff)[((j*y)+(k+(i*stripSize)))] = ((float*)buffer)[j+(k*x)];
-                            }
-                        }
-                                break;
+                        flipTransposeStrip<float>((float*)tiff,(float*)buffer,x,y,stripRows,rowOff,0);
+                        break;
                     case 64:
-                        // Map Values to flip x and y for MATLAB
-                        for(int64_t k = 0; k < stripSize; k++){
-                            if((k+(i*stripSize)) >= y) break;
-                            for(int64_t j = 0; j < x; j++){
-                                ((double*)tiff)[((j*y)+(k+(i*stripSize)))] = ((double*)buffer)[j+(k*x)];
-                            }
-                        }
-                                break;
+                        flipTransposeStrip<double>((double*)tiff,(double*)buffer,x,y,stripRows,rowOff,0);
+                        break;
                 }
             }
             free(buffer);
