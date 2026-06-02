@@ -103,12 +103,14 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
                     err = 1;
                     sprintf(errString,"Thread %d: File \"%s\" cannot be opened\n",w,fileName);
                 }
-                continue;
+                break;
             }
             outCounter++;
         }
 
-        void* buffer = malloc(x*stripSize*bytes);
+        // Only the flip path needs an intermediate bounce buffer. The no-flip
+        // path decodes each strip directly into the output array below.
+        void* buffer = flipXY ? malloc(x*stripSize*bytes) : NULL;
         for(int64_t dir = startSlice+(w*batchSize); dir < startSlice+((w+1)*batchSize); dir++){
             if(dir>=z+startSlice || err) break;
 
@@ -126,9 +128,12 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
             if(err) break;
             for (int64_t i = 0; i*stripSize < y; i++)
             {
-
-                //loading the data into a buffer
-                int64_t cBytes = TIFFReadEncodedStrip(tif, i, buffer, stripSize*x*bytes);
+                // No-flip: decode the strip straight into the output array (no
+                // bounce buffer, no full-image memcpy). Flip: decode into the
+                // buffer and transpose below.
+                void* stripDst = flipXY ? buffer
+                    : (void*)((uint8_t*)tiff + (((i*stripSize*x)+((dir-startSlice)*(x*y)))*bytes));
+                int64_t cBytes = TIFFReadEncodedStrip(tif, i, stripDst, stripSize*x*bytes);
                 if(cBytes < 0){
                     #pragma omp critical
                     {
@@ -139,7 +144,6 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
                     break;
                 }
                 if(!flipXY){
-                    memcpy(tiff+(((i*stripSize*x)+((dir-startSlice)*(x*y)))*bytes),buffer,cBytes);
                     continue;
                 }
                 switch(bits){
@@ -298,7 +302,7 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
                         err = 1;
                         sprintf(errString,"Thread %d: File \"%s\" cannot be opened\n",w,fileName);
                     }
-                    continue;
+                    break;
                 }
                 outCounter++;
             }
