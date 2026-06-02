@@ -33,7 +33,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     if(nrhs == 4){
         if(!mxIsClass(prhs[3], "string")){
             if(!mxIsChar(prhs[3])) mexErrMsgIdAndTxt("tiff:inputError","The fourth argument must be a string");
-            compression = mxArrayToString(prhs[0]);
+            compression = mxArrayToString(prhs[3]);
         }
         else{
             mxArray* mString[1];
