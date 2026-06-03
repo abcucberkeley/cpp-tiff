@@ -9,6 +9,15 @@
 #include "lzwencode.h"
 #include "helperfunctions.h"
 
+// zstd one-shot encode; symbols come from the libzstd statically linked into libtiff
+extern "C" {
+    size_t ZSTD_compress(void* dst, size_t dstCap, const void* src, size_t srcSize, int level);
+}
+#ifndef COMPRESSION_ZSTD
+#define COMPRESSION_ZSTD 50000
+#endif
+static const int kZstdLevel = 1;
+
 uint8_t writeTiffSingle(const uint64_t x, const uint64_t y, const uint64_t z, const char* fileName, const void* tiff, const void* tiffOld, const uint64_t bits, const uint64_t startSlice, const uint64_t stripSize, const char* mode, const bool transpose, const std::string &compression){
     TIFF* tif = NULL;
     if(!strcmp(mode,"w")){
@@ -32,7 +41,10 @@ uint8_t writeTiffSingle(const uint64_t x, const uint64_t y, const uint64_t z, co
 
     uint64_t len = 0;
     int compressionType = COMPRESSION_NONE;
-    if(compression != "none"){
+    if(compression == "zstd"){
+        compressionType = COMPRESSION_ZSTD;
+    }
+    else if(compression != "none" && !compression.empty()){
         compressionType = COMPRESSION_LZW;
     }
     for(uint64_t dir = startSlice; dir < z; dir++){
@@ -93,7 +105,11 @@ uint8_t writeTiffThread(const uint64_t x, const uint64_t y, const uint64_t z, co
     uint64_t len = 0;
     int compressionType = COMPRESSION_NONE;
     bool compress = false;
-    if(compression != "none"){
+    if(compression == "zstd"){
+        compress = true;
+        compressionType = COMPRESSION_ZSTD;
+    }
+    else if(compression != "none" && !compression.empty()){
         compress = true;
         compressionType = COMPRESSION_LZW;
     }
@@ -152,7 +168,8 @@ uint8_t writeTiffParallel(const uint64_t x, const uint64_t y, const uint64_t z, 
     uint64_t* cSizes = (uint64_t*)calloc(totalStrips, sizeof(uint64_t));
 
     std::future<uint8_t> writerThreadResult = std::async(std::launch::async, writeTiffThread, x, y, z, fileName, tiff, bits, startSlice, stripSize, mode, stripsPerDir, std::ref(comprA), cSizes, std::ref(compression));
-    if(compression != "none"){
+    const bool useZstd = (compression == "zstd");
+    if(compression != "none" && !compression.empty()){
         comprA = (uint8_t**)malloc(totalStrips*sizeof(uint8_t*));
 
         #pragma omp parallel for
@@ -160,22 +177,29 @@ uint8_t writeTiffParallel(const uint64_t x, const uint64_t y, const uint64_t z, 
             uint64_t len = 0;
             for (uint64_t i = 0; i*stripSize < y; i++)
             {
-                comprA[i+(dir*stripsPerDir)] = (uint8_t*)malloc((((x*stripSize)*(bits/8))+(extraBytes*(bits/8)))*2+1);
+                uint64_t cbound = (((x*stripSize)*(bits/8))+(extraBytes*(bits/8)))*2+1;
+                comprA[i+(dir*stripsPerDir)] = (uint8_t*)malloc(cbound);
                 if (stripSize*(i+1) > y){
                     len = (y-(stripSize*i))*x*(bits/8);
                 }
                 else{
                     len = stripSize*x*(bits/8);
                 }
+                uint8_t* src = (uint8_t*)tiff+((((i*stripSize)*x)+((dir-startSlice)*(x*y)))*(bits/8));
 
+                if(useZstd){
+                    // zstd compresses exactly len bytes (no over-read, no padding).
+                    cSizes[i+(dir*stripsPerDir)] = ZSTD_compress(comprA[i+(dir*stripsPerDir)], cbound, src, len, kZstdLevel);
+                    continue;
+                }
                 if(dir == z-1 && len == (y-(stripSize*i))*x*(bits/8)){
                     uint8_t* cArrL = (uint8_t*)malloc(len+(extraBytes*(bits/8)));
-                    memcpy(cArrL,(uint8_t*)tiff+((((i*stripSize)*x)+((dir-startSlice)*(x*y)))*(bits/8)),len);
+                    memcpy(cArrL, src, len);
                     cSizes[i+(dir*stripsPerDir)] = lzwEncode(cArrL,comprA[i+(dir*stripsPerDir)],len+(extraBytes*(bits/8)));
                     free(cArrL);
                     continue;
                 }
-                cSizes[i+(dir*stripsPerDir)] = lzwEncode((uint8_t*)tiff+((((i*stripSize)*x)+((dir-startSlice)*(x*y)))*(bits/8)),comprA[i+(dir*stripsPerDir)],len+(extraBytes*(bits/8)));
+                cSizes[i+(dir*stripsPerDir)] = lzwEncode(src,comprA[i+(dir*stripsPerDir)],len+(extraBytes*(bits/8)));
             }
         }
     }
@@ -281,7 +305,7 @@ uint8_t writeTiffParallelWrapper(const uint64_t x, const uint64_t y, const uint6
     else{
         return writeTiffParallel(x, y, z, fileName, data, data, bits, startSlice, stripSize, mode, transpose, compression);
     }
-    
+
     uint8_t ret = writeTiffParallel(x, y, z, fileName, tiff, data, bits, startSlice, stripSize, mode, transpose, compression);
     free(tiff);
     return ret;
