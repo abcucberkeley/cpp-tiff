@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.9)
+cmake_minimum_required(VERSION 3.18)
 
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
@@ -16,9 +16,6 @@ project(
   cpp-tiff
   VERSION 1.4.1
   LANGUAGES CXX)
-
-set(TIFF_VER "tiff-4.7.0")
-set(ZSTD_VER "zstd-1.5.6")
 
 # Set the RPATH to $ORIGIN when installing if applicable
 set(CMAKE_INSTALL_RPATH $ORIGIN)
@@ -41,20 +38,41 @@ set(LIBDEFLATE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/libdeflate-1.18")
 add_subdirectory(${LIBDEFLATE_DIR})
 set_property(TARGET libdeflate_static PROPERTY POSITION_INDEPENDENT_CODE ON)
 
-set(ZSTD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/${ZSTD_VER}")
-add_subdirectory(${ZSTD_DIR}/build/cmake)
-set_property(TARGET libzstd_static PROPERTY POSITION_INDEPENDENT_CODE ON)
+include(FetchContent)
 
-# Add libtiff
-include_directories(${CMAKE_BINARY_DIR}/dependencies/${TIFF_VER}/libtiff)
+# zstd: fetched at configure time instead of vendored. Its CMake lives under build/cmake.
+set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
+FetchContent_Declare(zstd
+    GIT_REPOSITORY https://github.com/facebook/zstd.git
+    GIT_TAG        v1.5.6
+    GIT_SHALLOW    TRUE
+    SOURCE_SUBDIR  build/cmake
+)
+FetchContent_MakeAvailable(zstd)
+set(ZSTD_DIR "${zstd_SOURCE_DIR}")
+set_property(TARGET libzstd_static PROPERTY POSITION_INDEPENDENT_CODE ON)
+# libtiff's ZSTDCodec.cmake enables zstd when the target zstd::libzstd_static exists,
+# and ALIASes it to ZSTD::ZSTD. Otherwise it runs a configure-time link test against
+# libzstd.a, which isn't built yet in a clean build. Provide it as an imported target
+# (a plain alias can't be re-aliased) pointing at the static lib FetchContent builds.
+if(NOT TARGET zstd::libzstd_static)
+    add_library(zstd::libzstd_static STATIC IMPORTED GLOBAL)
+    set_target_properties(zstd::libzstd_static PROPERTIES
+        IMPORTED_LOCATION "${zstd_BINARY_DIR}/lib/libzstd.a"
+        INTERFACE_INCLUDE_DIRECTORIES "${zstd_SOURCE_DIR}/lib")
+endif()
+
+# Add libtiff (fetched at configure time; finds its deps via the cache vars below)
 include_directories(${ZSTD_DIR}/lib)
 set(ZLIB_INCLUDE_DIR  ${ZLIB_DIR} CACHE STRING "" FORCE)
 set(ZLIB_LIBRARY  ${CMAKE_BINARY_DIR}/dependencies/zlib-1.2.8/${ZLIB_STATIC_NAME} CACHE STRING "" FORCE)
 set(Deflate_INCLUDE_DIR  ${LIBDEFLATE_DIR} CACHE STRING "" FORCE)
 set(Deflate_LIBRARY  ${CMAKE_BINARY_DIR}/dependencies/libdeflate-1.18/libdeflate.a CACHE STRING "" FORCE)
 set(ZSTD_INCLUDE_DIR  ${ZSTD_DIR}/lib CACHE STRING "" FORCE)
-set(ZSTD_LIBRARY  ${CMAKE_BINARY_DIR}/dependencies/${ZSTD_VER}/build/cmake/lib/libzstd.a CACHE STRING "" FORCE)
-set(LIBTIFF_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/${TIFF_VER}")
+set(ZSTD_LIBRARY  ${zstd_BINARY_DIR}/lib/libzstd.a CACHE STRING "" FORCE)
 set(tiff-tools OFF CACHE BOOL "" FORCE)
 set(tiff-tests OFF CACHE BOOL "" FORCE)
 set(tiff-contrib OFF CACHE BOOL "" FORCE)
@@ -65,8 +83,14 @@ set(lzma OFF CACHE BOOL "" FORCE)
 set(jbig OFF CACHE BOOL "" FORCE)
 set(webp OFF CACHE BOOL "" FORCE)
 set(lerc OFF CACHE BOOL "" FORCE)
-
-add_subdirectory(${LIBTIFF_DIR})
+FetchContent_Declare(tiff
+    GIT_REPOSITORY https://gitlab.com/libtiff/libtiff.git
+    GIT_TAG        v4.7.0
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(tiff)
+set(LIBTIFF_DIR "${tiff_SOURCE_DIR}")
+include_directories(${tiff_BINARY_DIR}/libtiff)
 set_property(TARGET tiff PROPERTY POSITION_INDEPENDENT_CODE ON)
 add_dependencies(tiff zlibstatic)
 add_dependencies(tiff libdeflate_static)
@@ -84,7 +108,7 @@ add_dependencies(cppTiff_shared tiff)
 
 file(GLOB LIBTIFF_HEADERS "${LIBTIFF_DIR}/libtiff/*.h")
 
-set_target_properties(cppTiff_shared PROPERTIES PUBLIC_HEADER "${LIBTIFF_HEADERS};${CMAKE_BINARY_DIR}/dependencies/${TIFF_VER}/libtiff/tiffconf.h;${ZSTD_DIR}/lib/zstd.h;${SRC_DIR}/helperfunctions.h;${SRC_DIR}/lzwencode.h;${SRC_DIR}/parallelreadtiff.h;${SRC_DIR}/parallelwritetiff.h")
+set_target_properties(cppTiff_shared PROPERTIES PUBLIC_HEADER "${LIBTIFF_HEADERS};${tiff_BINARY_DIR}/libtiff/tiffconf.h;${ZSTD_DIR}/lib/zstd.h;${SRC_DIR}/helperfunctions.h;${SRC_DIR}/lzwencode.h;${SRC_DIR}/parallelreadtiff.h;${SRC_DIR}/parallelwritetiff.h")
 
 # Include the header files
 target_include_directories(cppTiff_shared PRIVATE
@@ -96,10 +120,10 @@ target_include_directories(cppTiff_shared PRIVATE
 
 # Link against the libraries
 target_link_libraries(cppTiff_shared PRIVATE
-    ${CMAKE_BINARY_DIR}/dependencies/${TIFF_VER}/libtiff/libtiff.a
+    ${tiff_BINARY_DIR}/libtiff/libtiff.a
     ${CMAKE_BINARY_DIR}/dependencies/zlib-1.2.8/${ZLIB_STATIC_NAME}
     ${CMAKE_BINARY_DIR}/dependencies/libdeflate-1.18/libdeflate.a
-    ${CMAKE_BINARY_DIR}/dependencies/${ZSTD_VER}/build/cmake/lib/libzstd.a
+    ${zstd_BINARY_DIR}/lib/libzstd.a
     -static-libgcc
     -static-libstdc++
     OpenMP::OpenMP_CXX
