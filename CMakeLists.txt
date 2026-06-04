@@ -35,6 +35,10 @@ add_subdirectory(${ZLIB_DIR})
 set_property(TARGET zlibstatic PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 set(LIBDEFLATE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/libdeflate-1.18")
+# We only need libdeflate as a static library for libtiff -- not its gzip CLI
+# (whose install rule fails) or its shared lib.
+set(LIBDEFLATE_BUILD_GZIP OFF CACHE BOOL "" FORCE)
+set(LIBDEFLATE_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
 add_subdirectory(${LIBDEFLATE_DIR})
 set_property(TARGET libdeflate_static PROPERTY POSITION_INDEPENDENT_CODE ON)
 
@@ -46,10 +50,9 @@ set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
 FetchContent_Declare(zstd
-    GIT_REPOSITORY https://github.com/facebook/zstd.git
-    GIT_TAG        v1.5.6
-    GIT_SHALLOW    TRUE
-    SOURCE_SUBDIR  build/cmake
+    URL      https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz
+    URL_HASH SHA256=8c29e06cf42aacc1eafc4077ae2ec6c6fcb96a626157e0593d5e82a34fd403c1
+    SOURCE_SUBDIR build/cmake
 )
 FetchContent_MakeAvailable(zstd)
 set(ZSTD_DIR "${zstd_SOURCE_DIR}")
@@ -84,9 +87,8 @@ set(jbig OFF CACHE BOOL "" FORCE)
 set(webp OFF CACHE BOOL "" FORCE)
 set(lerc OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(tiff
-    GIT_REPOSITORY https://gitlab.com/libtiff/libtiff.git
-    GIT_TAG        v4.7.0
-    GIT_SHALLOW    TRUE
+    URL      https://download.osgeo.org/libtiff/tiff-4.7.0.tar.gz
+    URL_HASH SHA256=67160e3457365ab96c5b3286a0903aa6e78bdc44c4bc737d2e486bcecb6ba976
 )
 FetchContent_MakeAvailable(tiff)
 set(LIBTIFF_DIR "${tiff_SOURCE_DIR}")
@@ -108,7 +110,7 @@ add_dependencies(cppTiff_shared tiff)
 
 file(GLOB LIBTIFF_HEADERS "${LIBTIFF_DIR}/libtiff/*.h")
 
-set_target_properties(cppTiff_shared PROPERTIES PUBLIC_HEADER "${LIBTIFF_HEADERS};${tiff_BINARY_DIR}/libtiff/tiffconf.h;${ZSTD_DIR}/lib/zstd.h;${SRC_DIR}/helperfunctions.h;${SRC_DIR}/lzwencode.h;${SRC_DIR}/parallelreadtiff.h;${SRC_DIR}/parallelwritetiff.h")
+set_target_properties(cppTiff_shared PROPERTIES PUBLIC_HEADER "${LIBTIFF_HEADERS};${tiff_BINARY_DIR}/libtiff/tiffconf.h;${tiff_BINARY_DIR}/libtiff/tiffvers.h;${ZSTD_DIR}/lib/zstd.h;${SRC_DIR}/helperfunctions.h;${SRC_DIR}/lzwencode.h;${SRC_DIR}/parallelreadtiff.h;${SRC_DIR}/parallelwritetiff.h")
 
 # Include the header files
 target_include_directories(cppTiff_shared PRIVATE
