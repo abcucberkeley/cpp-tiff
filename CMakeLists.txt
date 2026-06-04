@@ -14,7 +14,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
 
 project(
   cpp-tiff
-  VERSION 1.3.0
+  VERSION 1.4.1
   LANGUAGES CXX)
 
 set(TIFF_VER "tiff-4.7.0")
