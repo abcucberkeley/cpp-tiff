@@ -2,10 +2,17 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <atomic>
+#include <memory>
 #include <limits.h>
 #include <omp.h>
 #include "tiffio.h"
 #include "../src/helperfunctions.h"
+
+// RAII for libtiff handles: TIFFClose runs on every exit path, so the worker
+// functions don't carry a naked TIFF* with a manual close. (C++11: no make_unique.)
+struct TiffCloser { void operator()(TIFF* t) const noexcept { if(t) TIFFClose(t); } };
+using TiffPtr = std::unique_ptr<TIFF, TiffCloser>;
 
 
 // Cache-blocked x/y transpose of one decoded strip into the column-major
@@ -39,7 +46,7 @@ uint8_t readTiffParallelBak(uint64_t x, uint64_t y, uint64_t z, const char* file
     uint64_t bytes = bits/8;
 
     int32_t w;
-	uint8_t err = 0;
+	std::atomic<uint8_t> err{0};
 	char errString[10000];
     #pragma omp parallel for
     for(w = 0; w < numWorkers; w++){
@@ -100,7 +107,7 @@ uint8_t readTiffParallelBak(uint64_t x, uint64_t y, uint64_t z, const char* file
         TIFFClose(tif);
     }
 	if(err){
-		printf(errString);
+		printf("%s", errString);
 	}
 	return err;
 }
@@ -112,15 +119,15 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
 
     int32_t w;
     uint8_t errBak = 0;
-    uint8_t err = 0;
+    std::atomic<uint8_t> err{0};
     char errString[10000];
     #pragma omp parallel for
     for(w = 0; w < numWorkers; w++){
 
         uint8_t outCounter = 0;
-        TIFF* tif = TIFFOpen(fileName, "r");
+        TiffPtr tif(TIFFOpen(fileName, "r"));   // RAII: TIFFClose on every exit path
         while(!tif){
-            tif = TIFFOpen(fileName, "r");
+            tif.reset(TIFFOpen(fileName, "r"));
             if(outCounter == 3){
                 #pragma omp critical
                 {
@@ -132,14 +139,16 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
             outCounter++;
         }
 
-        // Only the flip path needs an intermediate bounce buffer. The no-flip
-        // path decodes each strip directly into the output array below.
-        void* buffer = flipXY ? malloc(x*stripSize*bytes) : NULL;
+        // Only the flip path needs an intermediate bounce buffer; the no-flip
+        // path decodes each strip directly into the output. new[] (not vector or
+        // make_unique) keeps it RAII-owned without zero-filling before the read.
+        std::unique_ptr<uint8_t[]> buffer;
+        if(flipXY) buffer.reset(new uint8_t[x*stripSize*bytes]);
         for(int64_t dir = startSlice+(w*batchSize); dir < startSlice+((w+1)*batchSize); dir++){
             if(dir>=z+startSlice || err) break;
 
             uint8_t counter = 0;
-            while(!TIFFSetDirectory(tif, (uint64_t)dir) && counter<3){
+            while(!TIFFSetDirectory(tif.get(), (uint64_t)dir) && counter<3){
                 counter++;
                 if(counter == 3){
                     #pragma omp critical
@@ -155,9 +164,10 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
                 // No-flip: decode the strip straight into the output array (no
                 // bounce buffer, no full-image memcpy). Flip: decode into the
                 // buffer and transpose below.
-                void* stripDst = flipXY ? buffer
-                    : (void*)((uint8_t*)tiff + (((i*stripSize*x)+((dir-startSlice)*(x*y)))*bytes));
-                int64_t cBytes = TIFFReadEncodedStrip(tif, i, stripDst, stripSize*x*bytes);
+                void* stripDst = flipXY
+                    ? static_cast<void*>(buffer.get())
+                    : static_cast<void*>(static_cast<uint8_t*>(tiff) + (((i*stripSize*x)+((dir-startSlice)*(x*y)))*bytes));
+                int64_t cBytes = TIFFReadEncodedStrip(tif.get(), i, stripDst, stripSize*x*bytes);
                 if(cBytes < 0){
                     #pragma omp critical
                     {
@@ -179,27 +189,26 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
                 int64_t sliceOff = (dir-startSlice)*(x*y);
                 switch(bits){
                     case 8:
-                        flipTransposeStrip<uint8_t>((uint8_t*)tiff,(uint8_t*)buffer,x,y,stripRows,rowOff,sliceOff);
+                        flipTransposeStrip<uint8_t>(static_cast<uint8_t*>(tiff), buffer.get(), x,y,stripRows,rowOff,sliceOff);
                         break;
                     case 16:
-                        flipTransposeStrip<uint16_t>((uint16_t*)tiff,(uint16_t*)buffer,x,y,stripRows,rowOff,sliceOff);
+                        flipTransposeStrip<uint16_t>(static_cast<uint16_t*>(tiff), reinterpret_cast<uint16_t*>(buffer.get()), x,y,stripRows,rowOff,sliceOff);
                         break;
                     case 32:
-                        flipTransposeStrip<float>((float*)tiff,(float*)buffer,x,y,stripRows,rowOff,sliceOff);
+                        flipTransposeStrip<float>(static_cast<float*>(tiff), reinterpret_cast<float*>(buffer.get()), x,y,stripRows,rowOff,sliceOff);
                         break;
                     case 64:
-                        flipTransposeStrip<double>((double*)tiff,(double*)buffer,x,y,stripRows,rowOff,sliceOff);
+                        flipTransposeStrip<double>(static_cast<double*>(tiff), reinterpret_cast<double*>(buffer.get()), x,y,stripRows,rowOff,sliceOff);
                         break;
                 }
             }
         }
-        free(buffer);
-        TIFFClose(tif);
+        // bounce buffer auto-freed (unique_ptr); tif auto-closed (TiffPtr)
     }
     if(err){
         if(errBak) return readTiffParallelBak(x, y, z, fileName, tiff, bits, startSlice, flipXY);
         else {
-			printf(errString);
+			printf("%s", errString);
 		}
     }
 	return err;
@@ -212,7 +221,7 @@ uint8_t readTiffParallel2DBak(uint64_t x, uint64_t y, uint64_t z, const char* fi
     uint64_t bytes = bits/8;
 
     int32_t w;
-	uint8_t err = 0;
+	std::atomic<uint8_t> err{0};
 	char errString[10000];
     #pragma omp parallel for
     for(w = 0; w < numWorkers; w++){
@@ -273,7 +282,7 @@ uint8_t readTiffParallel2DBak(uint64_t x, uint64_t y, uint64_t z, const char* fi
         TIFFClose(tif);
     }
 	if(err){
-		printf(errString);
+		printf("%s", errString);
 	}
 	return err;
 }
@@ -286,7 +295,7 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
     uint64_t bytes = bits/8;
 
     int32_t w;
-    uint8_t err = 0;
+    std::atomic<uint8_t> err{0};
     uint8_t errBak = 0;
     char errString[10000];
     uint16_t compressed = 1;
@@ -438,7 +447,7 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
 
     if(err) {
         if(errBak) return readTiffParallel2DBak(x, y, z, fileName, tiff, bits, startSlice, flipXY);
-        else printf(errString);
+        else printf("%s", errString);
     }
 	return err;
 }
@@ -446,7 +455,7 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
 
 // Reading images saved by ImageJ
 uint8_t readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint8_t flipXY){
-    uint8_t err = 0;
+    std::atomic<uint8_t> err{0};
     FILE *fp = fopen(fileName, "rb");
     if(!fp){ 
 		printf("File \"%s\" cannot be opened from Disk\n",fileName);
@@ -486,8 +495,8 @@ uint8_t readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* f
     else{
         while(chunk < tBytes){
             rBytes = tBytes-chunk;
-            if(rBytes > INT_MAX) bytesRead = fread(tiff+chunk,1,INT_MAX,fp);
-            else bytesRead = fread(tiff+chunk,1,rBytes,fp);
+            if(rBytes > INT_MAX) bytesRead = fread(static_cast<uint8_t*>(tiff)+chunk,1,INT_MAX,fp);
+            else bytesRead = fread(static_cast<uint8_t*>(tiff)+chunk,1,rBytes,fp);
             chunk += bytesRead;
         }
     }
