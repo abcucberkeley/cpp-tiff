@@ -110,3 +110,18 @@ install(TARGETS cppTiff_shared
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
+
+# Optional benchmark executables for comparing reader/writer versions (not installed).
+# Enable with -DBUILD_BENCH=ON. See benchmarks/run_bench.sh.
+option(BUILD_BENCH "Build the read/write benchmark executables" OFF)
+if(BUILD_BENCH)
+    add_executable(benchRead ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/benchread.cpp)
+    set_target_properties(benchRead PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_include_directories(benchRead PRIVATE ${SRC_DIR})
+    target_link_libraries(benchRead PRIVATE cppTiff_shared OpenMP::OpenMP_CXX)
+
+    add_executable(benchWrite ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/benchwrite.cpp)
+    set_target_properties(benchWrite PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_include_directories(benchWrite PRIVATE ${SRC_DIR})
+    target_link_libraries(benchWrite PRIVATE cppTiff_shared OpenMP::OpenMP_CXX)
+endif()
