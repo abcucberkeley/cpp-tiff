@@ -14,7 +14,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
 
 project(
   cpp-tiff
-  VERSION 1.4.1
+  VERSION 1.5.0
   LANGUAGES CXX)
 
 # Set the RPATH to $ORIGIN when installing if applicable
@@ -50,8 +50,8 @@ set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
 FetchContent_Declare(zstd
-    URL      https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz
-    URL_HASH SHA256=8c29e06cf42aacc1eafc4077ae2ec6c6fcb96a626157e0593d5e82a34fd403c1
+    URL      https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+    URL_HASH SHA256=eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
     SOURCE_SUBDIR build/cmake
 )
 FetchContent_MakeAvailable(zstd)
@@ -87,8 +87,8 @@ set(jbig OFF CACHE BOOL "" FORCE)
 set(webp OFF CACHE BOOL "" FORCE)
 set(lerc OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(tiff
-    URL      https://download.osgeo.org/libtiff/tiff-4.7.0.tar.gz
-    URL_HASH SHA256=67160e3457365ab96c5b3286a0903aa6e78bdc44c4bc737d2e486bcecb6ba976
+    URL      https://download.osgeo.org/libtiff/tiff-4.7.1.tar.gz
+    URL_HASH SHA256=f698d94f3103da8ca7438d84e0344e453fe0ba3b7486e04c5bf7a9a3fabe9b69
 )
 FetchContent_MakeAvailable(tiff)
 set(LIBTIFF_DIR "${tiff_SOURCE_DIR}")
