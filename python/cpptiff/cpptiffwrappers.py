@@ -21,7 +21,10 @@ def read_tiff(file_name, z_range=None):
                 raise Exception(f'z_range is invalid! {z_range[0]} == {z_range[1]}')
 
     im = pybind11_read_tiff(file_name, z_range)
-    im = np.transpose(im, (2, 1, 0))
+    if im.ndim == 4:
+        im = np.transpose(im, (2, 1, 0, 3))  # (x,y,z,c) -> (z,y,x,c) for RGB
+    else:
+        im = np.transpose(im, (2, 1, 0))     # (x,y,z) -> (z,y,x)
     if im.shape[0] == 1:
         im = np.squeeze(im, axis=0)
     return im

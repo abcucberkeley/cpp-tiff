@@ -7,8 +7,25 @@
 #include "helperfunctions.h"
 
 template <typename T>
-pybind11::array_t<T> create_pybind11_array(void* data, const uint64_t* dims) {
+pybind11::array_t<T> create_pybind11_array(void* data, const uint64_t* dims, uint64_t samples) {
     auto deleter = [](void* ptr) { free(ptr); };
+
+    if(samples > 1){
+        // Channel-last interleaved buffer (z, y, x, c). Shape (x, y, z, c); the
+        // wrapper transposes (2,1,0,3) -> (z, y, x, c). Strides are in bytes.
+        std::vector<ssize_t> strides = {
+            static_cast<ssize_t>(samples * sizeof(T)),
+            static_cast<ssize_t>(dims[1] * samples * sizeof(T)),
+            static_cast<ssize_t>(dims[1] * dims[0] * samples * sizeof(T)),
+            static_cast<ssize_t>(sizeof(T))
+        };
+        return pybind11::array_t<T>(
+            {dims[1], dims[0], dims[2], samples},
+            strides,
+            static_cast<T*>(data),
+            pybind11::capsule(data, deleter)
+        );
+    }
 
     std::vector<ssize_t> strides = {
         static_cast<ssize_t>(sizeof(T)),
@@ -33,8 +50,10 @@ pybind11::array pybind11_read_tiff(const std::string& fileName, const std::vecto
         if(tempZ) dims[2] = tempZ;
     }
 	uint64_t dtype = getDataType(fileName.c_str());
+	uint64_t samples = getSamplesPerPixel(fileName.c_str());
 
 	void* data = readTiffParallelWrapperNoXYFlip(fileName.c_str(), zRange);
+	if(!data) throw std::runtime_error("Failed to read TIFF (unsupported format, e.g. planar RGB)");
 
     if(zRange.size()){
         if(zRange.size() == 2){
@@ -47,13 +66,13 @@ pybind11::array pybind11_read_tiff(const std::string& fileName, const std::vecto
 
 	switch (dtype) {
         case 8:  // 8-bit unsigned int
-            return create_pybind11_array<uint8_t>(data, dims);
+            return create_pybind11_array<uint8_t>(data, dims, samples);
 		case 16: // 16-bit unsigned int
-            return create_pybind11_array<uint16_t>(data, dims);
+            return create_pybind11_array<uint16_t>(data, dims, samples);
         case 32: // 32-bit float
-            return create_pybind11_array<float>(data, dims);
+            return create_pybind11_array<float>(data, dims, samples);
         case 64: // 64-bit double
-            return create_pybind11_array<double>(data, dims);
+            return create_pybind11_array<double>(data, dims, samples);
         default:
             throw std::runtime_error("Unsupported data type");
     }
@@ -89,9 +108,11 @@ void pybind11_write_tiff(const std::string &fileName, const pybind11::array &dat
 
 pybind11::tuple pybind11_get_image_shape(const std::string& fileName){
     uint64_t* dims = getImageSize(fileName.c_str());
-	pybind11::tuple shape = pybind11::make_tuple(dims[2], dims[0], dims[1]);
+    uint64_t samples = getSamplesPerPixel(fileName.c_str());
+    uint64_t z = dims[2], y = dims[0], x = dims[1];
     free(dims);
-	return shape;
+	if(samples > 1) return pybind11::make_tuple(z, y, x, samples);
+	return pybind11::make_tuple(z, y, x);
 }
 
 

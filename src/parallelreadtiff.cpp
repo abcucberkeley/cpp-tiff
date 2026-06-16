@@ -39,6 +39,34 @@ static inline void flipTransposeStrip(T* out, const T* buf, int64_t x, int64_t y
     }
 }
 
+// RGB/multi-sample variant: de-interleaves a chunky strip (input
+// buf[(k*x + j)*samples + c]) into the column-major (y, x, c, z) MATLAB output
+// while transposing x/y. Only used when samples>1; the grayscale path keeps
+// using flipTransposeStrip above, so its hot loop is unchanged.
+template <typename T>
+static inline void flipTransposeStripRGB(T* out, const T* buf, int64_t x, int64_t y,
+                                         int64_t stripRows, int64_t rowOff, int64_t sliceOff,
+                                         int64_t samples) {
+    constexpr int64_t TILE = 128;
+    const int64_t chanStride = x * y;     // output channel-plane stride
+    const int64_t inRow = x * samples;    // input (chunky) row stride, in elements
+    for (int64_t c = 0; c < samples; c++) {
+        T* outc = out + c * chanStride + sliceOff;
+        const T* bufc = buf + c;
+        for (int64_t jt = 0; jt < x; jt += TILE) {
+            const int64_t jEnd = (jt + TILE < x) ? jt + TILE : x;
+            for (int64_t kt = 0; kt < stripRows; kt += TILE) {
+                const int64_t kEnd = (kt + TILE < stripRows) ? kt + TILE : stripRows;
+                for (int64_t j = jt; j < jEnd; j++) {
+                    T* o = outc + (j * y) + rowOff;   // contiguous in k
+                    const T* b = bufc + j * samples;  // strided in k (step inRow)
+                    for (int64_t k = kt; k < kEnd; k++) o[k] = b[k * inRow];
+                }
+            }
+        }
+    }
+}
+
 // Backup method in case there are errors reading strips
 uint8_t readTiffParallelBak(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint8_t flipXY){
     int32_t numWorkers = omp_get_max_threads();
@@ -56,7 +84,9 @@ uint8_t readTiffParallelBak(uint64_t x, uint64_t y, uint64_t z, const char* file
 			sprintf(errString,"Thread %d: File \"%s\" cannot be opened\n",w,fileName);
 			err = 1;
 		}
-        void* buffer = malloc(x*bytes);
+        uint16_t spp = 1;
+        if(tif) TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
+        void* buffer = malloc(x*spp*bytes);   // *spp so an RGB scanline can't overflow
         for(int64_t dir = startSlice+(w*batchSize); dir < startSlice+((w+1)*batchSize); dir++){
             if(dir>=z+startSlice || err) break;
 
@@ -139,11 +169,18 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
             outCounter++;
         }
 
+        // Samples per pixel (1=grayscale, 3=RGB, 4=RGBA). xs is the interleaved
+        // row width in samples; xs==x when grayscale, so those paths are unchanged.
+        uint16_t spp = 1;
+        TIFFGetFieldDefaulted(tif.get(), TIFFTAG_SAMPLESPERPIXEL, &spp);
+        const uint64_t samples = spp;
+        const uint64_t xs = x * samples;
+
         // Only the flip path needs an intermediate bounce buffer; the no-flip
         // path decodes each strip directly into the output. new[] (not vector or
         // make_unique) keeps it RAII-owned without zero-filling before the read.
         std::unique_ptr<uint8_t[]> buffer;
-        if(flipXY) buffer.reset(new uint8_t[x*stripSize*bytes]);
+        if(flipXY) buffer.reset(new uint8_t[xs*stripSize*bytes]);
         for(int64_t dir = startSlice+(w*batchSize); dir < startSlice+((w+1)*batchSize); dir++){
             if(dir>=z+startSlice || err) break;
 
@@ -166,8 +203,8 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
                 // buffer and transpose below.
                 void* stripDst = flipXY
                     ? static_cast<void*>(buffer.get())
-                    : static_cast<void*>(static_cast<uint8_t*>(tiff) + (((i*stripSize*x)+((dir-startSlice)*(x*y)))*bytes));
-                int64_t cBytes = TIFFReadEncodedStrip(tif.get(), i, stripDst, stripSize*x*bytes);
+                    : static_cast<void*>(static_cast<uint8_t*>(tiff) + (((i*stripSize*xs)+((dir-startSlice)*(y*xs)))*bytes));
+                int64_t cBytes = TIFFReadEncodedStrip(tif.get(), i, stripDst, stripSize*xs*bytes);
                 if(cBytes < 0){
                     #pragma omp critical
                     {
@@ -187,19 +224,37 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
                 if(stripRows > (int64_t)stripSize) stripRows = (int64_t)stripSize;
                 int64_t rowOff = i*stripSize;
                 int64_t sliceOff = (dir-startSlice)*(x*y);
-                switch(bits){
-                    case 8:
-                        flipTransposeStrip<uint8_t>(static_cast<uint8_t*>(tiff), buffer.get(), x,y,stripRows,rowOff,sliceOff);
-                        break;
-                    case 16:
-                        flipTransposeStrip<uint16_t>(static_cast<uint16_t*>(tiff), reinterpret_cast<uint16_t*>(buffer.get()), x,y,stripRows,rowOff,sliceOff);
-                        break;
-                    case 32:
-                        flipTransposeStrip<float>(static_cast<float*>(tiff), reinterpret_cast<float*>(buffer.get()), x,y,stripRows,rowOff,sliceOff);
-                        break;
-                    case 64:
-                        flipTransposeStrip<double>(static_cast<double*>(tiff), reinterpret_cast<double*>(buffer.get()), x,y,stripRows,rowOff,sliceOff);
-                        break;
+                if(samples == 1){
+                    switch(bits){
+                        case 8:
+                            flipTransposeStrip<uint8_t>(static_cast<uint8_t*>(tiff), buffer.get(), x,y,stripRows,rowOff,sliceOff);
+                            break;
+                        case 16:
+                            flipTransposeStrip<uint16_t>(static_cast<uint16_t*>(tiff), reinterpret_cast<uint16_t*>(buffer.get()), x,y,stripRows,rowOff,sliceOff);
+                            break;
+                        case 32:
+                            flipTransposeStrip<float>(static_cast<float*>(tiff), reinterpret_cast<float*>(buffer.get()), x,y,stripRows,rowOff,sliceOff);
+                            break;
+                        case 64:
+                            flipTransposeStrip<double>(static_cast<double*>(tiff), reinterpret_cast<double*>(buffer.get()), x,y,stripRows,rowOff,sliceOff);
+                            break;
+                    }
+                } else {
+                    int64_t sliceOffC = (dir-startSlice)*(x*y*samples);
+                    switch(bits){
+                        case 8:
+                            flipTransposeStripRGB<uint8_t>(static_cast<uint8_t*>(tiff), buffer.get(), x,y,stripRows,rowOff,sliceOffC,samples);
+                            break;
+                        case 16:
+                            flipTransposeStripRGB<uint16_t>(static_cast<uint16_t*>(tiff), reinterpret_cast<uint16_t*>(buffer.get()), x,y,stripRows,rowOff,sliceOffC,samples);
+                            break;
+                        case 32:
+                            flipTransposeStripRGB<float>(static_cast<float*>(tiff), reinterpret_cast<float*>(buffer.get()), x,y,stripRows,rowOff,sliceOffC,samples);
+                            break;
+                        case 64:
+                            flipTransposeStripRGB<double>(static_cast<double*>(tiff), reinterpret_cast<double*>(buffer.get()), x,y,stripRows,rowOff,sliceOffC,samples);
+                            break;
+                    }
                 }
             }
         }
@@ -231,7 +286,9 @@ uint8_t readTiffParallel2DBak(uint64_t x, uint64_t y, uint64_t z, const char* fi
 			sprintf(errString,"tiff:threadError","Thread %d: File \"%s\" cannot be opened\n",w,fileName);
 			err = 1;
 		}
-        void* buffer = malloc(x*bytes);
+        uint16_t spp = 1;
+        if(tif) TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
+        void* buffer = malloc(x*spp*bytes);   // *spp so an RGB scanline can't overflow
         for(int64_t dir = startSlice+(w*batchSize); dir < startSlice+((w+1)*batchSize); dir++){
             if(dir>=z+startSlice || err) break;
 
@@ -301,6 +358,10 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
     uint16_t compressed = 1;
     TIFF* tif = TIFFOpen(fileName, "r");
     TIFFGetField(tif, TIFFTAG_COMPRESSION, &compressed);
+    uint16_t spp = 1;
+    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
+    const uint64_t samples = spp;          // 1=grayscale, 3=RGB, 4=RGBA
+    const uint64_t xs = x * samples;       // interleaved row width (xs==x when grayscale)
 
     // The other method won't work on specific slices of 3D images for now
     // so start slice must also be 0
@@ -323,9 +384,7 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
                 outCounter++;
             }
     
-            void* buffer = malloc(x*stripSize*bytes);
-    
-    
+            void* buffer = malloc(xs*stripSize*bytes);
             uint8_t counter = 0;
             while(!TIFFSetDirectory(tif, startSlice) && counter<3){
                 printf("Thread %d: File \"%s\" Directory \"%d\" failed to open. Try %d\n",w,fileName,0,counter+1);
@@ -342,7 +401,7 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
             {
                 if(i*stripSize >= y || err) break;
                 //loading the data into a buffer
-                int64_t cBytes = TIFFReadEncodedStrip(tif, i, buffer, stripSize*x*bytes);
+                int64_t cBytes = TIFFReadEncodedStrip(tif, i, buffer, stripSize*xs*bytes);
                 if(cBytes < 0){
                     #pragma omp critical
                     {
@@ -353,27 +412,44 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
                     break;
                 }
                 if(!flipXY){
-                    memcpy(tiff+((i*stripSize*x)*bytes),buffer,cBytes);
+                    memcpy((uint8_t*)tiff+((i*stripSize*xs)*bytes),buffer,cBytes);
                     continue;
                 }
-                // Same cache-blocked transpose as the 3D path (flipTransposeStrip),
-                // here for a single image so the slice offset is 0.
+                // Same cache-blocked transpose as the 3D path, single image so
+                // the slice offset is 0. samples==1 keeps the grayscale path.
                 int64_t stripRows = y - (i*stripSize);
                 if(stripRows > (int64_t)stripSize) stripRows = (int64_t)stripSize;
                 int64_t rowOff = i*stripSize;
-                switch(bits){
-                    case 8:
-                        flipTransposeStrip<uint8_t>((uint8_t*)tiff,(uint8_t*)buffer,x,y,stripRows,rowOff,0);
-                        break;
-                    case 16:
-                        flipTransposeStrip<uint16_t>((uint16_t*)tiff,(uint16_t*)buffer,x,y,stripRows,rowOff,0);
-                        break;
-                    case 32:
-                        flipTransposeStrip<float>((float*)tiff,(float*)buffer,x,y,stripRows,rowOff,0);
-                        break;
-                    case 64:
-                        flipTransposeStrip<double>((double*)tiff,(double*)buffer,x,y,stripRows,rowOff,0);
-                        break;
+                if(samples == 1){
+                    switch(bits){
+                        case 8:
+                            flipTransposeStrip<uint8_t>((uint8_t*)tiff,(uint8_t*)buffer,x,y,stripRows,rowOff,0);
+                            break;
+                        case 16:
+                            flipTransposeStrip<uint16_t>((uint16_t*)tiff,(uint16_t*)buffer,x,y,stripRows,rowOff,0);
+                            break;
+                        case 32:
+                            flipTransposeStrip<float>((float*)tiff,(float*)buffer,x,y,stripRows,rowOff,0);
+                            break;
+                        case 64:
+                            flipTransposeStrip<double>((double*)tiff,(double*)buffer,x,y,stripRows,rowOff,0);
+                            break;
+                    }
+                } else {
+                    switch(bits){
+                        case 8:
+                            flipTransposeStripRGB<uint8_t>((uint8_t*)tiff,(uint8_t*)buffer,x,y,stripRows,rowOff,0,samples);
+                            break;
+                        case 16:
+                            flipTransposeStripRGB<uint16_t>((uint16_t*)tiff,(uint16_t*)buffer,x,y,stripRows,rowOff,0,samples);
+                            break;
+                        case 32:
+                            flipTransposeStripRGB<float>((float*)tiff,(float*)buffer,x,y,stripRows,rowOff,0,samples);
+                            break;
+                        case 64:
+                            flipTransposeStripRGB<double>((double*)tiff,(double*)buffer,x,y,stripRows,rowOff,0,samples);
+                            break;
+                    }
                 }
             }
             free(buffer);
@@ -404,7 +480,7 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
 			return err;
 		}
 		offset = offsets[0];
-        uint64_t zSize = x*y*bytes;
+        uint64_t zSize = x*y*samples*bytes;
     
         fseek(fp, offset, SEEK_SET);
 
@@ -415,28 +491,26 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
             fread(tiff, 1, zSize, fp);
         }
         else{
-            uint64_t size = x*y*z*(bits/8);
+            uint64_t size = x*y*z*samples*(bits/8);
             tiffC = malloc(size);
             fread(tiffC, 1, zSize, fp);
         }
         fclose(fp);
-        if(flipXY){   
+        if(flipXY){
+            // De-interleave + transpose to column-major (y,x,c,z). samples==1
+            // (one channel pass, c=0) reduces to the original grayscale mapping.
             for(uint64_t k = 0; k < z; k++){
-                for(uint64_t j = 0; j < x; j++){
-                    for(uint64_t i = 0; i < y; i++){
-                        switch(bits){
-                            case 8:
-                                ((uint8_t*)tiff)[i+(j*y)+(k*x*y)] = ((uint8_t*)tiffC)[j+(i*x)+(k*x*y)];
-                                break;
-                            case 16:
-                                ((uint16_t*)tiff)[i+(j*y)+(k*x*y)] = ((uint16_t*)tiffC)[j+(i*x)+(k*x*y)];
-                                break;
-                            case 32:
-                                ((float*)tiff)[i+(j*y)+(k*x*y)] = ((float*)tiffC)[j+(i*x)+(k*x*y)];
-                                break;
-                            case 64:
-                                ((double*)tiff)[i+(j*y)+(k*x*y)] = ((double*)tiffC)[j+(i*x)+(k*x*y)];
-                                break;
+                for(uint64_t c = 0; c < samples; c++){
+                    for(uint64_t j = 0; j < x; j++){
+                        for(uint64_t i = 0; i < y; i++){
+                            uint64_t o  = i + (j*y) + (c*x*y) + (k*x*y*samples);
+                            uint64_t in = ((j+(i*x))*samples) + c + (k*x*y*samples);
+                            switch(bits){
+                                case 8:  ((uint8_t*)tiff)[o]  = ((uint8_t*)tiffC)[in];  break;
+                                case 16: ((uint16_t*)tiff)[o] = ((uint16_t*)tiffC)[in]; break;
+                                case 32: ((float*)tiff)[o]    = ((float*)tiffC)[in];    break;
+                                case 64: ((double*)tiff)[o]   = ((double*)tiffC)[in];   break;
+                            }
                         }
                     }
                 }
@@ -582,7 +656,18 @@ void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t fl
 	TIFFGetField(tif, TIFFTAG_BITSPERSAMPLE, &bits);
 	uint64_t stripSize = 1;
 	TIFFGetField(tif, TIFFTAG_ROWSPERSTRIP, &stripSize);
+	uint16_t spp = 1, planar = 1;
+	TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
+	TIFFGetFieldDefaulted(tif, TIFFTAG_PLANARCONFIG, &planar);
+	uint64_t samples = spp;   // 1=grayscale, 3=RGB, 4=RGBA
 	TIFFClose(tif);
+
+	// Planar (separate-plane) multi-sample TIFFs are not supported yet; reject
+	// clearly rather than silently mis-reading. Chunky RGB/RGBA are handled.
+	if(samples > 1 && planar == 2){
+		printf("Planar (PLANARCONFIG=2) RGB TIFFs are not supported by cpp-tiff\n");
+		return NULL;
+	}
 
 	// Check if image is an imagej image with imagej metadata
 	// Get the correct
@@ -607,22 +692,22 @@ void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t fl
 
 	if(imageJIm){
 		if(bits == 8){
-			if(!tiff) tiff = (uint8_t*)malloc(x*y*z*sizeof(uint8_t));
+			if(!tiff) tiff = (uint8_t*)malloc(x*y*z*samples*sizeof(uint8_t));
 			readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize,flipXY);
 			return (void*)tiff;
 		}
 		else if(bits == 16){
-			if(!tiff) tiff = (uint16_t*)malloc(x*y*z*sizeof(uint16_t));
+			if(!tiff) tiff = (uint16_t*)malloc(x*y*z*samples*sizeof(uint16_t));
 			readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
 			return (void*)tiff;
 		}
 		else if(bits == 32){
-			if(!tiff) tiff = (float*)malloc(x*y*z*sizeof(float));
+			if(!tiff) tiff = (float*)malloc(x*y*z*samples*sizeof(float));
 			readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
 			return (void*)tiff;
 		}
 		else if(bits == 64){
-			if(!tiff) tiff = (double*)malloc(x*y*z*sizeof(double));
+			if(!tiff) tiff = (double*)malloc(x*y*z*samples*sizeof(double));
 			readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
 			return (void*)tiff;
 		}
@@ -632,22 +717,22 @@ void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t fl
 	}
 	else if(z <= 1){
 		if(bits == 8){
-			if(!tiff) tiff = (uint8_t*)malloc(x*y*z*sizeof(uint8_t));
+			if(!tiff) tiff = (uint8_t*)malloc(x*y*z*samples*sizeof(uint8_t));
 			readTiffParallel2D(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize,flipXY);
 			return (void*)tiff;
 		}
 		else if(bits == 16){
-			if(!tiff) tiff = (uint16_t*)malloc(x*y*z*sizeof(uint16_t));
+			if(!tiff) tiff = (uint16_t*)malloc(x*y*z*samples*sizeof(uint16_t));
 			readTiffParallel2D(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
 			return (void*)tiff;
 		}
 		else if(bits == 32){
-			if(!tiff) tiff = (float*)malloc(x*y*z*sizeof(float));
+			if(!tiff) tiff = (float*)malloc(x*y*z*samples*sizeof(float));
 			readTiffParallel2D(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
 			return (void*)tiff;
 		}
 		else if(bits == 64){
-			if(!tiff) tiff = (double*)malloc(x*y*z*sizeof(double));
+			if(!tiff) tiff = (double*)malloc(x*y*z*samples*sizeof(double));
 			readTiffParallel2D(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
 			return (void*)tiff;
 		}
@@ -657,22 +742,22 @@ void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t fl
 	}
 	else{
 		if(bits == 8){
-			if(!tiff) tiff = (uint8_t*)malloc(x*y*z*sizeof(uint8_t));
+			if(!tiff) tiff = (uint8_t*)malloc(x*y*z*samples*sizeof(uint8_t));
 			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
 			return (void*)tiff;
 		}
 		else if(bits == 16){
-			if(!tiff) tiff = (uint16_t*)malloc(x*y*z*sizeof(uint16_t));
+			if(!tiff) tiff = (uint16_t*)malloc(x*y*z*samples*sizeof(uint16_t));
 			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
 			return (void*)tiff;
 		}
 		else if(bits == 32){
-			if(!tiff) tiff = (float*)malloc(x*y*z*sizeof(float));
+			if(!tiff) tiff = (float*)malloc(x*y*z*samples*sizeof(float));
 			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
 			return (void*)tiff;
 		}
 		else if(bits == 64){
-			if(!tiff) tiff = (double*)malloc(x*y*z*sizeof(double));
+			if(!tiff) tiff = (double*)malloc(x*y*z*samples*sizeof(double));
 			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
 			return (void*)tiff;
 		}

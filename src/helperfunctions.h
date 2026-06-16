@@ -21,4 +21,7 @@ uint64_t* getImageSize(const char* fileName);
 
 uint64_t getDataType(const char* fileName);
 
+// Samples per pixel: 1 = grayscale, 3 = RGB, 4 = RGBA. Defaults to 1.
+uint64_t getSamplesPerPixel(const char* fileName);
+
 #endif
