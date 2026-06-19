@@ -23,6 +23,9 @@ set(CMAKE_INSTALL_RPATH $ORIGIN)
 # OpenMP is Required
 find_package(OpenMP REQUIRED)
 
+include(FetchContent)
+
+# zlib's static target builds libz.a on Unix; MinGW/MSYS uses a different name.
 if(UNIX)
 set(ZLIB_STATIC_NAME "libz.a")
 else()
@@ -30,19 +33,27 @@ set(ZLIB_STATIC_NAME "libzlibstatic.a")
 endif()
 
 set(SKIP_INSTALL_ALL ON CACHE BOOL "" FORCE)
-set(ZLIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/zlib-1.2.8")
-add_subdirectory(${ZLIB_DIR})
+
+# zlib: fetched at configure time instead of vendored. Building it in-tree renames
+# the source zconf.h -> zconf.h.included on every configure, dirtying the repo.
+set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(zlib
+    URL      https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz
+    URL_HASH SHA256=9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23
+)
+FetchContent_MakeAvailable(zlib)
 set_property(TARGET zlibstatic PROPERTY POSITION_INDEPENDENT_CODE ON)
 
-set(LIBDEFLATE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dependencies/libdeflate-1.18")
-# We only need libdeflate as a static library for libtiff -- not its gzip CLI
-# (whose install rule fails) or its shared lib.
+# libdeflate: fetched too. We only need the static library for libtiff -- not its
+# gzip CLI (whose install rule fails) or its shared lib.
 set(LIBDEFLATE_BUILD_GZIP OFF CACHE BOOL "" FORCE)
 set(LIBDEFLATE_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
-add_subdirectory(${LIBDEFLATE_DIR})
+FetchContent_Declare(libdeflate
+    URL      https://github.com/ebiggers/libdeflate/releases/download/v1.25/libdeflate-1.25.tar.gz
+    URL_HASH SHA256=fed5cd22f00f30cc4c2e5329f94e2b8a901df9fa45ee255cb70e2b0b42344477
+)
+FetchContent_MakeAvailable(libdeflate)
 set_property(TARGET libdeflate_static PROPERTY POSITION_INDEPENDENT_CODE ON)
-
-include(FetchContent)
 
 # zstd: fetched at configure time instead of vendored. Its CMake lives under build/cmake.
 set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
@@ -70,10 +81,11 @@ endif()
 
 # Add libtiff (fetched at configure time; finds its deps via the cache vars below)
 include_directories(${ZSTD_DIR}/lib)
-set(ZLIB_INCLUDE_DIR  ${ZLIB_DIR} CACHE STRING "" FORCE)
-set(ZLIB_LIBRARY  ${CMAKE_BINARY_DIR}/dependencies/zlib-1.2.8/${ZLIB_STATIC_NAME} CACHE STRING "" FORCE)
-set(Deflate_INCLUDE_DIR  ${LIBDEFLATE_DIR} CACHE STRING "" FORCE)
-set(Deflate_LIBRARY  ${CMAKE_BINARY_DIR}/dependencies/libdeflate-1.18/libdeflate.a CACHE STRING "" FORCE)
+# zconf.h is generated into the binary dir, so list both dirs for libtiff's FindZLIB.
+set(ZLIB_INCLUDE_DIR  "${zlib_SOURCE_DIR};${zlib_BINARY_DIR}" CACHE STRING "" FORCE)
+set(ZLIB_LIBRARY  ${zlib_BINARY_DIR}/${ZLIB_STATIC_NAME} CACHE STRING "" FORCE)
+set(Deflate_INCLUDE_DIR  ${libdeflate_SOURCE_DIR} CACHE STRING "" FORCE)
+set(Deflate_LIBRARY  ${libdeflate_BINARY_DIR}/libdeflate.a CACHE STRING "" FORCE)
 set(ZSTD_INCLUDE_DIR  ${ZSTD_DIR}/lib CACHE STRING "" FORCE)
 set(ZSTD_LIBRARY  ${zstd_BINARY_DIR}/lib/libzstd.a CACHE STRING "" FORCE)
 set(tiff-tools OFF CACHE BOOL "" FORCE)
@@ -114,8 +126,9 @@ set_target_properties(cppTiff_shared PROPERTIES PUBLIC_HEADER "${LIBTIFF_HEADERS
 
 # Include the header files
 target_include_directories(cppTiff_shared PRIVATE
-    ${ZLIB_DIR}
-	${LIBDEFLATE_DIR} 
+    ${zlib_SOURCE_DIR}
+	${zlib_BINARY_DIR}
+	${libdeflate_SOURCE_DIR}
 	${ZSTD_DIR}/lib   
 	${LIBTIFF_DIR}/libtiff
 )
@@ -123,8 +136,8 @@ target_include_directories(cppTiff_shared PRIVATE
 # Link against the libraries
 target_link_libraries(cppTiff_shared PRIVATE
     ${tiff_BINARY_DIR}/libtiff/libtiff.a
-    ${CMAKE_BINARY_DIR}/dependencies/zlib-1.2.8/${ZLIB_STATIC_NAME}
-    ${CMAKE_BINARY_DIR}/dependencies/libdeflate-1.18/libdeflate.a
+    ${zlib_BINARY_DIR}/${ZLIB_STATIC_NAME}
+    ${libdeflate_BINARY_DIR}/libdeflate.a
     ${zstd_BINARY_DIR}/lib/libzstd.a
     -static-libgcc
     -static-libstdc++
