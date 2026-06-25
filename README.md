@@ -2,7 +2,8 @@
 An efficient parallel Tiff reader/writer that utilizes LibTIFF and OpenMP.
 
 ## Limitations
-1. Currently RGB tiffs are not supported but support may be added in the future
+1. RGB and RGBA tiffs are supported for reading only; writing RGB/RGBA is not yet supported
+2. Only chunky (interleaved) RGB/RGBA is supported. Planar RGB (separate color planes) will return an error
 
 ## Python
 
@@ -11,14 +12,14 @@ A Python version of cpp-tiff is available through pip
 ### Prerequisites
 
 #### Python
-1. Python version 3.8-3.13
+1. Python version 3.9-3.14
 
 #### OS
 Linux: All Linux distros made within the past 10 years should work
 
 Mac Apple Silicon (M1, M2, etc.): macOS 13 or newer is required
 
-Mac Intel: macOS 12 or newer is required
+Mac Intel: Support has been discontinued as of v1.5.0 (macOS 12 or newer is required)
 
 Windows: Windows 10 or newer is required
 
@@ -29,7 +30,7 @@ pip install cpp-tiff
 
 ### Usage
 
-The reader returns a zyx numpy array for the given tiff file
+The reader returns a zyx numpy array for the given tiff file (zyxc for RGB/RGBA tiffs, with the color channel last)
 
 The writer takes an output filename and a zyx numpy array
 
