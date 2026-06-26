@@ -162,7 +162,7 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
                 #pragma omp critical
                 {
                     err = 1;
-                    sprintf(errString,"Thread %d: File \"%s\" cannot be opened\n",w,fileName);
+                    sprintf(errString,"Thread %d: TIFFOpen failed for \"%s\"\n",w,fileName);
                 }
                 break;
             }
@@ -191,7 +191,7 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
                     #pragma omp critical
                     {
                         err = 1;
-                        sprintf(errString,"Thread %d: File \"%s\" cannot be opened\n",w,fileName);
+                        sprintf(errString,"Thread %d: TIFFSetDirectory(%ld) failed\n",w,(long)dir);
                     }
                 }
             }
@@ -670,7 +670,6 @@ void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t fl
 	}
 
 	// Check if image is an imagej image with imagej metadata
-	// Get the correct
 	uint8_t imageJIm = 0;
 	if(isImageJIm(fileName)){
 		imageJIm = 1;
@@ -681,11 +680,11 @@ void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t fl
     if(zRange.size()){
         if(zRange.size() == 2){
             startSlice = zRange[0];
-            z = zRange[1];
+            z = zRange[1] - zRange[0];   // number of slices to read
         }
         else{
             startSlice = zRange[0];
-            z = zRange[0]+1;
+            z = 1;                        // single slice
         }
     }
 
