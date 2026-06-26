@@ -98,84 +98,22 @@ void mexFunction(int nlhs, mxArray *plhs[],
     if(samples > 1){ ndim = 4; dim[2] = samples; dim[3] = z; }
     else           { ndim = 3; dim[2] = z; }
 
-    // Case for ImageJ
+    // Pick the MATLAB class from bit depth + sample format (2=signed int, 3=float, else unsigned).
+    uint64_t sampleFormat = getSampleFormat(fileName);
+    mxClassID classID = mxUINT8_CLASS;
+    if(bits == 8)       classID = (sampleFormat == 2) ? mxINT8_CLASS  : mxUINT8_CLASS;
+    else if(bits == 16) classID = (sampleFormat == 2) ? mxINT16_CLASS : mxUINT16_CLASS;
+    else if(bits == 32) classID = (sampleFormat == 3) ? mxSINGLE_CLASS : (sampleFormat == 2) ? mxINT32_CLASS : mxUINT32_CLASS;
+    else if(bits == 64) classID = (sampleFormat == 3) ? mxDOUBLE_CLASS : (sampleFormat == 2) ? mxINT64_CLASS : mxUINT64_CLASS;
+    else                mexErrMsgIdAndTxt("tiff:dataTypeError","Data type not suppported");
+
+    plhs[0] = mxCreateNumericArray(ndim,(mwSize*)dim,classID, mxREAL);
+    void* tiff = mxGetData(plhs[0]);
+
+    // Bytes are moved purely by bit width, so the worker only needs `bits`.
     uint8_t err = 0;
-    if(imageJIm){
-        if(bits == 8){
-            plhs[0] = mxCreateNumericArray(ndim,(mwSize*)dim,mxUINT8_CLASS, mxREAL);
-            uint8_t* tiff = (uint8_t*)mxGetPr(plhs[0]);
-            err = readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-        }
-        else if(bits == 16){
-            plhs[0] = mxCreateNumericArray(ndim,(mwSize*)dim,mxUINT16_CLASS, mxREAL);
-            uint16_t* tiff = (uint16_t*)mxGetPr(plhs[0]);
-            err = readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-        }
-        else if(bits == 32){
-            plhs[0] = mxCreateNumericArray(ndim,(mwSize*)dim,mxSINGLE_CLASS, mxREAL);
-            float* tiff = (float*)mxGetPr(plhs[0]);
-            err = readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-        }
-        else if(bits == 64){
-            plhs[0] = mxCreateNumericArray(ndim,(mwSize*)dim,mxDOUBLE_CLASS, mxREAL);
-            double* tiff = (double*)mxGetPr(plhs[0]);
-            err = readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-        }
-        else{
-            mexErrMsgIdAndTxt("tiff:dataTypeError","Data type not suppported");
-        }
-    }
-    // Case for 2D
-    else if(z <= 1){
-        if(bits == 8){
-            plhs[0] = mxCreateNumericArray(ndim,(mwSize*)dim,mxUINT8_CLASS, mxREAL);
-            uint8_t* tiff = (uint8_t*)mxGetPr(plhs[0]);
-            err = readTiffParallel2D(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-        }
-        else if(bits == 16){
-            plhs[0] = mxCreateNumericArray(ndim,(mwSize*)dim,mxUINT16_CLASS, mxREAL);
-            uint16_t* tiff = (uint16_t*)mxGetPr(plhs[0]);
-            err = readTiffParallel2D(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-        }
-        else if(bits == 32){
-            plhs[0] = mxCreateNumericArray(ndim,(mwSize*)dim,mxSINGLE_CLASS, mxREAL);
-            float* tiff = (float*)mxGetPr(plhs[0]);
-            err = readTiffParallel2D(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-        }
-        else if(bits == 64){
-            plhs[0] = mxCreateNumericArray(ndim,(mwSize*)dim,mxDOUBLE_CLASS, mxREAL);
-            double* tiff = (double*)mxGetPr(plhs[0]);
-            err = readTiffParallel2D(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-        }
-        else{
-            mexErrMsgIdAndTxt("tiff:dataTypeError","Data type not suppported");
-        }
-    }
-    // Case for 3D
-    else{
-        if(bits == 8){
-            plhs[0] = mxCreateNumericArray(ndim,(mwSize*)dim,mxUINT8_CLASS, mxREAL);
-            uint8_t* tiff = (uint8_t*)mxGetPr(plhs[0]);
-            err = readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-        }
-        else if(bits == 16){
-            plhs[0] = mxCreateNumericArray(ndim,(mwSize*)dim,mxUINT16_CLASS, mxREAL);
-            uint16_t* tiff = (uint16_t*)mxGetPr(plhs[0]);
-            err = readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-        }
-        else if(bits == 32){
-            plhs[0] = mxCreateNumericArray(ndim,(mwSize*)dim,mxSINGLE_CLASS, mxREAL);
-            float* tiff = (float*)mxGetPr(plhs[0]);
-            err = readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-        }
-        else if(bits == 64){
-            plhs[0] = mxCreateNumericArray(ndim,(mwSize*)dim,mxDOUBLE_CLASS, mxREAL);
-            double* tiff = (double*)mxGetPr(plhs[0]);
-            err = readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-        }
-        else{
-            mexErrMsgIdAndTxt("tiff:dataTypeError","Data type not suppported");
-        }
-    }
+    if(imageJIm)    err = readTiffParallelImageJ(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY);
+    else if(z <= 1) err = readTiffParallel2D(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY);
+    else            err = readTiffParallel(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY);
     if(err) mexErrMsgIdAndTxt("tiff:tiffError","An Error occured within the read function");
 }

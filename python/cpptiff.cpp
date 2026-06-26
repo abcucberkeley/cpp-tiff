@@ -51,6 +51,7 @@ pybind11::array pybind11_read_tiff(const std::string& fileName, const std::vecto
     }
 	uint64_t dtype = getDataType(fileName.c_str());
 	uint64_t samples = getSamplesPerPixel(fileName.c_str());
+	uint64_t fmt = getSampleFormat(fileName.c_str());  // 1=uint, 2=int, 3=float
 
 	void* data = readTiffParallelWrapperNoXYFlip(fileName.c_str(), zRange);
 	if(!data) throw std::runtime_error("Failed to read TIFF (unsupported format, e.g. planar RGB)");
@@ -65,14 +66,20 @@ pybind11::array pybind11_read_tiff(const std::string& fileName, const std::vecto
     }
 
 	switch (dtype) {
-        case 8:  // 8-bit unsigned int
+        case 8:
+            if(fmt == 2) return create_pybind11_array<int8_t>(data, dims, samples);
             return create_pybind11_array<uint8_t>(data, dims, samples);
-		case 16: // 16-bit unsigned int
+        case 16:
+            if(fmt == 2) return create_pybind11_array<int16_t>(data, dims, samples);
             return create_pybind11_array<uint16_t>(data, dims, samples);
-        case 32: // 32-bit float
-            return create_pybind11_array<float>(data, dims, samples);
-        case 64: // 64-bit double
-            return create_pybind11_array<double>(data, dims, samples);
+        case 32:
+            if(fmt == 3) return create_pybind11_array<float>(data, dims, samples);
+            if(fmt == 2) return create_pybind11_array<int32_t>(data, dims, samples);
+            return create_pybind11_array<uint32_t>(data, dims, samples);
+        case 64:
+            if(fmt == 3) return create_pybind11_array<double>(data, dims, samples);
+            if(fmt == 2) return create_pybind11_array<int64_t>(data, dims, samples);
+            return create_pybind11_array<uint64_t>(data, dims, samples);
         default:
             throw std::runtime_error("Unsupported data type");
     }
@@ -82,28 +89,23 @@ void pybind11_write_tiff(const std::string &fileName, const pybind11::array &dat
     // Determine the dtype based on the NumPy array type
     pybind11::buffer_info info = data.request();
 
-    uint64_t dtype;
-    if (info.format == pybind11::format_descriptor<uint8_t>::format()) {
-        dtype = 8;
-    }
-	else if (info.format == pybind11::format_descriptor<uint16_t>::format()) {
-        dtype = 16;
-    }
-	else if (info.format == pybind11::format_descriptor<float>::format()) {
-        dtype = 32;
-    }
-	else if (info.format == pybind11::format_descriptor<double>::format()) {
-        dtype = 64;
-    }
-	else {
+    // Map the NumPy dtype to (bit depth, TIFF sample format) by kind + width. Using the
+    // dtype kind avoids the long/long-long format-string ambiguity that breaks 64-bit matching.
+    char kind = data.dtype().kind();   // 'u' = unsigned int, 'i' = signed int, 'f' = float
+    uint64_t dtype = (uint64_t)(info.itemsize * 8);
+    uint16_t sampleFormat;
+    if (kind == 'u')      sampleFormat = 1;
+    else if (kind == 'i') sampleFormat = 2;
+    else if (kind == 'f') sampleFormat = 3;
+    else throw std::runtime_error("Unsupported data type");
+    if (dtype != 8 && dtype != 16 && dtype != 32 && dtype != 64)
         throw std::runtime_error("Unsupported data type");
-    }
 
     // Get the dimensions of the array
     uint64_t dims[3] = {static_cast<uint64_t>(info.shape[0]), static_cast<uint64_t>(info.shape[1]), static_cast<uint64_t>(info.shape[2])};
 
     // Call the function to write the data to a TIFF file
-    writeTiffParallelHelper(fileName.c_str(), info.ptr, dtype, "w", dims[0], dims[1], dims[2], 0, transpose, compression);
+    writeTiffParallelHelper(fileName.c_str(), info.ptr, dtype, "w", dims[0], dims[1], dims[2], 0, transpose, compression, sampleFormat);
 }
 
 pybind11::tuple pybind11_get_image_shape(const std::string& fileName){

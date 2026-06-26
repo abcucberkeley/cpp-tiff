@@ -18,7 +18,7 @@ extern "C" {
 #endif
 static const int kZstdLevel = 1;
 
-uint8_t writeTiffSingle(const uint64_t x, const uint64_t y, const uint64_t z, const char* fileName, const void* tiff, const void* tiffOld, const uint64_t bits, const uint64_t startSlice, const uint64_t stripSize, const char* mode, const bool transpose, const std::string &compression){
+uint8_t writeTiffSingle(const uint64_t x, const uint64_t y, const uint64_t z, const char* fileName, const void* tiff, const void* tiffOld, const uint64_t bits, const uint64_t startSlice, const uint64_t stripSize, const char* mode, const bool transpose, const std::string &compression, const uint16_t sampleFormat){
     TIFF* tif = NULL;
     if(!strcmp(mode,"w")){
         tif = TIFFOpen(fileName, "w8");
@@ -58,9 +58,9 @@ uint8_t writeTiffSingle(const uint64_t x, const uint64_t y, const uint64_t z, co
         TIFFSetField(tif, TIFFTAG_PLANARCONFIG, 1);
         TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 1);
 
-        if(bits >= 32){
-            TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
-        }
+        // Explicit type tag: caller-provided format, or derive from bits for legacy callers.
+        uint16_t sf = sampleFormat ? sampleFormat : (bits >= 32 ? SAMPLEFORMAT_IEEEFP : SAMPLEFORMAT_UINT);
+        TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT, sf);
 
         for (int64_t i = 0; i*stripSize < y; i++)
         {   
@@ -81,7 +81,7 @@ uint8_t writeTiffSingle(const uint64_t x, const uint64_t y, const uint64_t z, co
     return 0;
 }
 
-uint8_t writeTiffThread(const uint64_t x, const uint64_t y, const uint64_t z, const char* fileName, const void* tiff, const uint64_t bits, const uint64_t startSlice, const uint64_t stripSize, const char* mode, const uint64_t stripsPerDir, uint8_t** &comprA, uint64_t* cSizes, const std::string &compression){
+uint8_t writeTiffThread(const uint64_t x, const uint64_t y, const uint64_t z, const char* fileName, const void* tiff, const uint64_t bits, const uint64_t startSlice, const uint64_t stripSize, const char* mode, const uint64_t stripsPerDir, uint8_t** &comprA, uint64_t* cSizes, const std::string &compression, const uint16_t sampleFormat){
     TIFF* tif = NULL;
     if(!strcmp(mode,"w")){
         tif = TIFFOpen(fileName, "w8");
@@ -123,9 +123,9 @@ uint8_t writeTiffThread(const uint64_t x, const uint64_t y, const uint64_t z, co
         TIFFSetField(tif, TIFFTAG_PLANARCONFIG, 1);
         TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 1);
 
-        if(bits >= 32){
-            TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
-        }
+        // Explicit type tag: caller-provided format, or derive from bits for legacy callers.
+        uint16_t sf = sampleFormat ? sampleFormat : (bits >= 32 ? SAMPLEFORMAT_IEEEFP : SAMPLEFORMAT_UINT);
+        TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT, sf);
 
         for (int64_t i = 0; i*stripSize < y; i++)
         {
@@ -154,11 +154,11 @@ uint8_t writeTiffThread(const uint64_t x, const uint64_t y, const uint64_t z, co
     return 0;
 }
 
-uint8_t writeTiffParallel(const uint64_t x, const uint64_t y, const uint64_t z, const char* fileName, const void* tiff, const void* tiffOld, const uint64_t bits, const uint64_t startSlice, const uint64_t stripSize, const char* mode, const bool transpose, const std::string &compression){
+uint8_t writeTiffParallel(const uint64_t x, const uint64_t y, const uint64_t z, const char* fileName, const void* tiff, const void* tiffOld, const uint64_t bits, const uint64_t startSlice, const uint64_t stripSize, const char* mode, const bool transpose, const std::string &compression, const uint16_t sampleFormat){
     int32_t numWorkers = omp_get_max_threads();
     
     if(numWorkers == 1){
-        return writeTiffSingle(x, y, z, fileName, tiff, tiffOld, bits, startSlice, stripSize, mode, transpose, compression);
+        return writeTiffSingle(x, y, z, fileName, tiff, tiffOld, bits, startSlice, stripSize, mode, transpose, compression, sampleFormat);
     }
     
     uint64_t stripsPerDir = (uint64_t)ceil((double)y/(double)stripSize);
@@ -167,7 +167,7 @@ uint8_t writeTiffParallel(const uint64_t x, const uint64_t y, const uint64_t z, 
     uint8_t** comprA = NULL;
     uint64_t* cSizes = (uint64_t*)calloc(totalStrips, sizeof(uint64_t));
 
-    std::future<uint8_t> writerThreadResult = std::async(std::launch::async, writeTiffThread, x, y, z, fileName, tiff, bits, startSlice, stripSize, mode, stripsPerDir, std::ref(comprA), cSizes, std::ref(compression));
+    std::future<uint8_t> writerThreadResult = std::async(std::launch::async, writeTiffThread, x, y, z, fileName, tiff, bits, startSlice, stripSize, mode, stripsPerDir, std::ref(comprA), cSizes, std::ref(compression), sampleFormat);
     const bool useZstd = (compression == "zstd");
     if(compression != "none" && !compression.empty()){
         comprA = (uint8_t**)malloc(totalStrips*sizeof(uint8_t*));
@@ -206,7 +206,7 @@ uint8_t writeTiffParallel(const uint64_t x, const uint64_t y, const uint64_t z, 
     return writerThreadResult.get();
 }
 
-uint8_t writeTiffParallelWrapper(const uint64_t x, const uint64_t y, const uint64_t z, const char* fileName, const void* data, const uint64_t bits, const uint64_t startSlice, const uint64_t stripSize, const char* mode, const bool transpose, const std::string &compression){
+uint8_t writeTiffParallelWrapper(const uint64_t x, const uint64_t y, const uint64_t z, const char* fileName, const void* data, const uint64_t bits, const uint64_t startSlice, const uint64_t stripSize, const char* mode, const bool transpose, const std::string &compression, const uint16_t sampleFormat){
     int32_t numWorkers = omp_get_max_threads();
     void* tiff = nullptr;
 
@@ -303,15 +303,15 @@ uint8_t writeTiffParallelWrapper(const uint64_t x, const uint64_t y, const uint6
         }
     }
     else{
-        return writeTiffParallel(x, y, z, fileName, data, data, bits, startSlice, stripSize, mode, transpose, compression);
+        return writeTiffParallel(x, y, z, fileName, data, data, bits, startSlice, stripSize, mode, transpose, compression, sampleFormat);
     }
 
-    uint8_t ret = writeTiffParallel(x, y, z, fileName, tiff, data, bits, startSlice, stripSize, mode, transpose, compression);
+    uint8_t ret = writeTiffParallel(x, y, z, fileName, tiff, data, bits, startSlice, stripSize, mode, transpose, compression, sampleFormat);
     free(tiff);
     return ret;
 }
 
-void writeTiffParallelHelper(const char* fileName, const void* tiffOld, uint64_t bits, const char* mode, uint64_t x, uint64_t y, uint64_t z, uint64_t startSlice, const bool transpose, const std::string &compression)
+void writeTiffParallelHelper(const char* fileName, const void* tiffOld, uint64_t bits, const char* mode, uint64_t x, uint64_t y, uint64_t z, uint64_t startSlice, const bool transpose, const std::string &compression, const uint16_t sampleFormat)
 {
 	// Check if folder exists, if not then make it (recursive if needed)
 	char* folderName = strdup(fileName);
@@ -344,5 +344,5 @@ void writeTiffParallelHelper(const char* fileName, const void* tiffOld, uint64_t
 
 	uint64_t stripSize = 512;
 
-    writeTiffParallelWrapper(x, y, z, fileName, tiffOld, bits, startSlice, stripSize, mode, transpose, compression);
+    writeTiffParallelWrapper(x, y, z, fileName, tiffOld, bits, startSlice, stripSize, mode, transpose, compression, sampleFormat);
 }
