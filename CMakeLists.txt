@@ -164,3 +164,15 @@ if(BUILD_BENCH)
     target_include_directories(benchWrite PRIVATE ${SRC_DIR})
     target_link_libraries(benchWrite PRIVATE cppTiff_shared OpenMP::OpenMP_CXX)
 endif()
+
+# Round-trip smoke tests: write small random data, read it back, verify.
+# Enable with -DBUILD_TESTS=ON, then run `ctest` in the build dir.
+option(BUILD_TESTS "Build and register the round-trip smoke tests" OFF)
+if(BUILD_TESTS)
+    enable_testing()
+    add_executable(roundtripTest ${CMAKE_CURRENT_SOURCE_DIR}/tests/roundtrip.cpp)
+    set_target_properties(roundtripTest PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_include_directories(roundtripTest PRIVATE ${SRC_DIR})
+    target_link_libraries(roundtripTest PRIVATE cppTiff_shared OpenMP::OpenMP_CXX)
+    add_test(NAME roundtrip COMMAND roundtripTest ${CMAKE_CURRENT_BINARY_DIR})
+endif()

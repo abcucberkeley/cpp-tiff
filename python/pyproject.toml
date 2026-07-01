@@ -2,11 +2,31 @@
 requires = [
     "setuptools>=42",
     "pybind11>=2.10.0",
+    # Only the manylinux build container needs a pinned cmake; native mac/windows
+    # agents use their own. The marker keeps this Linux-only.
+    "cmake==3.26.4; sys_platform == 'linux'",
 ]
 build-backend = "setuptools.build_meta"
 
+# Common cibuildwheel settings; the [tool.cibuildwheel.<os>] tables below override
+# individual keys per platform (each key is inherited unless overridden).
 [tool.cibuildwheel]
+skip = "pp*"
 environment = {CXX="g++", CC="gcc"}
+# Smoke-test every built wheel in an isolated env (also verifies it imports and
+# bundles its native library).
+test-requires = ["numpy"]
+test-command = "python {project}/tests/test_python.py"
 
-[tool.cibuilddwheel.windows]
-CIBW_USE_MINGW = "true"
+[tool.cibuildwheel.linux]
+skip = "pp* *musllinux*"
+environment = {CXX="g++", CC="gcc", LD_LIBRARY_PATH="/project/build/install/lib64:$LD_LIBRARY_PATH"}
+
+[tool.cibuildwheel.macos]
+# Homebrew gcc on Apple Silicon. If the x86 mac build is re-enabled, its compiler
+# lives at /usr/local/bin — add an arch override then.
+environment = {CXX="/opt/homebrew/bin/g++-13", CC="/opt/homebrew/bin/gcc-13", MACOSX_DEPLOYMENT_TARGET="13.0"}
+
+[tool.cibuildwheel.windows]
+skip = "pp* cp*t-*"
+repair-wheel-command = "delvewheel repair --ignore-existing -w {dest_dir} {wheel}"
