@@ -174,5 +174,8 @@ if(BUILD_TESTS)
     set_target_properties(roundtripTest PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
     target_include_directories(roundtripTest PRIVATE ${SRC_DIR})
     target_link_libraries(roundtripTest PRIVATE cppTiff_shared OpenMP::OpenMP_CXX)
+    # Match libcppTiff's runtime linkage so std::string/exceptions cross the DLL
+    # boundary with one ABI (avoids a MinGW libstdc++ mismatch on Windows).
+    target_link_options(roundtripTest PRIVATE -static-libgcc -static-libstdc++)
     add_test(NAME roundtrip COMMAND roundtripTest ${CMAKE_CURRENT_BINARY_DIR})
 endif()

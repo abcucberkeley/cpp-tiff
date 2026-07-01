@@ -4,6 +4,9 @@
 //
 // Exits 0 if every case passes, 1 otherwise, so CTest reports pass/fail.
 // Usage: roundtripTest [output_dir]   (defaults to the current directory)
+//
+// Progress is written (flushed) to stderr before each operation so that if a
+// build segfaults, the CTest log shows exactly which step/dtype/compression died.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -18,11 +21,14 @@
 
 struct Case { const char* name; uint64_t bits; uint16_t sampleFormat; };
 
+static void step(const char* name, const char* comp, const char* what){
+    std::fprintf(stderr, "  [%s/%s] %s\n", name, comp, what);
+    std::fflush(stderr);
+}
+
 int main(int argc, char** argv){
     const std::string dir = (argc > 1) ? argv[1] : ".";
 
-    // Small, deliberately non-square and multi-slice, with a strip size that
-    // forces several strips per slice so the strip loop is exercised.
     const uint64_t x = 40, y = 24, z = 3;
     const uint64_t stripSize = 8;
     const uint64_t n = x * y * z;
@@ -48,26 +54,32 @@ int main(int argc, char** argv){
             total++;
             const std::string path = dir + "/rt_" + c.name + "_" + comp + ".tif";
 
+            step(c.name, comp, "write");
             uint8_t werr = writeTiffParallelWrapper(x, y, z, path.c_str(), orig.data(), c.bits,
                                                     0, stripSize, "w", false,
                                                     std::string(comp), c.sampleFormat);
             if (werr){ std::printf("FAIL  %-6s %-4s  (write error)\n", c.name, comp); failures++; continue; }
 
             // Metadata should round trip.
+            step(c.name, comp, "read metadata");
             const uint64_t rbits = getDataType(path.c_str());
             const uint64_t rfmt  = getSampleFormat(path.c_str());
             uint64_t* dims = getImageSize(path.c_str());   // {y, x, z}
             const bool metaOK = rbits == c.bits && rfmt == c.sampleFormat &&
                                 dims[0] == y && dims[1] == x && dims[2] == z;
+            step(c.name, comp, "free metadata buffer");
             free(dims);
 
             // No-flip read (the Python/C layout) must be byte-identical to what we wrote.
+            step(c.name, comp, "read no-flip");
             void* rbuf = readTiffParallelWrapperNoXYFlip(path.c_str(), {});
             const bool dataOK = rbuf && std::memcmp(rbuf, orig.data(), nbytes) == 0;
+            step(c.name, comp, "free no-flip buffer");
             free(rbuf);
 
             // Flip read (the MATLAB (y,x,z) column-major layout): compare against the
             // transpose of the original, exercising the flipTransposeStrip path.
+            step(c.name, comp, "read flip");
             std::vector<uint8_t> expFlip(nbytes);
             for (uint64_t zi = 0; zi < z; zi++)
                 for (uint64_t yi = 0; yi < y; yi++)
@@ -76,6 +88,7 @@ int main(int argc, char** argv){
                                     &orig[(zi*y*x + yi*x + xi) * es], es);
             void* fbuf = readTiffParallelWrapper(path.c_str());
             const bool flipOK = fbuf && std::memcmp(fbuf, expFlip.data(), nbytes) == 0;
+            step(c.name, comp, "free flip buffer");
             free(fbuf);
 
             std::remove(path.c_str());
