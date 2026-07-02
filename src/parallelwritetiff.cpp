@@ -192,14 +192,12 @@ uint8_t writeTiffParallel(const uint64_t x, const uint64_t y, const uint64_t z, 
                     cSizes[i+(dir*stripsPerDir)] = ZSTD_compress(comprA[i+(dir*stripsPerDir)], cbound, src, len, kZstdLevel);
                     continue;
                 }
-                if(dir == z-1 && len == (y-(stripSize*i))*x*(bits/8)){
-                    uint8_t* cArrL = (uint8_t*)malloc(len+(extraBytes*(bits/8)));
-                    memcpy(cArrL, src, len);
-                    cSizes[i+(dir*stripsPerDir)] = lzwEncode(cArrL,comprA[i+(dir*stripsPerDir)],len+(extraBytes*(bits/8)));
-                    free(cArrL);
-                    continue;
-                }
-                cSizes[i+(dir*stripsPerDir)] = lzwEncode(src,comprA[i+(dir*stripsPerDir)],len+(extraBytes*(bits/8)));
+                // Compress exactly the strip's len bytes. An earlier version passed
+                // len+extraBytes here, reading past the strip -- a benign over-read on
+                // Linux but an out-of-bounds fault under concurrent allocation on Windows
+                // (crashed only on multithreaded LZW writes). cbound above keeps the
+                // output buffer margin; the source length must be exactly len.
+                cSizes[i+(dir*stripsPerDir)] = lzwEncode(src,comprA[i+(dir*stripsPerDir)],len);
             }
         }
     }
