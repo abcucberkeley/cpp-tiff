@@ -769,9 +769,9 @@ void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t fl
 	return NULL;
 }
 
-void* readTiffParallelWrapper(const char* fileName)
+void* readTiffParallelWrapper(const char* fileName, const std::vector<uint64_t> &zRange)
 {
-	return readTiffParallelWrapperHelper(fileName,NULL,1);
+	return readTiffParallelWrapperHelper(fileName,NULL,1,zRange);
 }
 
 void* readTiffParallelWrapperNoXYFlip(const char* fileName, const std::vector<uint64_t> &zRange)
