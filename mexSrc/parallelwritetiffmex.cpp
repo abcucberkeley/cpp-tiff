@@ -96,9 +96,11 @@ void mexFunction(int nlhs, mxArray *plhs[],
     uint64_t* dims = (uint64_t*) mxGetDimensions(prhs[1]);
 
 
-    uint64_t x = dims[1], y = dims[0], z = dims[2], bits = 0, startSlice = 0;
+    uint64_t x = dims[1], y = dims[0], bits = 0, startSlice = 0;
 
-    // For 2D images MATLAB passes in the 3rd dim as 0 so we set it to 1;
+    // mxGetDimensions returns exactly nDims entries, so reading dims[2] for a 2D
+    // image is out of bounds -- MATLAB does not pad the array with a trailing 0.
+    uint64_t z = (nDims > 2) ? dims[2] : 1;
     if(!z){
         z = 1;
     }
