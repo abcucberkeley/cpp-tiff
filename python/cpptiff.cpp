@@ -85,7 +85,7 @@ pybind11::array pybind11_read_tiff(const std::string& fileName, const std::vecto
     }
 }
 
-void pybind11_write_tiff(const std::string &fileName, const pybind11::array &data, const bool transpose = false, const std::string &compression = "lzw") {
+void pybind11_write_tiff(const std::string &fileName, const pybind11::array &data, const bool transpose = false, const std::string &compression = "lzw", const uint64_t tile = 0) {
     // Determine the dtype based on the NumPy array type
     pybind11::buffer_info info = data.request();
 
@@ -101,11 +101,17 @@ void pybind11_write_tiff(const std::string &fileName, const pybind11::array &dat
     if (dtype != 8 && dtype != 16 && dtype != 32 && dtype != 64)
         throw std::runtime_error("Unsupported data type");
 
-    // Get the dimensions of the array
-    uint64_t dims[3] = {static_cast<uint64_t>(info.shape[0]), static_cast<uint64_t>(info.shape[1]), static_cast<uint64_t>(info.shape[2])};
+    // Get the dimensions of the array. A 2D array only has two entries in shape,
+    // so reading shape[2] unconditionally is out of bounds -- it fed a garbage z
+    // to the writer (seen producing a 247 MB file for a 24x40 image).
+    if (info.ndim < 2 || info.ndim > 3)
+        throw std::runtime_error("data must be 2D or 3D");
+    uint64_t dims[3] = {static_cast<uint64_t>(info.shape[0]),
+                        static_cast<uint64_t>(info.shape[1]),
+                        info.ndim > 2 ? static_cast<uint64_t>(info.shape[2]) : 1};
 
     // Call the function to write the data to a TIFF file
-    writeTiffParallelHelper(fileName.c_str(), info.ptr, dtype, "w", dims[0], dims[1], dims[2], 0, transpose, compression, sampleFormat);
+    writeTiffParallelHelper(fileName.c_str(), info.ptr, dtype, "w", dims[0], dims[1], dims[2], 0, transpose, compression, sampleFormat, tile);
 }
 
 pybind11::tuple pybind11_get_image_shape(const std::string& fileName){
@@ -125,7 +131,7 @@ PYBIND11_MODULE(cpptiff, m) {
 
 	m.def("pybind11_read_tiff", &pybind11_read_tiff, "Read a tiff file");
 
-	m.def("pybind11_write_tiff", &pybind11_write_tiff, pybind11::arg("fileName"), pybind11::arg("data"), pybind11::arg("transpose"), pybind11::arg("compression"), "Write a tiff file");
+	m.def("pybind11_write_tiff", &pybind11_write_tiff, pybind11::arg("fileName"), pybind11::arg("data"), pybind11::arg("transpose"), pybind11::arg("compression"), pybind11::arg("tile") = 0, "Write a tiff file");
 
 	m.def("pybind11_get_image_shape", &pybind11_get_image_shape, "Get the image shape without reading the entire image");
 }

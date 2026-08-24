@@ -67,6 +67,168 @@ static inline void flipTransposeStripRGB(T* out, const T* buf, int64_t x, int64_
     }
 }
 
+// ---- Tiled TIFF support -------------------------------------------------
+// A tile is a sub-rectangle rather than a full-width strip, so its rows are not
+// contiguous in the output (the no-flip path cannot decode straight into the
+// output like it does for strips) and libtiff pads edge tiles out to a full
+// tile. validW/validH bound every copy to the part inside the image.
+
+// Copy one decoded tile into the row-major (no-flip) output, row by row.
+static inline void copyTileNoFlip(uint8_t* out, const uint8_t* buf, int64_t x,
+                                  int64_t tileX0, int64_t tileY0,
+                                  int64_t validW, int64_t validH,
+                                  int64_t tw, int64_t sliceOff,
+                                  int64_t samples, int64_t bytes) {
+    const int64_t px = samples * bytes;      // bytes per pixel
+    const int64_t inRow = tw * px;           // padded tile row stride
+    const int64_t outRow = x * px;           // image row stride
+    const int64_t copyBytes = validW * px;
+    uint8_t* o = out + sliceOff + ((tileY0 * x) + tileX0) * px;
+    const uint8_t* b = buf;
+    for (int64_t r = 0; r < validH; r++) {
+        memcpy(o, b, (size_t)copyBytes);
+        o += outRow;
+        b += inRow;
+    }
+}
+
+// Tile equivalent of flipTransposeStrip: transpose one tile into the
+// column-major (y, x, z) MATLAB output. j = output column (input x),
+// k = output row within the tile (input y).
+template <typename T>
+static inline void flipTransposeTile(T* out, const T* buf, int64_t y,
+                                     int64_t tileX0, int64_t tileY0,
+                                     int64_t validW, int64_t validH,
+                                     int64_t tw, int64_t sliceOff) {
+    constexpr int64_t TILE = 128;
+    for (int64_t jt = 0; jt < validW; jt += TILE) {
+        const int64_t jEnd = (jt + TILE < validW) ? jt + TILE : validW;
+        for (int64_t kt = 0; kt < validH; kt += TILE) {
+            const int64_t kEnd = (kt + TILE < validH) ? kt + TILE : validH;
+            for (int64_t j = jt; j < jEnd; j++) {
+                T* o = out + ((tileX0 + j) * y) + tileY0 + sliceOff;  // contiguous in k
+                const T* b = buf + j;                                 // strided in k (step tw)
+                for (int64_t k = kt; k < kEnd; k++) o[k] = b[k * tw];
+            }
+        }
+    }
+}
+
+// Tile equivalent of flipTransposeStripRGB (chunky multi-sample tiles).
+template <typename T>
+static inline void flipTransposeTileRGB(T* out, const T* buf, int64_t x, int64_t y,
+                                        int64_t tileX0, int64_t tileY0,
+                                        int64_t validW, int64_t validH,
+                                        int64_t tw, int64_t sliceOff, int64_t samples) {
+    constexpr int64_t TILE = 128;
+    const int64_t chanStride = x * y;        // output channel-plane stride
+    const int64_t inRow = tw * samples;      // input (chunky) tile row stride
+    for (int64_t c = 0; c < samples; c++) {
+        T* outc = out + c * chanStride + sliceOff;
+        const T* bufc = buf + c;
+        for (int64_t jt = 0; jt < validW; jt += TILE) {
+            const int64_t jEnd = (jt + TILE < validW) ? jt + TILE : validW;
+            for (int64_t kt = 0; kt < validH; kt += TILE) {
+                const int64_t kEnd = (kt + TILE < validH) ? kt + TILE : validH;
+                for (int64_t j = jt; j < jEnd; j++) {
+                    T* o = outc + ((tileX0 + j) * y) + tileY0;
+                    const T* b = bufc + j * samples;
+                    for (int64_t k = kt; k < kEnd; k++) o[k] = b[k * inRow];
+                }
+            }
+        }
+    }
+}
+
+// Decode tiles [tileStart, tileEnd) of the current directory into the output.
+// Shared by the 2D and 3D readers (they differ only in how tiles are split
+// across workers). Returns 1 and sets failedTile if a tile cannot be read.
+static uint8_t readTilesInto(TIFF* tif, uint8_t* buffer, int64_t tileBufBytes,
+                             void* out, int64_t x, int64_t y, int64_t bits,
+                             int64_t samples, int64_t tw, int64_t tl,
+                             int64_t tilesAcross, int64_t tileStart, int64_t tileEnd,
+                             int64_t sliceIdx, uint8_t flipXY, int64_t* failedTile) {
+    const int64_t bytes = bits / 8;
+    for (int64_t t = tileStart; t < tileEnd; t++) {
+        const int64_t tileY0 = (t / tilesAcross) * tl;
+        const int64_t tileX0 = (t % tilesAcross) * tw;
+        int64_t validH = y - tileY0; if (validH > tl) validH = tl;
+        int64_t validW = x - tileX0; if (validW > tw) validW = tw;
+        if (validW <= 0 || validH <= 0) continue;
+
+        if (TIFFReadEncodedTile(tif, (uint32_t)t, buffer, tileBufBytes) < 0) {
+            *failedTile = t;
+            return 1;
+        }
+        if (!flipXY) {
+            copyTileNoFlip((uint8_t*)out, buffer, x, tileX0, tileY0, validW, validH, tw,
+                           sliceIdx * y * x * samples * bytes, samples, bytes);
+            continue;
+        }
+        if (samples == 1) {
+            const int64_t sliceOff = sliceIdx * x * y;
+            switch (bits) {
+                case 8:
+                    flipTransposeTile<uint8_t>((uint8_t*)out, (const uint8_t*)buffer, y, tileX0, tileY0, validW, validH, tw, sliceOff);
+                    break;
+                case 16:
+                    flipTransposeTile<uint16_t>((uint16_t*)out, (const uint16_t*)buffer, y, tileX0, tileY0, validW, validH, tw, sliceOff);
+                    break;
+                case 32:
+                    flipTransposeTile<float>((float*)out, (const float*)buffer, y, tileX0, tileY0, validW, validH, tw, sliceOff);
+                    break;
+                case 64:
+                    flipTransposeTile<double>((double*)out, (const double*)buffer, y, tileX0, tileY0, validW, validH, tw, sliceOff);
+                    break;
+            }
+        }
+        else {
+            const int64_t sliceOff = sliceIdx * x * y * samples;
+            switch (bits) {
+                case 8:
+                    flipTransposeTileRGB<uint8_t>((uint8_t*)out, (const uint8_t*)buffer, x, y, tileX0, tileY0, validW, validH, tw, sliceOff, samples);
+                    break;
+                case 16:
+                    flipTransposeTileRGB<uint16_t>((uint16_t*)out, (const uint16_t*)buffer, x, y, tileX0, tileY0, validW, validH, tw, sliceOff, samples);
+                    break;
+                case 32:
+                    flipTransposeTileRGB<float>((float*)out, (const float*)buffer, x, y, tileX0, tileY0, validW, validH, tw, sliceOff, samples);
+                    break;
+                case 64:
+                    flipTransposeTileRGB<double>((double*)out, (const double*)buffer, x, y, tileX0, tileY0, validW, validH, tw, sliceOff, samples);
+                    break;
+            }
+        }
+    }
+    return 0;
+}
+
+// One worker's whole tiled read: walk its directories and decode every tile of
+// each. Kept in its own function so readTiffParallel's body stays focused on the
+// strip path. Returns 2 if a directory could not be selected, 1 if a tile could
+// not be read, 0 on success.
+static uint8_t readTiledDirs(TIFF* tif, void* out, int64_t x, int64_t y, int64_t z,
+                             int64_t bits, int64_t samples, int64_t tw, int64_t tl,
+                             int64_t tilesAcross, int64_t tilesDown, int64_t startSlice,
+                             int64_t dirBegin, int64_t dirEnd, uint8_t flipXY,
+                             int64_t tileBufBytes, int64_t* failedDir, int64_t* failedTile)
+{
+    std::unique_ptr<uint8_t[]> tileBuf(new uint8_t[tileBufBytes]);
+    for(int64_t dir = dirBegin; dir < dirEnd; dir++){
+        if(dir >= z + startSlice) break;
+
+        uint8_t counter = 0;
+        while(!TIFFSetDirectory(tif, (uint64_t)dir) && counter < 3){
+            counter++;
+            if(counter == 3){ *failedDir = dir; return 2; }
+        }
+        if(readTilesInto(tif, tileBuf.get(), tileBufBytes, out, x, y, bits, samples,
+                         tw, tl, tilesAcross, 0, tilesAcross*tilesDown,
+                         dir - startSlice, flipXY, failedTile)) return 1;
+    }
+    return 0;
+}
+
 // Backup method in case there are errors reading strips
 uint8_t readTiffParallelBak(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint8_t flipXY){
     int32_t numWorkers = omp_get_max_threads();
@@ -175,6 +337,51 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
         TIFFGetFieldDefaulted(tif.get(), TIFFTAG_SAMPLESPERPIXEL, &spp);
         const uint64_t samples = spp;
         const uint64_t xs = x * samples;
+
+        // Tiled TIFFs store sub-rectangles instead of full-width strips.
+        const bool tiled = TIFFIsTiled(tif.get());
+        uint32_t tw = 0, tl = 0;
+        uint64_t tileBufBytes = 0, tilesAcross = 0, tilesDown = 0;
+        if(tiled){
+            TIFFGetField(tif.get(), TIFFTAG_TILEWIDTH, &tw);
+            TIFFGetField(tif.get(), TIFFTAG_TILELENGTH, &tl);
+            const int64_t tileBytes = (int64_t)TIFFTileSize(tif.get());
+            // Bail out rather than divide by zero below or read nothing at all.
+            if(!tw || !tl || tileBytes <= 0){
+                #pragma omp critical
+                {
+                    err = 1;
+                    sprintf(errString,"Thread %d: tiled image has invalid tile geometry\n",w);
+                }
+            }
+            else{
+                tileBufBytes = (uint64_t)tileBytes;
+                tilesAcross = (x + tw - 1) / tw;
+                tilesDown = (y + tl - 1) / tl;
+            }
+        }
+
+        // Tiled images run their own directory loop, leaving the strip loop below
+        // unchanged. This worker owns whole slices, so it reads every tile of each
+        // of its directories.
+        if(tiled){
+            int64_t failedDir = -1, failedTile = -1;
+            uint8_t terr = readTiledDirs(tif.get(), tiff, (int64_t)x, (int64_t)y, (int64_t)z,
+                                         (int64_t)bits, (int64_t)samples, (int64_t)tw, (int64_t)tl,
+                                         (int64_t)tilesAcross, (int64_t)tilesDown, (int64_t)startSlice,
+                                         startSlice+(w*batchSize), startSlice+((w+1)*batchSize),
+                                         flipXY, (int64_t)tileBufBytes, &failedDir, &failedTile);
+            if(terr){
+                #pragma omp critical
+                {
+                    // No errBak: the scanline fallback cannot read tiled images.
+                    err = 1;
+                    if(terr == 2) sprintf(errString,"Thread %d: TIFFSetDirectory(%ld) failed\n",w,(long)failedDir);
+                    else sprintf(errString,"Thread %d: Tile %ld cannot be read\n",w,(long)failedTile);
+                }
+            }
+            continue;
+        }
 
         // Only the flip path needs an intermediate bounce buffer; the no-flip
         // path decodes each strip directly into the output. new[] (not vector or
@@ -363,9 +570,32 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
     const uint64_t samples = spp;          // 1=grayscale, 3=RGB, 4=RGBA
     const uint64_t xs = x * samples;       // interleaved row width (xs==x when grayscale)
 
+    // Tiled TIFFs store sub-rectangles instead of full-width strips. A single 2D
+    // image is one directory, so here the workers are split across tiles.
+    const bool tiled = TIFFIsTiled(tif);
+    uint32_t tw = 0, tl = 0;
+    uint64_t tileBufBytes = 0, tilesAcross = 0, tilesDown = 0, numTiles = 0;
+    if(tiled){
+        TIFFGetField(tif, TIFFTAG_TILEWIDTH, &tw);
+        TIFFGetField(tif, TIFFTAG_TILELENGTH, &tl);
+        const int64_t tileBytes = (int64_t)TIFFTileSize(tif);
+        // Bail out rather than divide by zero below or read nothing at all.
+        if(!tw || !tl || tileBytes <= 0){
+            printf("Tiled image \"%s\" has invalid tile geometry\n",fileName);
+            TIFFClose(tif);
+            return 1;
+        }
+        tileBufBytes = (uint64_t)tileBytes;
+        tilesAcross = (x + tw - 1) / tw;
+        tilesDown = (y + tl - 1) / tl;
+        numTiles = tilesAcross * tilesDown;
+    }
+    const int32_t tileBatch = tiled ? (int32_t)((numTiles-1)/numWorkers+1) : 0;
+
     // The other method won't work on specific slices of 3D images for now
-    // so start slice must also be 0
-    if(numWorkers > 1 || compressed > 1){
+    // so start slice must also be 0. It also reads the strips as one contiguous
+    // block straight off disk, which is not how tiled data is laid out.
+    if(numWorkers > 1 || compressed > 1 || tiled){
         #pragma omp parallel for
         for(w = 0; w < numWorkers; w++){
     
@@ -384,7 +614,7 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
                 outCounter++;
             }
     
-            void* buffer = malloc(xs*stripSize*bytes);
+            void* buffer = malloc(tiled ? tileBufBytes : xs*stripSize*bytes);
             uint8_t counter = 0;
             while(!TIFFSetDirectory(tif, startSlice) && counter<3){
                 printf("Thread %d: File \"%s\" Directory \"%d\" failed to open. Try %d\n",w,fileName,0,counter+1);
@@ -397,7 +627,25 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
                     }
                 }
             }
-            for (int64_t i = (w*batchSize); i < (w+1)*batchSize; i++)
+            if(tiled){
+                int64_t tStart = (int64_t)w*tileBatch;
+                int64_t tEnd = tStart + tileBatch;
+                if(tEnd > (int64_t)numTiles) tEnd = (int64_t)numTiles;
+                int64_t failedTile = -1;
+                if(!err && tStart < tEnd &&
+                   readTilesInto(tif, (uint8_t*)buffer, (int64_t)tileBufBytes, tiff,
+                                 (int64_t)x, (int64_t)y, (int64_t)bits, (int64_t)samples,
+                                 (int64_t)tw, (int64_t)tl, (int64_t)tilesAcross,
+                                 tStart, tEnd, 0, flipXY, &failedTile)){
+                    #pragma omp critical
+                    {
+                        // No errBak: the scanline fallback cannot read tiled images.
+                        err = 1;
+                        sprintf(errString,"Thread %d: Tile %ld cannot be read\n",w,(long)failedTile);
+                    }
+                }
+            }
+            else for (int64_t i = (w*batchSize); i < (w+1)*batchSize; i++)
             {
                 if(i*stripSize >= y || err) break;
                 //loading the data into a buffer
@@ -660,6 +908,7 @@ void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t fl
 	TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
 	TIFFGetFieldDefaulted(tif, TIFFTAG_PLANARCONFIG, &planar);
 	uint64_t samples = spp;   // 1=grayscale, 3=RGB, 4=RGBA
+	const bool tiled = TIFFIsTiled(tif);
 	TIFFClose(tif);
 
 	// Planar (separate-plane) multi-sample TIFFs are not supported yet; reject
@@ -669,9 +918,11 @@ void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t fl
 		return NULL;
 	}
 
-	// Check if image is an imagej image with imagej metadata
+	// Check if image is an imagej image with imagej metadata. The ImageJ reader
+	// pulls the pixels off disk as one contiguous block, which is not how tiled
+	// data is laid out, so tiled files go through the normal readers instead.
 	uint8_t imageJIm = 0;
-	if(isImageJIm(fileName)){
+	if(!tiled && isImageJIm(fileName)){
 		imageJIm = 1;
 		uint64_t tempZ = imageJImGetZ(fileName);
 		if(tempZ) z = tempZ;

@@ -30,7 +30,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     if(mxIsEmpty(prhs[1])) mexErrMsgIdAndTxt("tiff:inputError","All input data axes must be of at least size 1");
 
     std::string compression = "lzw";
-    if(nrhs == 4){
+    if(nrhs >= 4){
         if(!mxIsClass(prhs[3], "string")){
             if(!mxIsChar(prhs[3])) mexErrMsgIdAndTxt("tiff:inputError","The fourth argument must be a string");
             compression = mxArrayToString(prhs[3]);
@@ -44,6 +44,18 @@ void mexFunction(int nlhs, mxArray *plhs[],
             mexCallMATLAB(1, mCharA, 1, mString, "char");
             compression = mxArrayToString(mCharA[0]);
         }
+    }
+
+    // Optional fifth argument: tile size (0/omitted = striped, the default).
+    uint64_t tileSize = 0;
+    if(nrhs >= 5){
+        if(!mxIsNumeric(prhs[4]) || mxIsEmpty(prhs[4]))
+            mexErrMsgIdAndTxt("tiff:inputError","The fifth argument (tile size) must be a number");
+        double t = mxGetScalar(prhs[4]);
+        if(t < 0) mexErrMsgIdAndTxt("tiff:inputError","Tile size cannot be negative");
+        tileSize = (uint64_t)t;
+        if(tileSize && tileSize % 16)
+            mexErrMsgIdAndTxt("tiff:inputError","Tile size must be a multiple of 16");
     }
 
     // Handle the tilde character in filenames on Linux/Mac
@@ -109,7 +121,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
 
     uint64_t stripSize = 512;
     void* data = mxGetData(prhs[1]);
-    uint8_t err = writeTiffParallelWrapper(x,y,z,fileName,data,bits,startSlice,stripSize,mode,true,compression,sampleFormat);
+    uint8_t err = writeTiffParallelWrapper(x,y,z,fileName,data,bits,startSlice,stripSize,mode,true,compression,sampleFormat,tileSize);
 
     if(err) mexErrMsgIdAndTxt("tiff:tiffError","An Error occured within the write function");
 }

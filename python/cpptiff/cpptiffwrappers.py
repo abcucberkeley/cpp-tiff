@@ -30,7 +30,7 @@ def read_tiff(file_name, z_range=None):
     return im
 
 
-def write_tiff(file_name, data, compression='lzw'):
+def write_tiff(file_name, data, compression='lzw', tile=0):
     ndims = data.ndim
     transpose = False
     if data.flags['F_CONTIGUOUS'] or not data.flags['C_CONTIGUOUS']:
@@ -41,7 +41,7 @@ def write_tiff(file_name, data, compression='lzw'):
         data = np.transpose(data, (1, 0))
     else:
         raise Exception(f'data must be 3D or 2D!')
-    pybind11_write_tiff(file_name, data, transpose, compression)
+    pybind11_write_tiff(file_name, data, transpose, compression, tile)
     return
 
 

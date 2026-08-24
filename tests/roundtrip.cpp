@@ -38,6 +38,9 @@ int main(int argc, char** argv){
         {"int32",  32, 2}, {"float",  32, 3}, {"double", 64, 3},
     };
     const char* comps[] = {"none", "lzw", "zstd"};
+    // 0 = striped. 16 gives a 3x2 grid over the 40x24 image, ragged in both
+    // directions, so the padded edge tiles are exercised too.
+    const uint64_t tiles[] = {0, 16};
 
     std::mt19937 rng(1234567u);
     std::uniform_int_distribution<int> byteDist(0, 255);
@@ -50,36 +53,39 @@ int main(int argc, char** argv){
         std::vector<uint8_t> orig(nbytes);
         for (uint64_t i = 0; i < nbytes; i++) orig[i] = static_cast<uint8_t>(byteDist(rng));
 
-        for (const char* comp : comps){
+        for (const char* comp : comps)
+        for (const uint64_t tile : tiles){
             total++;
-            const std::string path = dir + "/rt_" + c.name + "_" + comp + ".tif";
+            char lbl[24];
+            std::snprintf(lbl, sizeof lbl, "%s/%s", comp, tile ? "tile" : "strip");
+            const std::string path = dir + "/rt_" + c.name + "_" + comp + "_t" + std::to_string(tile) + ".tif";
 
-            step(c.name, comp, "write");
+            step(c.name, lbl, "write");
             uint8_t werr = writeTiffParallelWrapper(x, y, z, path.c_str(), orig.data(), c.bits,
                                                     0, stripSize, "w", false,
-                                                    std::string(comp), c.sampleFormat);
-            if (werr){ std::printf("FAIL  %-6s %-4s  (write error)\n", c.name, comp); failures++; continue; }
+                                                    std::string(comp), c.sampleFormat, tile);
+            if (werr){ std::printf("FAIL  %-6s %-10s  (write error)\n", c.name, lbl); failures++; continue; }
 
             // Metadata should round trip.
-            step(c.name, comp, "read metadata");
+            step(c.name, lbl, "read metadata");
             const uint64_t rbits = getDataType(path.c_str());
             const uint64_t rfmt  = getSampleFormat(path.c_str());
             uint64_t* dims = getImageSize(path.c_str());   // {y, x, z}
             const bool metaOK = rbits == c.bits && rfmt == c.sampleFormat &&
                                 dims[0] == y && dims[1] == x && dims[2] == z;
-            step(c.name, comp, "free metadata buffer");
+            step(c.name, lbl, "free metadata buffer");
             free(dims);
 
             // No-flip read (the Python/C layout) must be byte-identical to what we wrote.
-            step(c.name, comp, "read no-flip");
+            step(c.name, lbl, "read no-flip");
             void* rbuf = readTiffParallelWrapperNoXYFlip(path.c_str(), {});
             const bool dataOK = rbuf && std::memcmp(rbuf, orig.data(), nbytes) == 0;
-            step(c.name, comp, "free no-flip buffer");
+            step(c.name, lbl, "free no-flip buffer");
             free(rbuf);
 
             // Flip read (the MATLAB (y,x,z) column-major layout): compare against the
             // transpose of the original, exercising the flipTransposeStrip path.
-            step(c.name, comp, "read flip");
+            step(c.name, lbl, "read flip");
             std::vector<uint8_t> expFlip(nbytes);
             for (uint64_t zi = 0; zi < z; zi++)
                 for (uint64_t yi = 0; yi < y; yi++)
@@ -88,16 +94,16 @@ int main(int argc, char** argv){
                                     &orig[(zi*y*x + yi*x + xi) * es], es);
             void* fbuf = readTiffParallelWrapper(path.c_str());
             const bool flipOK = fbuf && std::memcmp(fbuf, expFlip.data(), nbytes) == 0;
-            step(c.name, comp, "free flip buffer");
+            step(c.name, lbl, "free flip buffer");
             free(fbuf);
 
             std::remove(path.c_str());
 
             if (metaOK && dataOK && flipOK){
-                std::printf("PASS  %-6s %-4s\n", c.name, comp);
+                std::printf("PASS  %-6s %-10s\n", c.name, lbl);
             } else {
-                std::printf("FAIL  %-6s %-4s  (meta=%d noflip=%d flip=%d)\n",
-                            c.name, comp, (int)metaOK, (int)dataOK, (int)flipOK);
+                std::printf("FAIL  %-6s %-10s  (meta=%d noflip=%d flip=%d)\n",
+                            c.name, lbl, (int)metaOK, (int)dataOK, (int)flipOK);
                 failures++;
             }
         }
