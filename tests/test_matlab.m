@@ -143,21 +143,54 @@ end
 
 function tw = tileWidthOf(f)
 %TILEWIDTHOF TileWidth of the first directory, 0 if striped, -1 if unreadable.
-%   Returns -1 when the file cannot be inspected (e.g. a MATLAB release whose
-%   Tiff class cannot open BigTIFF) so the caller skips the check instead of
-%   failing on something unrelated to the data.
+%   Reads the header directly instead of using the Tiff class: Tiff holds the
+%   file open past the call, and Windows then refuses to delete it. Only
+%   little-endian files are decoded (every platform cpp-tiff targets is little
+%   endian); anything else returns -1 so the caller skips the check.
     tw = -1;
-    try
-        tf = Tiff(f, 'r');
-    catch
+    fid = fopen(f, 'r', 'l');
+    if fid < 0
         return;
     end
     try
-        tw = double(getTag(tf, 'TileWidth'));
+        tw = readTileWidth(fid);
     catch
-        tw = 0;   % tag absent => striped
+        tw = -1;
     end
-    % Close explicitly rather than leaving it to onCleanup/destructor ordering:
-    % Windows refuses to delete a file that still has an open handle.
-    close(tf);
+    fclose(fid);
+end
+
+
+function tw = readTileWidth(fid)
+    tw = -1;
+    if ~strcmp(fread(fid, 2, '*char')', 'II')
+        return;                                  % not little-endian
+    end
+    magic = fread(fid, 1, 'uint16');
+    if magic == 42                               % classic: 12-byte entries
+        off = fread(fid, 1, 'uint32');
+        if fseek(fid, off, 'bof') ~= 0, return; end
+        n = fread(fid, 1, 'uint16'); esz = 12; voff = 9;
+    elseif magic == 43                           % BigTIFF: 20-byte entries
+        fread(fid, 4, 'uint8');                  % offset size + reserved
+        off = fread(fid, 1, 'uint64');
+        if fseek(fid, off, 'bof') ~= 0, return; end
+        n = fread(fid, 1, 'uint64'); esz = 20; voff = 13;
+    else
+        return;
+    end
+    if isempty(n) || n > 4096
+        return;
+    end
+    tw = 0;                                      % no tile tag => striped
+    for i = 1:n
+        e = fread(fid, esz, '*uint8')';
+        if numel(e) < esz
+            tw = -1; return;
+        end
+        if double(e(1)) + 256*double(e(2)) == 322      % TIFFTAG_TILEWIDTH
+            tw = double(e(voff)) + 256*double(e(voff+1));
+            return;
+        end
+    end
 end
