@@ -26,7 +26,7 @@ function test_matlab(mexDir)
 
     tmp = tempname;
     mkdir(tmp);
-    cleanup = onCleanup(@() rmdir(tmp, 's')); %#ok<NASGU>
+    cleanup = onCleanup(@() rmdirQuiet(tmp)); %#ok<NASGU>
 
     rng(1234567);
     types = {'uint8','int8','uint16','int16','uint32','int32','single', ...
@@ -132,6 +132,15 @@ function data = makeData(sz, t)
 end
 
 
+function rmdirQuiet(d)
+%RMDIRQUIET Best-effort teardown; cleanup trouble must not mask the result.
+    try
+        rmdir(d, 's');
+    catch
+    end
+end
+
+
 function tw = tileWidthOf(f)
 %TILEWIDTHOF TileWidth of the first directory, 0 if striped, -1 if unreadable.
 %   Returns -1 when the file cannot be inspected (e.g. a MATLAB release whose
@@ -143,10 +152,12 @@ function tw = tileWidthOf(f)
     catch
         return;
     end
-    closer = onCleanup(@() close(tf)); %#ok<NASGU>
     try
         tw = double(getTag(tf, 'TileWidth'));
     catch
         tw = 0;   % tag absent => striped
     end
+    % Close explicitly rather than leaving it to onCleanup/destructor ordering:
+    % Windows refuses to delete a file that still has an open handle.
+    close(tf);
 end

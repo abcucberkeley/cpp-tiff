@@ -703,6 +703,10 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
             free(buffer);
             TIFFClose(tif);
         }
+        // Close the outer handle as well. It was only needed for the tag reads
+        // above (each worker opens its own), and leaving it open leaked a handle
+        // per 2D read -- harmless on Linux but it keeps the file locked on Windows.
+        TIFFClose(tif);
     }
     else{
         void* tiffC = NULL;
