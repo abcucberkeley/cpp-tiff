@@ -799,11 +799,22 @@ uint8_t readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* f
     TIFFGetField(tif, TIFFTAG_STRIPOFFSETS, &offsets);
     if(offsets) offset = offsets[0];
 
+    // ImageJ RGB stacks are chunky interleaved (spp=3), so every size below
+    // scales by samples. Grayscale (samples==1) is unchanged.
+    uint16_t spp = 1;
+    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
+    const uint64_t samples = spp;
+
+    // The raw fread below bypasses libtiff, so swap bytes only when the file's
+    // byte order differs from the host's (ImageJ itself writes big-endian, but
+    // e.g. tifffile writes ImageJ-format files little-endian by default).
+    const int needSwap = TIFFIsByteSwapped(tif);
+
     TIFFClose(tif);
 
-    fseek(fp, offset, SEEK_SET);
-
     uint64_t bytes = bits/8;
+    // The data is one contiguous block, so a z-range is just an offset into it.
+    fseek(fp, offset + startSlice*x*y*samples*bytes, SEEK_SET);
     //#pragma omp parallel for
     /*
     for(uint64_t i = 0; i < z; i++){
@@ -812,7 +823,7 @@ uint8_t readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* f
     read(fd,tiff+cOffset,x*y*bytes);
     }*/
     uint64_t chunk = 0;
-    uint64_t tBytes = x*y*z*bytes;
+    uint64_t tBytes = x*y*z*samples*bytes;
     uint64_t bytesRead;
     uint64_t rBytes = tBytes;
 
@@ -827,11 +838,11 @@ uint8_t readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* f
         }
     }
     fclose(fp);
-    // Swap endianess for types greater than 8 bits
-    // TODO: May need to change later because we may not always need to swap
-    if(bits > 8){
+    // Swap endianess for types greater than 8 bits when the file's byte order
+    // differs from the host's.
+    if(bits > 8 && needSwap){
         #pragma omp parallel for
-        for(uint64_t i = 0; i < x*y*z; i++){
+        for(uint64_t i = 0; i < x*y*z*samples; i++){
             switch(bits){
                 case 16:
                     //((uint16_t*)tiff)[i] = ((((uint16_t*)tiff)[i] & 0xff) >> 8) | (((uint16_t*)tiff)[i] << 8);
@@ -863,9 +874,10 @@ uint8_t readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* f
     }
     // Find a way to do this in-place without making a copy
     if(flipXY){
-        uint64_t size = x*y*z*(bits/8);
+        uint64_t size = x*y*z*samples*(bits/8);
         void* tiffC = malloc(size);
         memcpy(tiffC,tiff,size);
+        if(samples == 1){
         #pragma omp parallel for
         for(uint64_t k = 0; k < z; k++){
             for(uint64_t j = 0; j < x; j++){
@@ -884,6 +896,29 @@ uint8_t readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* f
                             ((double*)tiff)[i+(j*y)+(k*x*y)] = ((double*)tiffC)[j+(i*x)+(k*x*y)];
                             break;
                     }
+                }
+            }
+        }
+        }
+        else{
+            // De-interleave each chunky slice into the column-major (y,x,c,z)
+            // MATLAB layout, same mapping as the strip readers use.
+            #pragma omp parallel for
+            for(uint64_t k = 0; k < z; k++){
+                const uint64_t off = k*x*y*samples;
+                switch(bits){
+                    case 8:
+                        flipTransposeStripRGB<uint8_t>((uint8_t*)tiff, (uint8_t*)tiffC + off, x, y, y, 0, off, samples);
+                        break;
+                    case 16:
+                        flipTransposeStripRGB<uint16_t>((uint16_t*)tiff, (uint16_t*)tiffC + off, x, y, y, 0, off, samples);
+                        break;
+                    case 32:
+                        flipTransposeStripRGB<float>((float*)tiff, (float*)tiffC + off, x, y, y, 0, off, samples);
+                        break;
+                    case 64:
+                        flipTransposeStripRGB<double>((double*)tiff, (double*)tiffC + off, x, y, y, 0, off, samples);
+                        break;
                 }
             }
         }

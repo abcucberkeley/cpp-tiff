@@ -114,7 +114,103 @@ function test_matlab(mexDir)
     end
     assert(threw, 'a tile size that is not a multiple of 16 was accepted');
 
+    % 5. ImageJ-format files (single IFD + contiguous slices): RGB sample
+    %    scaling, z-range start offset, and byte-order handling in the ImageJ
+    %    fast path. Real ImageJ writes big-endian; tifffile writes little.
+    ijcases = { ...
+        'ij_rgb',    makeData([24 40 3 5], 'uint8'),  'l'; ...
+        'ij_g16_le', makeData([24 40 4],   'uint16'), 'l'; ...
+        'ij_g16_be', makeData([24 40 4],   'uint16'), 'b'};
+    for ci = 1:size(ijcases, 1)
+        [name, arr, bo] = ijcases{ci, :};
+        f = fullfile(tmp, [name '.tif']);
+        writeImageJTiff(f, arr, bo);
+
+        im = parallelReadTiff(f);
+        assert(strcmp(class(im), class(arr)), 'imagej %s: class %s', name, class(im));
+        assert(isequal(size(im), size(arr)),  'imagej %s: size %s', name, mat2str(size(im)));
+        assert(isequal(im, arr),              'imagej %s: data mismatch', name);
+
+        sub = parallelReadTiff(f, [2 3]);     % 1-indexed, inclusive
+        dims = getImageSizeMex(f);
+        if ndims(arr) == 4
+            assert(isequal(sub, arr(:,:,:,2:3)), 'imagej %s: z-range', name);
+            assert(isequal(double(dims), [24 40 5 3]), 'imagej %s: getImageSizeMex %s', name, mat2str(dims));
+        else
+            assert(isequal(sub, arr(:,:,2:3)), 'imagej %s: z-range', name);
+            assert(isequal(double(dims), [24 40 4]), 'imagej %s: getImageSizeMex %s', name, mat2str(dims));
+        end
+        delete(f);
+        fprintf('PASS  imagej %s\n', name);
+    end
+
     fprintf('MATLAB tests PASSED (%d round trips)\n', nchecked);
+end
+
+
+function writeImageJTiff(f, arr, byteorder)
+%WRITEIMAGEJTIFF Minimal single-IFD ImageJ-format TIFF (test fixture).
+%   One IFD describes slice 1; every slice's raw data sits contiguous after it
+%   and the ImageJ description carries images=Z -- the layout ImageJ's fast
+%   save produces, which the library reads through its ImageJ path. The
+%   library's writer cannot produce this layout, so the test writes it by
+%   hand, mirroring the fixtures in tests/roundtrip.cpp and
+%   python/tests/test_python.py. arr is (y,x,z) or (y,x,c,z); byteorder is
+%   'l' (little endian, like tifffile) or 'b' (big endian, like ImageJ).
+    if ndims(arr) == 4
+        [y, x, spp, z] = size(arr); perm = [3 2 1 4];   % file order: c, x, y, z
+    else
+        [y, x, z] = size(arr); spp = 1; perm = [2 1 3]; % file order: x, y, z
+    end
+    bits = 8 * numel(typecast(cast(0, class(arr)), 'uint8'));
+    es = bits / 8;
+    desc = [sprintf('ImageJ=1.11a\nimages=%d\nslices=%d\n', z, z) char(0)];
+    if mod(numel(desc), 2), desc(end+1) = char(0); end
+
+    n = 11;
+    auxOff = 8 + 2 + n*12 + 4;
+    bpsLen = (spp > 1) * spp * 2;
+    descOff = auxOff + bpsLen;
+    pixOff = descOff + numel(desc);
+    pixOff = pixOff + mod(pixOff, 2);
+
+    if spp == 1, bpsVal = bits; bpsLong = false;
+    else,        bpsVal = auxOff; bpsLong = true;  end
+    photometric = 1; if spp == 3, photometric = 2; end
+    % tag, type (2=ASCII, 3=SHORT, 4=LONG), count, value, value-is-LONG
+    ents = { ...
+        256, 3, 1,           x,             false; ...  % ImageWidth
+        257, 3, 1,           y,             false; ...  % ImageLength
+        258, 3, spp,         bpsVal,        bpsLong; ...% BitsPerSample
+        259, 3, 1,           1,             false; ...  % Compression: none
+        262, 3, 1,           photometric,   false; ...  % Photometric
+        270, 2, numel(desc), descOff,       true;  ...  % ImageDescription
+        273, 4, 1,           pixOff,        true;  ...  % StripOffsets
+        277, 3, 1,           spp,           false; ...  % SamplesPerPixel
+        278, 3, 1,           y,             false; ...  % RowsPerStrip
+        279, 4, 1,           x*y*spp*es,    true;  ...  % StripByteCounts
+        284, 3, 1,           1,             false};     % PlanarConfig: chunky
+    fid = fopen(f, 'w', byteorder);
+    assert(fid > 0, 'writeImageJTiff: cannot open %s', f);
+    if byteorder == 'b', fwrite(fid, 'MM', 'uint8'); else, fwrite(fid, 'II', 'uint8'); end
+    fwrite(fid, 42, 'uint16'); fwrite(fid, 8, 'uint32');
+    fwrite(fid, n, 'uint16');
+    for i = 1:size(ents, 1)
+        fwrite(fid, [ents{i,1} ents{i,2}], 'uint16');
+        fwrite(fid, ents{i,3}, 'uint32');
+        if ents{i,5}
+            fwrite(fid, ents{i,4}, 'uint32');
+        else
+            fwrite(fid, [ents{i,4} 0], 'uint16');   % SHORT sits in the first 2 bytes
+        end
+    end
+    fwrite(fid, 0, 'uint32');                       % no next IFD
+    if spp > 1, fwrite(fid, repmat(bits, 1, spp), 'uint16'); end
+    fwrite(fid, uint8(desc), 'uint8');
+    fwrite(fid, zeros(1, pixOff - ftell(fid), 'uint8'), 'uint8');
+    v = permute(arr, perm);
+    fwrite(fid, v(:), class(arr));
+    fclose(fid);
 end
 
 

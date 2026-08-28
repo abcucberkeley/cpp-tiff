@@ -85,8 +85,6 @@ void mexFunction(int nlhs, mxArray *plhs[],
     TIFFClose(tif);
 
     uint64_t samples = spp;
-    // ImageJ hyperstacks are grayscale (channels live in metadata); RGB ImageJ is out of scope.
-    if(imageJIm) samples = 1;
     if(samples > 1 && planar == 2)
         mexErrMsgIdAndTxt("tiff:planarError","Planar (PLANARCONFIG=2) RGB TIFFs are not supported");
 

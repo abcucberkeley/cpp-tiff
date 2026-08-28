@@ -84,6 +84,59 @@ def make(shape, dt, rng):
     return (rng.standard_normal(shape) * 1000).astype(dt)
 
 
+def write_imagej_tiff(path, arr, byteorder="<"):
+    """Minimal single-IFD ImageJ-format TIFF: one IFD describing slice 0, every
+    slice's raw data contiguous after it, and an ImageJ description carrying
+    images=Z. This is the layout ImageJ's fast save (and tifffile's
+    imagej=True, truncate=True) produce, which cpp-tiff reads through its
+    ImageJ fast path -- the library's own writer cannot produce it, hence this
+    hand-rolled fixture writer. arr is (z, y, x) or (z, y, x, 3)."""
+    e = byteorder
+    z, y, x = arr.shape[:3]
+    spp = arr.shape[3] if arr.ndim == 4 else 1
+    bits = arr.dtype.itemsize * 8
+    desc = f"ImageJ=1.11a\nimages={z}\nslices={z}\n".encode() + b"\x00"
+    if len(desc) % 2:
+        desc += b"\x00"
+
+    def entry(tag, typ, count, value_field):
+        return struct.pack(e + "HHI", tag, typ, count) + value_field
+
+    def short_v(v):
+        return struct.pack(e + "H", v) + b"\x00\x00"
+
+    def long_v(v):
+        return struct.pack(e + "I", v)
+
+    nentries = 11
+    aux_off = 8 + 2 + nentries * 12 + 4
+    bps_blob = struct.pack(e + f"{spp}H", *([bits] * spp)) if spp > 1 else b""
+    desc_off = aux_off + len(bps_blob)
+    pixel_off = desc_off + len(desc)
+    pixel_off += pixel_off % 2
+
+    ents = [
+        entry(256, 3, 1, short_v(x)),                        # ImageWidth
+        entry(257, 3, 1, short_v(y)),                        # ImageLength
+        entry(258, 3, spp, short_v(bits) if spp == 1 else long_v(aux_off)),
+        entry(259, 3, 1, short_v(1)),                        # Compression: none
+        entry(262, 3, 1, short_v(2 if spp == 3 else 1)),     # Photometric
+        entry(270, 2, len(desc), long_v(desc_off)),          # ImageDescription
+        entry(273, 4, 1, long_v(pixel_off)),                 # StripOffsets
+        entry(277, 3, 1, short_v(spp)),                      # SamplesPerPixel
+        entry(278, 3, 1, short_v(y)),                        # RowsPerStrip
+        entry(279, 4, 1, long_v(x * y * spp * (bits // 8))), # StripByteCounts
+        entry(284, 3, 1, short_v(1)),                        # PlanarConfig: chunky
+    ]
+    with open(path, "wb") as f:
+        f.write((b"II" if e == "<" else b"MM") + struct.pack(e + "HI", 42, 8))
+        f.write(struct.pack(e + "H", nentries) + b"".join(ents) + struct.pack(e + "I", 0))
+        f.write(bps_blob + desc)
+        if f.tell() < pixel_off:
+            f.write(b"\x00" * (pixel_off - f.tell()))
+        f.write(np.ascontiguousarray(arr).astype(arr.dtype.newbyteorder(e)).tobytes())
+
+
 def main():
     rng = np.random.default_rng(1234567)
     tmp = tempfile.mkdtemp()
@@ -135,6 +188,27 @@ def main():
         cpptiff.write_tiff(path, ragged, "zstd", tile)
         check(tile_width(path) == tile, f"ragged tile{tile}: not tiled")
         check(np.array_equal(cpptiff.read_tiff(path), ragged), f"ragged tile{tile}: data")
+        os.remove(path)
+
+    # 4. ImageJ-format files (single IFD + contiguous slices). Covers the ImageJ
+    #    fast path: RGB scaling by samples, z-range start offset, and byte-order
+    #    dependent swapping (real ImageJ writes big-endian, tifffile little-endian).
+    yy, xx = np.meshgrid(np.arange(24), np.arange(40), indexing="ij")
+    ij_rgb = np.zeros((5, 24, 40, 3), np.uint8)
+    for k in range(5):
+        ij_rgb[k, ..., 0] = (xx * 3 + k * 7) % 250
+        ij_rgb[k, ..., 1] = (yy * 5 + k * 11) % 250
+        ij_rgb[k, ..., 2] = (xx + yy * 2 + k * 13) % 250
+    ij_g16 = (np.arange(4 * 24 * 40, dtype=np.uint16) % 6000).reshape(4, 24, 40)
+    cases = [("ij_rgb", ij_rgb, "<"), ("ij_g16_le", ij_g16, "<"), ("ij_g16_be", ij_g16, ">")]
+    for name, arr, bo in cases:
+        path = os.path.join(tmp, name + ".tif")
+        write_imagej_tiff(path, arr, bo)
+        back = cpptiff.read_tiff(path)
+        check(back.dtype == arr.dtype and back.shape == arr.shape
+              and np.array_equal(back, arr), f"imagej {name}: full read")
+        sub = cpptiff.read_tiff(path, [1, 3])
+        check(np.array_equal(sub, arr[1:3]), f"imagej {name}: z-range [1,3)")
         os.remove(path)
 
     if _failures:
