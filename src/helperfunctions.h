@@ -1,5 +1,5 @@
-#ifndef HELPERFUNCTIONS_H
-#define HELPERFUNCTIONS_H
+#ifndef CPPTIFF_HELPERFUNCTIONS_H
+#define CPPTIFF_HELPERFUNCTIONS_H
 #include <cstdint>
 #include <stdarg.h>
 
