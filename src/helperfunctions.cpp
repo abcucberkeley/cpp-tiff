@@ -81,6 +81,7 @@ uint8_t isImageJIm(const char* fileName){
             if(size[2] > 1){
                 if(TIFFSetDirectory(tif,1)){
                     free(size);
+                    TIFFClose(tif);
                     return 0;
                 }
             }
@@ -104,10 +105,14 @@ uint64_t imageJImGetZ(const char* fileName){
         if(strstr(tiffDesc, "ImageJ")){
             char* nZ = strstr(tiffDesc,"images=");
             if(nZ){
-                TIFFClose(tif);
-                nZ+=7;
+                // Parse before TIFFClose: tiffDesc points into libtiff's
+                // directory storage, which TIFFClose frees. Reading it after
+                // the close only worked by allocator luck on Linux/Windows and
+                // returned garbage on macOS.
                 char* temp;
-                return strtol(nZ,&temp,10);
+                uint64_t z = strtol(nZ+7,&temp,10);
+                TIFFClose(tif);
+                return z;
             }
         }
     }
