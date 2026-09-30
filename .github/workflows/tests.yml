@@ -32,13 +32,14 @@ jobs:
 
       # The library's build flags and OpenMP setup are GCC-only, so Windows uses
       # MinGW. Python comes from MSYS2 too, so everything shares one toolchain.
+      # MSYS2 packages GCC's OpenMP runtime (libgomp) separately from gcc.
       - name: Set up MinGW (Windows)
         if: runner.os == 'Windows'
         uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
           update: false
-          pacboy: gcc:p cmake:p ninja:p python:p python-numpy:p pybind11:p
+          pacboy: gcc:p libgomp:p cmake:p ninja:p python:p python-numpy:p pybind11:p
 
       # Same compiler as the release builds. Apple clang has no OpenMP.
       - name: Set up GCC 13 (macOS)
@@ -109,7 +110,7 @@ jobs:
         with:
           msystem: UCRT64
           update: false
-          pacboy: gcc:p cmake:p ninja:p
+          pacboy: gcc:p libgomp:p cmake:p ninja:p
 
       # MATLAB finds MinGW through MW_MINGW64_LOC; build_mex.m selects it.
       - name: Point MATLAB at MinGW (Windows)
