@@ -67,6 +67,10 @@ Times `writeTiffParallelWrapper` on the **same volumes** as the reader. For each
 `.tif` in `--dir` it loads the volume into memory once (untimed, via the reader),
 then times writing that buffer back out as a TIFF, reporting throughput against
 the same logical-byte normalizer so read and write GB/s are directly comparable.
+The loaded volume is first copied into a buffer filled by all threads, so every
+library version writes from memory laid out the same way (each version's reader
+places its pages differently, which on two-socket Linux machines changed write
+times by tens of percent).
 
 ```bash
 # native (row-major) path, LZW

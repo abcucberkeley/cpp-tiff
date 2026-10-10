@@ -16,6 +16,10 @@
 #include <string>
 #include <vector>
 #include <omp.h>
+#ifndef _WIN32
+#include <csignal>
+#include <sys/resource.h>
+#endif
 
 #include "parallelreadtiff.h"
 #include "parallelwritetiff.h"
@@ -246,6 +250,17 @@ static bool truncateFile(const std::string& path, uint64_t cut){
     const size_t w = std::fwrite(v.data(), 1, keep, f);
     std::fclose(f);
     return w == keep;
+}
+
+static std::vector<uint8_t> readFileBytes(const std::string& path){
+    std::vector<uint8_t> v;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if(!f) return v;
+    uint8_t buf[65536];
+    size_t n;
+    while((n = std::fread(buf, 1, sizeof buf, f)) > 0) v.insert(v.end(), buf, buf + n);
+    std::fclose(f);
+    return v;
 }
 
 // Column-major MATLAB layout (y, x[, c], z) of a chunky row-major source.
@@ -665,6 +680,105 @@ int main(int argc, char** argv){
         std::remove(sp.c_str());
         if(ok) std::printf("PASS  %-14s one thread\n", "u16-none");
         else { std::printf("FAIL  %-14s one thread  (single-slice or full read wrong)\n", "u16-none"); failures++; }
+    }
+
+    // ---- Writer layouts. MATLAB-layout input (column-major, transposed strip by
+    // strip as it is written) must give the same file as row-major input, a
+    // single-threaded write must give the same file as a parallel one, and the
+    // file must read back to the source.
+    {
+        struct WL { const char* name; uint64_t x, y, z, bits; uint16_t fmt; const char* comp; uint64_t strip, tile; };
+        const WL wls[] = {
+            {"u8-none-s7",    40, 41, 3,  8, 1, "none",   7,  0},
+            {"u16-lzw-s512", 333, 77, 4, 16, 1, "lzw",  512,  0},
+            {"f32-zstd-s5",   61, 29, 3, 32, 3, "zstd",   5,  0},
+            {"f64-lzw-t16",   50, 37, 2, 64, 3, "lzw",  512, 16},
+            {"u16-none-t32",  70, 45, 3, 16, 1, "none", 512, 32},
+            {"u8-zstd-t16",   33, 70, 2,  8, 1, "zstd", 512, 16},
+        };
+        std::mt19937 wrng(424242u);
+        std::uniform_int_distribution<int> wbyte(0, 255);
+        const int prevThreads = omp_get_max_threads();
+        for(const WL& c : wls){
+            total++;
+            const uint64_t es = c.bits/8;
+            std::vector<uint8_t> rm(c.x*c.y*c.z*es);
+            for(auto& v8 : rm) v8 = (uint8_t)(wbyte(wrng) & 0x3F);   // compressible, and floats stay finite
+            const std::vector<uint8_t> cm = flipped(rm.data(), c.x, c.y, c.z, 1, es);
+            const std::string pa = dir + "/wl_row_" + c.name + ".tif", pb = dir + "/wl_matlab_" + c.name + ".tif",
+                              pc = dir + "/wl_one_" + c.name + ".tif";
+            step(c.name, "writer layouts", "row-major, MATLAB-layout and one-thread writes");
+            bool ok = !writeTiffParallelWrapper(c.x, c.y, c.z, pa.c_str(), rm.data(), c.bits, 0, c.strip, "w", false, std::string(c.comp), c.fmt, c.tile)
+                      && !writeTiffParallelWrapper(c.x, c.y, c.z, pb.c_str(), cm.data(), c.bits, 0, c.strip, "w", true, std::string(c.comp), c.fmt, c.tile);
+            omp_set_num_threads(1);
+            ok = ok && !writeTiffParallelWrapper(c.x, c.y, c.z, pc.c_str(), cm.data(), c.bits, 0, c.strip, "w", true, std::string(c.comp), c.fmt, c.tile);
+            omp_set_num_threads(prevThreads);
+            const std::vector<uint8_t> fa = readFileBytes(pa), fb = readFileBytes(pb), fc = readFileBytes(pc);
+            ok = ok && !fa.empty() && fa == fb && fa == fc;
+            void* back = ok ? readTiffParallelWrapperNoXYFlip(pa.c_str(), {}) : nullptr;
+            ok = ok && back && std::memcmp(back, rm.data(), rm.size()) == 0;
+            free(back);
+            std::remove(pa.c_str()); std::remove(pb.c_str()); std::remove(pc.c_str());
+            if(ok) std::printf("PASS  %-14s writer layouts\n", c.name);
+            else { std::printf("FAIL  %-14s writer layouts  (files differ or read back wrong)\n", c.name); failures++; }
+        }
+    }
+
+    // ---- Write failures must be reported instead of leaving a broken file and
+    // returning success.
+    {
+        const uint64_t fx = 128, fy = 128, fz = 8;
+        std::vector<uint16_t> fv(fx*fy*fz);
+        for(uint64_t i = 0; i < fv.size(); i++) fv[i] = (uint16_t)(i*2654435761u >> 7);
+        // A folder that cannot exist: the path runs through a regular file.
+        total++;
+        const std::string blocker = dir + "/not_a_folder.txt";
+        if(FILE* f = std::fopen(blocker.c_str(), "wb")){ std::fputs("x", f); std::fclose(f); }
+        const std::string inside = blocker + "/sub/out.tif";
+        step("bad-folder", "write failures", "write below a regular file");
+        const bool badFolder = writeTiffParallelHelper(inside.c_str(), fv.data(), 16, "w", fx, fy, fz, 0, false, "lzw", 1, 0) != 0;
+        std::remove(blocker.c_str());
+        if(badFolder) std::printf("PASS  %-14s write failures\n", "bad-folder");
+        else { std::printf("FAIL  %-14s write failures  (reported success)\n", "bad-folder"); failures++; }
+#ifdef __linux__
+        // A device that rejects every write.
+        total++;
+        step("dev-full", "write failures", "write to /dev/full");
+        const bool devFull = writeTiffParallelWrapper(fx, fy, fz, "/dev/full", fv.data(), 16, 0, 16, "w", false, "none", 1, 0) != 0;
+        if(devFull) std::printf("PASS  %-14s write failures\n", "dev-full");
+        else { std::printf("FAIL  %-14s write failures  (reported success)\n", "dev-full"); failures++; }
+#endif
+#ifndef _WIN32
+        // Running out of space partway through: lower the file-size limit so
+        // writes past it fail (with SIGXFSZ ignored they return an error instead
+        // of killing the process), in both the parallel and one-thread writers.
+        const std::string partial = dir + "/partial_write.tif";
+        struct rlimit oldLimit;
+        getrlimit(RLIMIT_FSIZE, &oldLimit);
+        void (*oldHandler)(int) = std::signal(SIGXFSZ, SIG_IGN);
+        const int prevThreads = omp_get_max_threads();
+        const int threadCounts[] = {prevThreads, 1};
+        for(int t : threadCounts){
+            for(const char* comp : {"none", "zstd"}){
+                total++;
+                struct rlimit lim = oldLimit;
+                lim.rlim_cur = 64*1024;   // the volume is 256 KB uncompressed, well above this compressed
+                step("partial", comp, "write past a 64 KB file-size limit");
+                omp_set_num_threads(t);
+                std::vector<uint16_t> noisy(fv.size());
+                std::mt19937 nrng(7u);
+                for(auto& v16 : noisy) v16 = (uint16_t)nrng();   // incompressible, so zstd output exceeds the limit too
+                setrlimit(RLIMIT_FSIZE, &lim);
+                const bool reported = writeTiffParallelWrapper(fx, fy, fz, partial.c_str(), noisy.data(), 16, 0, 16, "w", false, std::string(comp), 1, 0) != 0;
+                setrlimit(RLIMIT_FSIZE, &oldLimit);
+                omp_set_num_threads(prevThreads);
+                std::remove(partial.c_str());
+                if(reported) std::printf("PASS  partial-%-6s t%-3d write failures\n", comp, t);
+                else { std::printf("FAIL  partial-%-6s t%-3d write failures  (reported success)\n", comp, t); failures++; }
+            }
+        }
+        std::signal(SIGXFSZ, oldHandler);
+#endif
     }
 
     // ---- Unreadable and damaged files: report failure, never crash.

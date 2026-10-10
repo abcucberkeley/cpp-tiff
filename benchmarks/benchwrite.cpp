@@ -242,6 +242,20 @@ int main(int argc, char* argv[]) {
         std::string dims = std::to_string(v.x) + "x" + std::to_string(v.y) + "x" + std::to_string(v.z);
 
         void* buf = loadInput(path.string());
+        if (buf) {
+            // The reader's threads decided where this buffer's pages live, and that
+            // differs between library versions, which skews version-to-version
+            // comparisons. Copy it the same way every time instead.
+            void* mine = malloc(v.bytes);
+            if (mine) {
+                const int64_t blk = 1 << 20, nb = (int64_t)((v.bytes + blk - 1) / blk);
+                #pragma omp parallel for schedule(static)
+                for (int64_t b = 0; b < nb; b++)
+                    std::memcpy((char*)mine + b*blk, (char*)buf + b*blk, (size_t)std::min<int64_t>(blk, (int64_t)v.bytes - b*blk));
+            }
+            free(buf);
+            buf = mine;
+        }
         if (!buf) {
             std::printf("%-34s %-16s %4llu %8s %s\n", shortName(base, 34).c_str(), dims.c_str(),
                         (unsigned long long)v.bits, "-", "FAILED to load source");

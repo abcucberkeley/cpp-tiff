@@ -296,6 +296,18 @@ def main():
     check(np.array_equal(cpptiff.read_tiff(path, [0, 3]), ij_g16[0:3]), "truncated imagej: complete slices")
     os.remove(path)
 
+    # Writes that cannot succeed raise instead of returning normally (the path
+    # runs through a regular file, so its folder can never be created).
+    blocker = os.path.join(tmp, "not_a_folder.txt")
+    with open(blocker, "w") as fh:
+        fh.write("x")
+    try:
+        cpptiff.write_tiff(os.path.join(blocker, "sub", "out.tif"), vol)
+        check(False, "write below a regular file did not raise")
+    except RuntimeError:
+        pass
+    os.remove(blocker)
+
     if _failures:
         for f in _failures[:20]:
             print("FAIL:", f)

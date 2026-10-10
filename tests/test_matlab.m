@@ -167,6 +167,17 @@ function test_matlab(mexDir)
     assert(throws(@() parallelReadTiff(f, [3 3])), 'corrupt strip: damaged slice did not error');
     assert(isequal(parallelReadTiff(f, [1 2]), vol(:,:,1:2)), 'corrupt strip: undamaged slices');
     delete(f);
+
+    % Writes that cannot succeed must error instead of reporting success.
+    blocker = fullfile(tmp, 'not_a_folder.txt');
+    fid = fopen(blocker, 'w');
+    fwrite(fid, 'x');
+    fclose(fid);
+    assert(throws(@() parallelWriteTiff(fullfile(blocker, 'sub', 'out.tif'), vol)), 'write below a regular file did not error');
+    delete(blocker);
+    if isunix && ~ismac
+        assert(throws(@() parallelWriteTiff('/dev/full', vol, 'w', 'none')), 'write to /dev/full did not error');
+    end
     fprintf('PASS  damaged files\n');
 
     fprintf('MATLAB tests PASSED (%d round trips)\n', nchecked);

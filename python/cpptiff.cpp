@@ -111,8 +111,10 @@ void pybind11_write_tiff(const std::string &fileName, const pybind11::array &dat
                         static_cast<uint64_t>(info.shape[1]),
                         info.ndim > 2 ? static_cast<uint64_t>(info.shape[2]) : 1};
 
-    // Call the function to write the data to a TIFF file
-    writeTiffParallelHelper(fileName.c_str(), info.ptr, dtype, "w", dims[0], dims[1], dims[2], 0, transpose, compression, sampleFormat, tile);
+    // Call the function to write the data to a TIFF file. The library prints
+    // why a write failed; without this check Python never heard about it.
+    if(writeTiffParallelHelper(fileName.c_str(), info.ptr, dtype, "w", dims[0], dims[1], dims[2], 0, transpose, compression, sampleFormat, tile))
+        throw std::runtime_error("Failed to write \"" + fileName + "\"");
 }
 
 pybind11::tuple pybind11_get_image_shape(const std::string& fileName){
