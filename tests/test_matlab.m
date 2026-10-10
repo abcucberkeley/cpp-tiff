@@ -144,6 +144,31 @@ function test_matlab(mexDir)
         fprintf('PASS  imagej %s\n', name);
     end
 
+    % 6. Unreadable and damaged files raise MATLAB errors instead of crashing
+    %    MATLAB.
+    missing = fullfile(tmp, 'missing.tif');
+    assert(throws(@() parallelReadTiff(missing)), 'missing file: parallelReadTiff did not error');
+    assert(throws(@() getImageSizeMex(missing)), 'missing file: getImageSizeMex did not error');
+
+    % Damage one LZW strip of slice 3. Reading it must error, as a full read and
+    % as a single slice, while the undamaged slices still read correctly.
+    rng(97531);
+    vol = uint16(randi([0 65535], [48 64 4]));
+    f = fullfile(tmp, 'corrupt.tif');
+    parallelWriteTiff(f, vol, 'w', 'lzw');
+    info = imfinfo(f);
+    off = double(info(3).StripOffsets(1));
+    cnt = double(info(3).StripByteCounts(1));
+    fid = fopen(f, 'r+');
+    fseek(fid, off + floor(cnt/4), 'bof');
+    fwrite(fid, repmat(uint8(255), 1, min(256, floor(cnt/2))), 'uint8');
+    fclose(fid);
+    assert(throws(@() parallelReadTiff(f)), 'corrupt strip: full read did not error');
+    assert(throws(@() parallelReadTiff(f, [3 3])), 'corrupt strip: damaged slice did not error');
+    assert(isequal(parallelReadTiff(f, [1 2]), vol(:,:,1:2)), 'corrupt strip: undamaged slices');
+    delete(f);
+    fprintf('PASS  damaged files\n');
+
     fprintf('MATLAB tests PASSED (%d round trips)\n', nchecked);
 end
 
@@ -213,6 +238,16 @@ function writeImageJTiff(f, arr, byteorder)
     fclose(fid);
 end
 
+
+function tf = throws(fn)
+%THROWS True if calling fn raises an error.
+    tf = false;
+    try
+        fn();
+    catch
+        tf = true;
+    end
+end
 
 function data = makeData(sz, t)
 %MAKEDATA Deterministic test data for class t, using the type's extremes.

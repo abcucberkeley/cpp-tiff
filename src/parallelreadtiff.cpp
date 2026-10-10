@@ -218,79 +218,97 @@ static TIFF* openReaderTiff(const char* fileName){
 #endif
 }
 
-// Backup method in case there are errors reading strips
+// Place one decoded scanline (row `row` of output slice `slice`) in the output.
+// No-flip keeps the chunky row-major (z, y, x, c) layout the strip path writes;
+// flip writes the column-major MATLAB (y, x, c, z) layout, matching
+// flipTransposeStrip and flipTransposeStripRGB. Bit-exact copies, so the
+// sample format does not matter.
+template <typename T>
+static void placeScanlineFlipped(T* out, const T* line, uint64_t x, uint64_t y,
+                                 uint64_t samples, uint64_t row, uint64_t slice){
+    T* base = out + slice*x*y*samples + row;
+    for(uint64_t j = 0; j < x; j++)
+        for(uint64_t c = 0; c < samples; c++)
+            base[j*y + c*x*y] = line[j*samples + c];
+}
+
+static void placeScanline(void* out, const void* line, uint64_t x, uint64_t y, uint64_t samples,
+                          uint64_t bits, uint64_t row, uint64_t slice, uint8_t flipXY){
+    const uint64_t rowBytes = x*samples*(bits/8);
+    if(!flipXY){
+        memcpy(static_cast<uint8_t*>(out) + (slice*y + row)*rowBytes, line, rowBytes);
+        return;
+    }
+    switch(bits){
+        case 8:  placeScanlineFlipped(static_cast<uint8_t*>(out),  static_cast<const uint8_t*>(line),  x, y, samples, row, slice); break;
+        case 16: placeScanlineFlipped(static_cast<uint16_t*>(out), static_cast<const uint16_t*>(line), x, y, samples, row, slice); break;
+        case 32: placeScanlineFlipped(static_cast<uint32_t*>(out), static_cast<const uint32_t*>(line), x, y, samples, row, slice); break;
+        case 64: placeScanlineFlipped(static_cast<uint64_t*>(out), static_cast<const uint64_t*>(line), x, y, samples, row, slice); break;
+    }
+}
+
+static bool setDirectoryWithRetry(TIFF* tif, uint64_t dir){
+    for(int attempt = 0; attempt < 3; attempt++)
+        if(TIFFSetDirectory(tif, (tdir_t)dir)) return true;
+    return false;
+}
+
+// Backup method in case there are errors reading strips: re-read every slice a
+// scanline at a time, each worker taking a block of whole slices. Reports an
+// error if a row still cannot be read rather than leaving it unwritten.
 uint8_t readTiffParallelBak(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint8_t flipXY){
     int32_t numWorkers = omp_get_max_threads();
     int32_t batchSize = (z-1)/numWorkers+1;
     uint64_t bytes = bits/8;
 
     int32_t w;
-	std::atomic<uint8_t> err{0};
-	char errString[10000];
+    std::atomic<uint8_t> err{0};
+    char errString[10000];
     #pragma omp parallel for
     for(w = 0; w < numWorkers; w++){
-		if(err) continue;
-        TIFF* tif = TIFFOpen(fileName, "r");
+        if(err) continue;
+        const int64_t first = (int64_t)startSlice + (int64_t)w*batchSize;
+        const int64_t last = std::min<int64_t>(first + batchSize, (int64_t)(startSlice + z));
+        if(first >= last) continue;
+
+        TiffPtr tif(openReaderTiff(fileName));
         if(!tif){
-			sprintf(errString,"Thread %d: File \"%s\" cannot be opened\n",w,fileName);
-			err = 1;
-		}
-        uint16_t spp = 1;
-        if(tif) TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
-        void* buffer = malloc(x*spp*bytes);   // *spp so an RGB scanline can't overflow
-        for(int64_t dir = startSlice+(w*batchSize); dir < startSlice+((w+1)*batchSize); dir++){
-            if(dir>=z+startSlice || err) break;
-
-            int counter = 0;
-            while(!TIFFSetDirectory(tif, (uint64_t)dir) && counter<3){
-                printf("Thread %d: File \"%s\" Directory \"%d\" failed to open. Try %d\n",w,fileName,dir,counter+1);
-                counter++;
-            }
-
-            for (int64_t i = 0; i < y; i++)
+            #pragma omp critical
             {
-                TIFFReadScanline(tif, buffer, i, 0);
-                if(!flipXY){
-                    // Probably need to fix this
-                    memcpy(tiff+(((i*y)+((dir-startSlice)*(x*y)))*bytes),buffer,x*bytes);
-                    continue;
+                err = 1;
+                sprintf(errString,"Thread %d: File \"%s\" cannot be opened\n",w,fileName);
+            }
+            continue;
+        }
+        uint16_t spp = 1;
+        TIFFGetFieldDefaulted(tif.get(), TIFFTAG_SAMPLESPERPIXEL, &spp);
+        std::unique_ptr<uint8_t[]> line(new uint8_t[x*spp*bytes]);
+        for(int64_t dir = first; dir < last && !err; dir++){
+            if(!setDirectoryWithRetry(tif.get(), (uint64_t)dir)){
+                #pragma omp critical
+                {
+                    err = 1;
+                    sprintf(errString,"Thread %d: TIFFSetDirectory(%ld) failed\n",w,(long)dir);
                 }
-                //loading the data into a buffer
-                switch(bits){
-                    case 8:
-                        // Map Values to flip x and y for MATLAB
-                        for(int64_t j = 0; j < x; j++){
-                            ((uint8_t*)tiff)[((j*y)+i)+((dir-startSlice)*(x*y))] = ((uint8_t*)buffer)[j];
-                        }
-                            break;
-                    case 16:
-                        // Map Values to flip x and y for MATLAB
-                        for(int64_t j = 0; j < x; j++){
-                            ((uint16_t*)tiff)[((j*y)+i)+((dir-startSlice)*(x*y))] = ((uint16_t*)buffer)[j];
-                        }
-                            break;
-                    case 32:
-                        // Map Values to flip x and y for MATLAB
-                        for(int64_t j = 0; j < x; j++){
-                            ((float*)tiff)[((j*y)+i)+((dir-startSlice)*(x*y))] = ((float*)buffer)[j];
-                        }
-                            break;
-                    case 64:
-                        // Map Values to flip x and y for MATLAB
-                        for(int64_t j = 0; j < x; j++){
-                            ((double*)tiff)[((j*y)+i)+((dir-startSlice)*(x*y))] = ((double*)buffer)[j];
-                        }
-                            break;
+                break;
+            }
+            for(uint64_t i = 0; i < y; i++){
+                if(TIFFReadScanline(tif.get(), line.get(), (uint32_t)i, 0) < 0){
+                    #pragma omp critical
+                    {
+                        err = 1;
+                        sprintf(errString,"Thread %d: Row %lu of directory %ld cannot be read\n",w,(unsigned long)i,(long)dir);
+                    }
+                    break;
                 }
+                placeScanline(tiff, line.get(), x, y, spp, bits, i, (uint64_t)(dir - (int64_t)startSlice), flipXY);
             }
         }
-        free(buffer);
-        TIFFClose(tif);
     }
-	if(err){
-		printf("%s", errString);
-	}
-	return err;
+    if(err){
+        printf("%s", errString);
+    }
+    return err;
 }
 
 uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint8_t flipXY){
@@ -406,7 +424,7 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
                     {
                         errBak = 1;
                         err = 1;
-                        sprintf(errString,"Thread %d: Strip %ld cannot be read\n",w,i);
+                        sprintf(errString,"Thread %d: Strip %ld cannot be read\n",w,(long)i);
                     }
                     return;
                 }
@@ -486,79 +504,71 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
 	return err;
 }
 
-// Backup method in case there are errors reading strips
+// Backup method in case there are errors reading strips of a single image:
+// re-read it a scanline at a time. Compressed strips can only be decoded from
+// their first row, so workers split the image by whole strips and read each
+// one in row order. Reports an error if a row still cannot be read rather than
+// leaving it unwritten.
 uint8_t readTiffParallel2DBak(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint8_t flipXY){
-    int32_t numWorkers = omp_get_max_threads();
-    int32_t batchSize = (y-1)/numWorkers+1;
+    (void)z;   // a single image
     uint64_t bytes = bits/8;
+    uint32_t rowsPerStrip = 0;
+    {
+        TiffPtr probe(openReaderTiff(fileName));
+        if(probe && setDirectoryWithRetry(probe.get(), startSlice))
+            TIFFGetFieldDefaulted(probe.get(), TIFFTAG_ROWSPERSTRIP, &rowsPerStrip);
+    }
+    if(!rowsPerStrip || rowsPerStrip > y) rowsPerStrip = (uint32_t)y;
+    const uint64_t numStrips = (y + rowsPerStrip - 1) / rowsPerStrip;
+    const int32_t numWorkers = (int32_t)std::max<uint64_t>(1, std::min<uint64_t>((uint64_t)omp_get_max_threads(), numStrips));
+    const uint64_t stripsPerWorker = (numStrips + numWorkers - 1) / numWorkers;
 
     int32_t w;
-	std::atomic<uint8_t> err{0};
-	char errString[10000];
-    #pragma omp parallel for
+    std::atomic<uint8_t> err{0};
+    char errString[10000];
+    #pragma omp parallel for num_threads(numWorkers)
     for(w = 0; w < numWorkers; w++){
-		if(err) continue;
-        TIFF* tif = TIFFOpen(fileName, "r");
-        if(!tif) {
-			sprintf(errString,"tiff:threadError","Thread %d: File \"%s\" cannot be opened\n",w,fileName);
-			err = 1;
-		}
-        uint16_t spp = 1;
-        if(tif) TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
-        void* buffer = malloc(x*spp*bytes);   // *spp so an RGB scanline can't overflow
-        for(int64_t dir = startSlice+(w*batchSize); dir < startSlice+((w+1)*batchSize); dir++){
-            if(dir>=z+startSlice || err) break;
+        if(err) continue;
+        const uint64_t rowBegin = std::min<uint64_t>((uint64_t)w*stripsPerWorker*rowsPerStrip, y);
+        const uint64_t rowEnd = std::min<uint64_t>(((uint64_t)w + 1)*stripsPerWorker*rowsPerStrip, y);
+        if(rowBegin >= rowEnd) continue;
 
-            int counter = 0;
-            while(!TIFFSetDirectory(tif, startSlice) && counter<3){
-                printf("Thread %d: File \"%s\" Directory \"%d\" failed to open. Try %d\n",w,fileName,dir,counter+1);
-                counter++;
-            }
-
-            for (int64_t i = (w*batchSize); i < ((w+1)*batchSize); i++)
+        TiffPtr tif(openReaderTiff(fileName));
+        if(!tif){
+            #pragma omp critical
             {
-                if(i >= y) break;
-                TIFFReadScanline(tif, buffer, i, 0);
-                if(!flipXY){
-                    memcpy(tiff+((i*x)*bytes),buffer,x*bytes);
-                    continue;
-                }
-                //loading the data into a buffer
-                switch(bits){
-                    case 8:
-                        // Map Values to flip x and y for MATLAB
-                        for(int64_t j = 0; j < x; j++){
-                            ((uint8_t*)tiff)[((j*y)+i)+((dir-startSlice)*(x*y))] = ((uint8_t*)buffer)[j];
-                        }
-                            break;
-                    case 16:
-                        // Map Values to flip x and y for MATLAB
-                        for(int64_t j = 0; j < x; j++){
-                            ((uint16_t*)tiff)[((j*y)+i)+((dir-startSlice)*(x*y))] = ((uint16_t*)buffer)[j];
-                        }
-                            break;
-                    case 32:
-                        // Map Values to flip x and y for MATLAB
-                        for(int64_t j = 0; j < x; j++){
-                            ((float*)tiff)[((j*y)+i)+((dir-startSlice)*(x*y))] = ((float*)buffer)[j];
-                        }
-                            break;
-                    case 64:
-                        // Map Values to flip x and y for MATLAB
-                        for(int64_t j = 0; j < x; j++){
-                            ((double*)tiff)[((j*y)+i)+((dir-startSlice)*(x*y))] = ((double*)buffer)[j];
-                        }
-                            break;
-                }
+                err = 1;
+                sprintf(errString,"Thread %d: File \"%s\" cannot be opened\n",w,fileName);
             }
+            continue;
         }
-        free(buffer);
-        TIFFClose(tif);
+        if(!setDirectoryWithRetry(tif.get(), startSlice)){
+            #pragma omp critical
+            {
+                err = 1;
+                sprintf(errString,"Thread %d: TIFFSetDirectory(%lu) failed\n",w,(unsigned long)startSlice);
+            }
+            continue;
+        }
+        uint16_t spp = 1;
+        TIFFGetFieldDefaulted(tif.get(), TIFFTAG_SAMPLESPERPIXEL, &spp);
+        std::unique_ptr<uint8_t[]> line(new uint8_t[x*spp*bytes]);
+        for(uint64_t i = rowBegin; i < rowEnd; i++){
+            if(TIFFReadScanline(tif.get(), line.get(), (uint32_t)i, 0) < 0){
+                #pragma omp critical
+                {
+                    err = 1;
+                    sprintf(errString,"Thread %d: Row %lu cannot be read\n",w,(unsigned long)i);
+                }
+                break;
+            }
+            placeScanline(tiff, line.get(), x, y, spp, bits, i, 0, flipXY);
+        }
     }
-	if(err){
-		printf("%s", errString);
-	}
-	return err;
+    if(err){
+        printf("%s", errString);
+    }
+    return err;
 }
 
 
@@ -572,9 +582,11 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
     std::atomic<uint8_t> err{0};
     uint8_t errBak = 0;
     char errString[10000];
-    uint16_t compressed = 1;
     TIFF* tif = TIFFOpen(fileName, "r");
-    TIFFGetField(tif, TIFFTAG_COMPRESSION, &compressed);
+    if(!tif){
+        printf("File \"%s\" cannot be opened\n",fileName);
+        return 1;
+    }
     uint16_t spp = 1;
     TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
     const uint64_t samples = spp;          // 1=grayscale, 3=RGB, 4=RGBA
@@ -602,191 +614,127 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
     }
     const int32_t tileBatch = tiled ? (int32_t)((numTiles-1)/numWorkers+1) : 0;
 
-    // The other method won't work on specific slices of 3D images for now
-    // so start slice must also be 0. It also reads the strips as one contiguous
-    // block straight off disk, which is not how tiled data is laid out.
-    if(numWorkers > 1 || compressed > 1 || tiled){
-        // Only start as many workers as there are strips or tiles to read. A
-        // small image has just a few, and every extra worker opened the file
-        // and selected its directory for nothing.
-        const uint64_t workItems = tiled ? numTiles : stripsPerDir;
-        const uint64_t perWorker = tiled ? (uint64_t)tileBatch : (uint64_t)batchSize;
-        const int32_t activeWorkers = (int32_t)std::max<uint64_t>(1, std::min<uint64_t>((uint64_t)numWorkers, (workItems + perWorker - 1) / perWorker));
-        #pragma omp parallel for num_threads(activeWorkers)
-        for(w = 0; w < activeWorkers; w++){
-    
-            uint8_t outCounter = 0;
-            TIFF* tif = openReaderTiff(fileName);
-            while(!tif){
-                tif = openReaderTiff(fileName);
-                if(outCounter == 3){
-                    #pragma omp critical
-                    {
-                        err = 1;
-                        sprintf(errString,"Thread %d: File \"%s\" cannot be opened\n",w,fileName);
-                    }
-                    break;
+    // Only start as many workers as there are strips or tiles to read. A
+    // small image has just a few, and every extra worker opened the file
+    // and selected its directory for nothing.
+    const uint64_t workItems = tiled ? numTiles : stripsPerDir;
+    const uint64_t perWorker = tiled ? (uint64_t)tileBatch : (uint64_t)batchSize;
+    const int32_t activeWorkers = (int32_t)std::max<uint64_t>(1, std::min<uint64_t>((uint64_t)numWorkers, (workItems + perWorker - 1) / perWorker));
+    #pragma omp parallel for num_threads(activeWorkers)
+    for(w = 0; w < activeWorkers; w++){
+
+        uint8_t outCounter = 0;
+        TIFF* tif = openReaderTiff(fileName);
+        while(!tif){
+            tif = openReaderTiff(fileName);
+            if(outCounter == 3){
+                #pragma omp critical
+                {
+                    err = 1;
+                    sprintf(errString,"Thread %d: File \"%s\" cannot be opened\n",w,fileName);
                 }
-                outCounter++;
+                break;
             }
-    
-            if(!tif) continue;   // err is already set; never hand libtiff a null handle
-            void* buffer = malloc(tiled ? tileBufBytes : xs*stripSize*bytes);
-            uint8_t counter = 0;
-            while(!TIFFSetDirectory(tif, startSlice) && counter<3){
-                printf("Thread %d: File \"%s\" Directory \"%d\" failed to open. Try %d\n",w,fileName,0,counter+1);
-                counter++;
-                if(counter == 3){
-                    #pragma omp critical
-                    {
-                        err = 1;
-                        sprintf(errString,"Thread %d: File \"%s\" cannot be opened\n",w,fileName);
-                    }
-                }
-            }
-            if(tiled){
-                int64_t tStart = (int64_t)w*tileBatch;
-                int64_t tEnd = tStart + tileBatch;
-                if(tEnd > (int64_t)numTiles) tEnd = (int64_t)numTiles;
-                int64_t failedTile = -1;
-                if(!err && tStart < tEnd &&
-                   readTilesInto(tif, (uint8_t*)buffer, (int64_t)tileBufBytes, tiff,
-                                 (int64_t)x, (int64_t)y, (int64_t)bits, (int64_t)samples,
-                                 (int64_t)tw, (int64_t)tl, (int64_t)tilesAcross,
-                                 tStart, tEnd, 0, flipXY, &failedTile)){
-                    #pragma omp critical
-                    {
-                        // No errBak: the scanline fallback cannot read tiled images.
-                        err = 1;
-                        sprintf(errString,"Thread %d: Tile %ld cannot be read\n",w,(long)failedTile);
-                    }
-                }
-            }
-            else for (int64_t i = (w*batchSize); i < (w+1)*batchSize; i++)
-            {
-                if(i*stripSize >= y || err) break;
-                //loading the data into a buffer
-                int64_t cBytes = TIFFReadEncodedStrip(tif, i, buffer, stripSize*xs*bytes);
-                if(cBytes < 0){
-                    #pragma omp critical
-                    {
-                        errBak = 1;
-                        err = 1;
-                        sprintf(errString,"Thread %d: Strip %ld cannot be read\n",w,i);
-                    }
-                    break;
-                }
-                if(!flipXY){
-                    memcpy((uint8_t*)tiff+((i*stripSize*xs)*bytes),buffer,cBytes);
-                    continue;
-                }
-                // Same cache-blocked transpose as the 3D path, single image so
-                // the slice offset is 0. samples==1 keeps the grayscale path.
-                int64_t stripRows = y - (i*stripSize);
-                if(stripRows > (int64_t)stripSize) stripRows = (int64_t)stripSize;
-                int64_t rowOff = i*stripSize;
-                if(samples == 1){
-                    switch(bits){
-                        case 8:
-                            flipTransposeStrip<uint8_t>((uint8_t*)tiff,(uint8_t*)buffer,x,y,stripRows,rowOff,0);
-                            break;
-                        case 16:
-                            flipTransposeStrip<uint16_t>((uint16_t*)tiff,(uint16_t*)buffer,x,y,stripRows,rowOff,0);
-                            break;
-                        case 32:
-                            flipTransposeStrip<float>((float*)tiff,(float*)buffer,x,y,stripRows,rowOff,0);
-                            break;
-                        case 64:
-                            flipTransposeStrip<double>((double*)tiff,(double*)buffer,x,y,stripRows,rowOff,0);
-                            break;
-                    }
-                } else {
-                    switch(bits){
-                        case 8:
-                            flipTransposeStripRGB<uint8_t>((uint8_t*)tiff,(uint8_t*)buffer,x,y,stripRows,rowOff,0,samples);
-                            break;
-                        case 16:
-                            flipTransposeStripRGB<uint16_t>((uint16_t*)tiff,(uint16_t*)buffer,x,y,stripRows,rowOff,0,samples);
-                            break;
-                        case 32:
-                            flipTransposeStripRGB<float>((float*)tiff,(float*)buffer,x,y,stripRows,rowOff,0,samples);
-                            break;
-                        case 64:
-                            flipTransposeStripRGB<double>((double*)tiff,(double*)buffer,x,y,stripRows,rowOff,0,samples);
-                            break;
-                    }
-                }
-            }
-            free(buffer);
-            TIFFClose(tif);
+            outCounter++;
         }
-        // Close the outer handle as well. It was only needed for the tag reads
-        // above (each worker opens its own), and leaving it open leaked a handle
-        // per 2D read -- harmless on Linux but it keeps the file locked on Windows.
+
+        if(!tif) continue;   // err is already set; never hand libtiff a null handle
+        // Tiles always decode into the buffer; strips only on the flip path,
+        // since the no-flip path decodes each strip straight into the output.
+        void* buffer = (tiled || flipXY) ? malloc(tiled ? tileBufBytes : xs*stripSize*bytes) : NULL;
+        uint8_t counter = 0;
+        while(!TIFFSetDirectory(tif, startSlice) && counter<3){
+            printf("Thread %d: File \"%s\" Directory \"%d\" failed to open. Try %d\n",w,fileName,0,counter+1);
+            counter++;
+            if(counter == 3){
+                #pragma omp critical
+                {
+                    err = 1;
+                    sprintf(errString,"Thread %d: File \"%s\" cannot be opened\n",w,fileName);
+                }
+            }
+        }
+        if(tiled){
+            int64_t tStart = (int64_t)w*tileBatch;
+            int64_t tEnd = tStart + tileBatch;
+            if(tEnd > (int64_t)numTiles) tEnd = (int64_t)numTiles;
+            int64_t failedTile = -1;
+            if(!err && tStart < tEnd &&
+               readTilesInto(tif, (uint8_t*)buffer, (int64_t)tileBufBytes, tiff,
+                             (int64_t)x, (int64_t)y, (int64_t)bits, (int64_t)samples,
+                             (int64_t)tw, (int64_t)tl, (int64_t)tilesAcross,
+                             tStart, tEnd, 0, flipXY, &failedTile)){
+                #pragma omp critical
+                {
+                    // No errBak: the scanline fallback cannot read tiled images.
+                    err = 1;
+                    sprintf(errString,"Thread %d: Tile %ld cannot be read\n",w,(long)failedTile);
+                }
+            }
+        }
+        else for (int64_t i = (w*batchSize); i < (w+1)*batchSize; i++)
+        {
+            if(i*stripSize >= y || err) break;
+            // No-flip: decode the strip straight into the output, as the 3D
+            // path does. Flip: decode into the buffer and transpose below.
+            void* stripDst = flipXY ? buffer : static_cast<void*>(static_cast<uint8_t*>(tiff) + i*stripSize*xs*bytes);
+            int64_t cBytes = TIFFReadEncodedStrip(tif, i, stripDst, stripSize*xs*bytes);
+            if(cBytes < 0){
+                #pragma omp critical
+                {
+                    errBak = 1;
+                    err = 1;
+                    sprintf(errString,"Thread %d: Strip %ld cannot be read\n",w,(long)i);
+                }
+                break;
+            }
+            if(!flipXY){
+                continue;
+            }
+            // Same cache-blocked transpose as the 3D path, single image so
+            // the slice offset is 0. samples==1 keeps the grayscale path.
+            int64_t stripRows = y - (i*stripSize);
+            if(stripRows > (int64_t)stripSize) stripRows = (int64_t)stripSize;
+            int64_t rowOff = i*stripSize;
+            if(samples == 1){
+                switch(bits){
+                    case 8:
+                        flipTransposeStrip<uint8_t>((uint8_t*)tiff,(uint8_t*)buffer,x,y,stripRows,rowOff,0);
+                        break;
+                    case 16:
+                        flipTransposeStrip<uint16_t>((uint16_t*)tiff,(uint16_t*)buffer,x,y,stripRows,rowOff,0);
+                        break;
+                    case 32:
+                        flipTransposeStrip<float>((float*)tiff,(float*)buffer,x,y,stripRows,rowOff,0);
+                        break;
+                    case 64:
+                        flipTransposeStrip<double>((double*)tiff,(double*)buffer,x,y,stripRows,rowOff,0);
+                        break;
+                }
+            } else {
+                switch(bits){
+                    case 8:
+                        flipTransposeStripRGB<uint8_t>((uint8_t*)tiff,(uint8_t*)buffer,x,y,stripRows,rowOff,0,samples);
+                        break;
+                    case 16:
+                        flipTransposeStripRGB<uint16_t>((uint16_t*)tiff,(uint16_t*)buffer,x,y,stripRows,rowOff,0,samples);
+                        break;
+                    case 32:
+                        flipTransposeStripRGB<float>((float*)tiff,(float*)buffer,x,y,stripRows,rowOff,0,samples);
+                        break;
+                    case 64:
+                        flipTransposeStripRGB<double>((double*)tiff,(double*)buffer,x,y,stripRows,rowOff,0,samples);
+                        break;
+                }
+            }
+        }
+        free(buffer);
         TIFFClose(tif);
     }
-    else{
-        void* tiffC = NULL;
-        FILE *fp = fopen(fileName, "rb");
-        if(!fp){ 
-			printf("File \"%s\" cannot be opened from Disk\n",fileName);
-			err = 1;
-			return err;
-		}
-
-        if(!tif){ 
-			printf("File \"%s\" cannot be opened\n",fileName);
-			err = 1;
-			return err;
-		}
-        
-		uint64_t offset = 0;
-        uint64_t* offsets = NULL;
-        TIFFGetField(tif, TIFFTAG_STRIPOFFSETS, &offsets);
-        if(!offsets){ 
-			printf("Could not get offsets from the tiff file\n");
-       		err = 1;
-			return err;
-		}
-		offset = offsets[0];
-        uint64_t zSize = x*y*samples*bytes;
-    
-        fseek(fp, offset, SEEK_SET);
-
-
-        TIFFClose(tif);
-        
-        if(!flipXY){
-            fread(tiff, 1, zSize, fp);
-        }
-        else{
-            uint64_t size = x*y*z*samples*(bits/8);
-            tiffC = malloc(size);
-            fread(tiffC, 1, zSize, fp);
-        }
-        fclose(fp);
-        if(flipXY){
-            // De-interleave + transpose to column-major (y,x,c,z). samples==1
-            // (one channel pass, c=0) reduces to the original grayscale mapping.
-            for(uint64_t k = 0; k < z; k++){
-                for(uint64_t c = 0; c < samples; c++){
-                    for(uint64_t j = 0; j < x; j++){
-                        for(uint64_t i = 0; i < y; i++){
-                            uint64_t o  = i + (j*y) + (c*x*y) + (k*x*y*samples);
-                            uint64_t in = ((j+(i*x))*samples) + c + (k*x*y*samples);
-                            switch(bits){
-                                case 8:  ((uint8_t*)tiff)[o]  = ((uint8_t*)tiffC)[in];  break;
-                                case 16: ((uint16_t*)tiff)[o] = ((uint16_t*)tiffC)[in]; break;
-                                case 32: ((float*)tiff)[o]    = ((float*)tiffC)[in];    break;
-                                case 64: ((double*)tiff)[o]   = ((double*)tiffC)[in];   break;
-                            }
-                        }
-                    }
-                }
-            }
-            free(tiffC);
-        }
-    }
+    // Close the outer handle as well. It was only needed for the tag reads
+    // above (each worker opens its own), and leaving it open leaked a handle
+    // per 2D read -- harmless on Linux but it keeps the file locked on Windows.
+    TIFFClose(tif);
 
     if(err) {
         if(errBak) return readTiffParallel2DBak(x, y, z, fileName, tiff, bits, startSlice, flipXY);
@@ -795,6 +743,16 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
 	return err;
 }
 
+
+// Seek to an absolute byte offset; 0 on success. fseek takes a long, which is
+// 32 bits on Windows, so offsets past 2 GB need the 64-bit variants.
+static int seekFile(FILE* fp, uint64_t offset){
+#ifdef _WIN32
+    return _fseeki64(fp, (long long)offset, SEEK_SET);
+#else
+    return fseeko(fp, (off_t)offset, SEEK_SET);
+#endif
+}
 
 // Reading images saved by ImageJ
 uint8_t readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint8_t flipXY){
@@ -806,15 +764,22 @@ uint8_t readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* f
 		return err;
 	}
     TIFF* tif = TIFFOpen(fileName, "r");
-    if(!tif){ 
+    if(!tif){
 		printf("File \"%s\" cannot be opened\n",fileName);
+		fclose(fp);
 		err = 1;
 		return err;
 	}
-    uint64_t offset = 0;
     uint64_t* offsets = NULL;
     TIFFGetField(tif, TIFFTAG_STRIPOFFSETS, &offsets);
-    if(offsets) offset = offsets[0];
+    if(!offsets){
+        printf("Could not get offsets from the tiff file\n");
+        TIFFClose(tif);
+        fclose(fp);
+        err = 1;
+        return err;
+    }
+    const uint64_t offset = offsets[0];
 
     // ImageJ RGB stacks are chunky interleaved (spp=3), so every size below
     // scales by samples. Grayscale (samples==1) is unchanged.
@@ -831,7 +796,12 @@ uint8_t readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* f
 
     uint64_t bytes = bits/8;
     // The data is one contiguous block, so a z-range is just an offset into it.
-    fseek(fp, offset + startSlice*x*y*samples*bytes, SEEK_SET);
+    if(seekFile(fp, offset + startSlice*x*y*samples*bytes)){
+        printf("File \"%s\": cannot seek to the image data\n",fileName);
+        fclose(fp);
+        err = 1;
+        return err;
+    }
     //#pragma omp parallel for
     /*
     for(uint64_t i = 0; i < z; i++){
@@ -839,22 +809,23 @@ uint8_t readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* f
     //pread(fd,tiff+cOffset,x*y*bytes,offset+cOffset);
     read(fd,tiff+cOffset,x*y*bytes);
     }*/
+    // fread at most INT_MAX bytes at a time. A short read means the file ends
+    // before its image data does (e.g. an interrupted copy), so report that
+    // instead of retrying forever or returning the unread part of the buffer.
+    const uint64_t tBytes = x*y*z*samples*bytes;
     uint64_t chunk = 0;
-    uint64_t tBytes = x*y*z*samples*bytes;
-    uint64_t bytesRead;
-    uint64_t rBytes = tBytes;
-
-    // Can probably read more than INT_MAX now that we use fread
-    if(tBytes < INT_MAX) bytesRead = fread(tiff,1,tBytes,fp);
-    else{
-        while(chunk < tBytes){
-            rBytes = tBytes-chunk;
-            if(rBytes > INT_MAX) bytesRead = fread(static_cast<uint8_t*>(tiff)+chunk,1,INT_MAX,fp);
-            else bytesRead = fread(static_cast<uint8_t*>(tiff)+chunk,1,rBytes,fp);
-            chunk += bytesRead;
-        }
+    while(chunk < tBytes){
+        const uint64_t want = std::min<uint64_t>(tBytes - chunk, INT_MAX);
+        const uint64_t got = fread(static_cast<uint8_t*>(tiff)+chunk,1,want,fp);
+        chunk += got;
+        if(got < want) break;
     }
     fclose(fp);
+    if(chunk < tBytes){
+        printf("File \"%s\" ends before its image data does\n",fileName);
+        err = 1;
+        return err;
+    }
     // Swap endianess for types greater than 8 bits when the file's byte order
     // differs from the host's.
     if(bits > 8 && needSwap){
@@ -996,84 +967,25 @@ void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t fl
     }
 
 
-	if(imageJIm){
-		if(bits == 8){
-			if(!tiff) tiff = (uint8_t*)malloc(x*y*z*samples*sizeof(uint8_t));
-			readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize,flipXY);
-			return (void*)tiff;
-		}
-		else if(bits == 16){
-			if(!tiff) tiff = (uint16_t*)malloc(x*y*z*samples*sizeof(uint16_t));
-			readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-			return (void*)tiff;
-		}
-		else if(bits == 32){
-			if(!tiff) tiff = (float*)malloc(x*y*z*samples*sizeof(float));
-			readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-			return (void*)tiff;
-		}
-		else if(bits == 64){
-			if(!tiff) tiff = (double*)malloc(x*y*z*samples*sizeof(double));
-			readTiffParallelImageJ(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-			return (void*)tiff;
-		}
-		else{
-			return NULL;
-		}
+	// Bytes are moved purely by bit width, so one allocation covers every
+	// sample format.
+	if(bits != 8 && bits != 16 && bits != 32 && bits != 64) return NULL;
+	const bool allocated = !tiff;
+	if(allocated){
+		tiff = malloc(x*y*z*samples*(bits/8));
+		if(!tiff) return NULL;
 	}
-	else if(z <= 1){
-		if(bits == 8){
-			if(!tiff) tiff = (uint8_t*)malloc(x*y*z*samples*sizeof(uint8_t));
-			readTiffParallel2D(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize,flipXY);
-			return (void*)tiff;
-		}
-		else if(bits == 16){
-			if(!tiff) tiff = (uint16_t*)malloc(x*y*z*samples*sizeof(uint16_t));
-			readTiffParallel2D(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-			return (void*)tiff;
-		}
-		else if(bits == 32){
-			if(!tiff) tiff = (float*)malloc(x*y*z*samples*sizeof(float));
-			readTiffParallel2D(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-			return (void*)tiff;
-		}
-		else if(bits == 64){
-			if(!tiff) tiff = (double*)malloc(x*y*z*samples*sizeof(double));
-			readTiffParallel2D(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-			return (void*)tiff;
-		}
-		else{
-			return NULL;
-		}
+	uint8_t err;
+	if(imageJIm)    err = readTiffParallelImageJ(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY);
+	else if(z <= 1) err = readTiffParallel2D(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY);
+	else            err = readTiffParallel(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY);
+	// A failed read leaves part of the buffer unwritten, so report it instead of
+	// returning partial data. The reader has already printed why.
+	if(err){
+		if(allocated) free(tiff);
+		return NULL;
 	}
-	else{
-		if(bits == 8){
-			if(!tiff) tiff = (uint8_t*)malloc(x*y*z*samples*sizeof(uint8_t));
-			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-			return (void*)tiff;
-		}
-		else if(bits == 16){
-			if(!tiff) tiff = (uint16_t*)malloc(x*y*z*samples*sizeof(uint16_t));
-			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-			return (void*)tiff;
-		}
-		else if(bits == 32){
-			if(!tiff) tiff = (float*)malloc(x*y*z*samples*sizeof(float));
-			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-			return (void*)tiff;
-		}
-		else if(bits == 64){
-			if(!tiff) tiff = (double*)malloc(x*y*z*samples*sizeof(double));
-			readTiffParallel(x,y,z,fileName, (void*)tiff, bits, startSlice, stripSize, flipXY);
-			return (void*)tiff;
-		}
-		else{
-			return NULL;
-		}
-	}
-
-	// Should never get here but return NULL if we do
-	return NULL;
+	return tiff;
 }
 
 void* readTiffParallelWrapper(const char* fileName, const std::vector<uint64_t> &zRange)

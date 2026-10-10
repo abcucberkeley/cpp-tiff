@@ -7,6 +7,7 @@
 //
 // Progress is written (flushed) to stderr before each operation so that if a
 // build segfaults, the CTest log shows exactly which step/dtype/compression died.
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +15,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <omp.h>
 
 #include "parallelreadtiff.h"
 #include "parallelwritetiff.h"
@@ -95,6 +97,135 @@ static bool writeImageJTiff(const std::string& path, const uint8_t* data,
     const size_t w = std::fwrite(v.data(), 1, v.size(), f);
     std::fclose(f);
     return w == v.size();
+}
+
+// ---- Plain multi-page fixture writer -----------------------------------------
+// Little-endian classic TIFF, uncompressed, one strip per page, chunky samples.
+// The library's writer only writes grayscale, so RGB fixtures are written here.
+static bool writePlainTiff(const std::string& path, const uint8_t* data,
+                           uint64_t x, uint64_t y, uint64_t z, uint64_t spp, uint64_t bits){
+    const uint64_t pageBytes = x*y*spp*(bits/8);
+    const uint32_t nEntries = 10;
+    const uint32_t ifdSize = 2 + nEntries*12 + 4;
+    const uint32_t bpsLen = (spp > 1) ? (uint32_t)(spp*2) : 0;
+    std::vector<uint8_t> v;
+    v.push_back('I'); v.push_back('I'); ijPut16(v, 42, false); ijPut32(v, 8, false);
+    for(uint64_t k = 0; k < z; k++){
+        const uint32_t ifdOff = (uint32_t)v.size();
+        const uint32_t bpsOff = ifdOff + ifdSize;
+        const uint32_t pixOff = bpsOff + bpsLen;
+        const uint32_t next = (k + 1 < z) ? (uint32_t)(pixOff + pageBytes) : 0;
+        auto shortVal = [&](uint16_t sv){ ijPut16(v, sv, false); v.push_back(0); v.push_back(0); };
+        auto longVal  = [&](uint32_t lv){ ijPut32(v, lv, false); };
+        ijPut16(v, nEntries, false);
+        ijEntry(v,256,3,1,false); shortVal((uint16_t)x);                  // ImageWidth
+        ijEntry(v,257,3,1,false); shortVal((uint16_t)y);                  // ImageLength
+        ijEntry(v,258,3,(uint32_t)spp,false);                             // BitsPerSample
+        if(spp == 1) shortVal((uint16_t)bits); else longVal(bpsOff);
+        ijEntry(v,259,3,1,false); shortVal(1);                            // Compression: none
+        ijEntry(v,262,3,1,false); shortVal(spp == 3 ? 2 : 1);             // Photometric
+        ijEntry(v,273,4,1,false); longVal(pixOff);                        // StripOffsets
+        ijEntry(v,277,3,1,false); shortVal((uint16_t)spp);                // SamplesPerPixel
+        ijEntry(v,278,3,1,false); shortVal((uint16_t)y);                  // RowsPerStrip
+        ijEntry(v,279,4,1,false); longVal((uint32_t)pageBytes);           // StripByteCounts
+        ijEntry(v,284,3,1,false); shortVal(1);                            // PlanarConfig: chunky
+        ijPut32(v, next, false);                                          // next IFD
+        if(spp > 1) for(uint64_t i = 0; i < spp; i++) ijPut16(v, (uint16_t)bits, false);
+        v.insert(v.end(), data + k*pageBytes, data + (k + 1)*pageBytes);
+    }
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if(!f) return false;
+    const size_t w = std::fwrite(v.data(), 1, v.size(), f);
+    std::fclose(f);
+    return w == v.size();
+}
+
+// Offset and byte count of one strip, for damaging it on purpose. Handles the
+// little-endian classic and BigTIFF files this test writes.
+static bool stripLocation(const std::string& path, uint64_t page, uint64_t strip,
+                          uint64_t* off, uint64_t* cnt){
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if(!f) return false;
+    auto rd = [&](uint64_t pos, uint8_t* dst, size_t n){
+        return std::fseek(f, (long)pos, SEEK_SET) == 0 && std::fread(dst, 1, n, f) == n; };
+    auto le = [](const uint8_t* b, int n){ uint64_t val = 0; for(int i = n - 1; i >= 0; i--) val = (val << 8) | b[i]; return val; };
+    uint8_t h[16];
+    bool ok = rd(0, h, 16) && h[0] == 'I' && h[1] == 'I';
+    const bool big = ok && h[2] == 43;
+    const int cntSz = big ? 8 : 2, entSz = big ? 20 : 12, offSz = big ? 8 : 4;
+    uint64_t ifd = big ? le(h + 8, 8) : le(h + 4, 4);
+    uint8_t b[20];
+    for(uint64_t pg = 0; ok && pg < page; pg++){
+        ok = rd(ifd, b, cntSz) && rd(ifd + cntSz + le(b, cntSz)*entSz, b, offSz);
+        ifd = le(b, offSz);
+    }
+    const uint64_t n = (ok && rd(ifd, b, cntSz)) ? le(b, cntSz) : 0;
+    bool haveOff = false, haveCnt = false;
+    for(uint64_t e = 0; ok && e < n; e++){
+        ok = rd(ifd + cntSz + e*entSz, b, entSz);
+        const uint64_t tag = le(b, 2), typ = le(b + 2, 2), count = big ? le(b + 4, 8) : le(b + 4, 4);
+        if(!ok || (tag != 273 && tag != 279)) continue;
+        const int sz = typ == 16 ? 8 : typ == 4 ? 4 : typ == 3 ? 2 : 0;
+        if(!sz || strip >= count){ ok = false; break; }
+        const uint8_t* field = b + (big ? 12 : 8);
+        uint8_t val[8];
+        if(count*sz <= (uint64_t)offSz) std::memcpy(val, field + strip*sz, sz);
+        else ok = rd(le(field, offSz) + strip*sz, val, sz);
+        if(tag == 273){ *off = le(val, sz); haveOff = true; } else { *cnt = le(val, sz); haveCnt = true; }
+    }
+    std::fclose(f);
+    return ok && haveOff && haveCnt;
+}
+
+// Drop the last `cut` bytes of a file, as an interrupted copy would.
+static bool truncateFile(const std::string& path, uint64_t cut){
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if(!f) return false;
+    std::vector<uint8_t> v;
+    uint8_t buf[65536];
+    size_t n;
+    while((n = std::fread(buf, 1, sizeof buf, f)) > 0) v.insert(v.end(), buf, buf + n);
+    std::fclose(f);
+    if(cut >= v.size()) return false;
+    f = std::fopen(path.c_str(), "wb");
+    if(!f) return false;
+    const size_t keep = v.size() - cut;
+    const size_t w = std::fwrite(v.data(), 1, keep, f);
+    std::fclose(f);
+    return w == keep;
+}
+
+// Column-major MATLAB layout (y, x[, c], z) of a chunky row-major source.
+static std::vector<uint8_t> flipped(const uint8_t* src, uint64_t x, uint64_t y, uint64_t z,
+                                    uint64_t spp, uint64_t es){
+    std::vector<uint8_t> out(x*y*z*spp*es);
+    for(uint64_t k = 0; k < z; k++)
+        for(uint64_t i = 0; i < y; i++)
+            for(uint64_t j = 0; j < x; j++)
+                for(uint64_t c = 0; c < spp; c++)
+                    std::memcpy(&out[(i + j*y + c*x*y + k*x*y*spp)*es],
+                                src + (((k*y + i)*x + j)*spp + c)*es, es);
+    return out;
+}
+
+// The scanline fallbacks are internal: the readers only use them when a strip
+// fails to decode, so valid files never reach them. Call them directly.
+uint8_t readTiffParallelBak(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint8_t flipXY);
+uint8_t readTiffParallel2DBak(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint8_t flipXY);
+
+// Run one fallback read into a poisoned, guarded buffer: unwritten bytes keep
+// the poison and any write past the end changes the guard.
+static bool fallbackMatches(bool twoD, const std::string& path, uint64_t x, uint64_t y, uint64_t z,
+                            uint64_t spp, uint64_t bits, uint64_t startSlice, bool flip,
+                            const std::vector<uint8_t>& expected){
+    const size_t guard = 4096;
+    std::vector<uint8_t> out(expected.size() + guard, 0xA5);
+    const uint8_t err = twoD ? readTiffParallel2DBak(x, y, z, path.c_str(), out.data(), bits, startSlice, flip)
+                             : readTiffParallelBak(x, y, z, path.c_str(), out.data(), bits, startSlice, flip);
+    bool guardOK = true;
+    for(size_t i = expected.size(); i < out.size(); i++) guardOK = guardOK && out[i] == 0xA5;
+    (void)spp;
+    return !err && guardOK && std::memcmp(out.data(), expected.data(), expected.size()) == 0;
 }
 
 int main(int argc, char** argv){
@@ -247,6 +378,205 @@ int main(int argc, char** argv){
                             c.name, (int)nfOK, (int)zrOK, (int)flOK);
                 failures++;
             }
+        }
+    }
+
+    // ---- Scanline fallbacks, called directly on valid files. Wide and tall
+    // images (the old row offset only ran past the buffer when x < y), 3D, 2D
+    // and an offset z-range, both layouts, grayscale from the library's writer
+    // and hand-written RGB.
+    {
+        struct FB { const char* name; uint64_t x, y, spp, bits; uint16_t fmt; const char* comp; };
+        const FB fbs[] = {
+            {"u16-lzw-wide",  40, 24, 1, 16, 1, "lzw"},
+            {"u16-lzw-tall",  24, 40, 1, 16, 1, "lzw"},
+            {"u8-none-tall",  24, 40, 1,  8, 1, "none"},
+            {"f32-zstd-wide", 40, 24, 1, 32, 3, "zstd"},
+            {"rgb8-wide",     40, 24, 3,  8, 1, nullptr},
+            {"rgb8-tall",     24, 40, 3,  8, 1, nullptr},
+        };
+        std::mt19937 frng(7654321u);
+        std::uniform_int_distribution<int> fbyte(0, 255);
+        for(const FB& c : fbs){
+            const uint64_t fz = 3, es = c.bits/8, slice = c.x*c.y*c.spp*es;
+            std::vector<uint8_t> src(slice*fz);
+            for(auto& v8 : src) v8 = (uint8_t)fbyte(frng);
+            if(c.bits == 32) for(uint64_t i = 0; i < src.size(); i += 4) src[i + 3] &= 0x3F;   // keep floats finite
+            const std::string p3 = dir + "/fb3_" + c.name + ".tif", p2 = dir + "/fb2_" + c.name + ".tif";
+            step(c.name, "fallback", "write fixtures");
+            bool wrote;
+            if(c.comp) wrote = !writeTiffParallelWrapper(c.x, c.y, fz, p3.c_str(), src.data(), c.bits, 0, 8, "w", false, std::string(c.comp), c.fmt, 0)
+                            && !writeTiffParallelWrapper(c.x, c.y, 1, p2.c_str(), src.data(), c.bits, 0, 8, "w", false, std::string(c.comp), c.fmt, 0);
+            else       wrote = writePlainTiff(p3, src.data(), c.x, c.y, fz, c.spp, c.bits)
+                            && writePlainTiff(p2, src.data(), c.x, c.y, 1, c.spp, c.bits);
+            total++;
+            if(!wrote){ std::printf("FAIL  %-14s fallback (fixture write)\n", c.name); failures++; continue; }
+
+            const std::vector<uint8_t> all(src.begin(), src.end());
+            const std::vector<uint8_t> tail(src.begin() + slice, src.end());          // slices 1..2
+            const std::vector<uint8_t> first(src.begin(), src.begin() + slice);       // slice 0
+            step(c.name, "fallback", "3D no-flip / flip / z-range");
+            const bool b3  = fallbackMatches(false, p3, c.x, c.y, fz, c.spp, c.bits, 0, false, all)
+                          && fallbackMatches(false, p3, c.x, c.y, fz, c.spp, c.bits, 0, true, flipped(src.data(), c.x, c.y, fz, c.spp, es))
+                          && fallbackMatches(false, p3, c.x, c.y, 2, c.spp, c.bits, 1, false, tail)
+                          && fallbackMatches(false, p3, c.x, c.y, 2, c.spp, c.bits, 1, true, flipped(src.data() + slice, c.x, c.y, 2, c.spp, es));
+            step(c.name, "fallback", "2D no-flip / flip");
+            const bool b2  = fallbackMatches(true, p2, c.x, c.y, 1, c.spp, c.bits, 0, false, first)
+                          && fallbackMatches(true, p2, c.x, c.y, 1, c.spp, c.bits, 0, true, flipped(src.data(), c.x, c.y, 1, c.spp, es));
+            // The normal readers must agree on the same files (RGB fixtures included).
+            step(c.name, "fallback", "normal readers");
+            void* nf = readTiffParallelWrapperNoXYFlip(p3.c_str(), {});
+            void* fl = readTiffParallelWrapper(p3.c_str());
+            const std::vector<uint8_t> f3 = flipped(src.data(), c.x, c.y, fz, c.spp, es);
+            const bool rd = nf && fl && std::memcmp(nf, all.data(), all.size()) == 0 && std::memcmp(fl, f3.data(), f3.size()) == 0;
+            free(nf); free(fl);
+            std::remove(p3.c_str()); std::remove(p2.c_str());
+            if(b3 && b2 && rd) std::printf("PASS  %-14s fallback\n", c.name);
+            else { std::printf("FAIL  %-14s fallback  (3D=%d 2D=%d readers=%d)\n", c.name, (int)b3, (int)b2, (int)rd); failures++; }
+        }
+    }
+
+    // ---- One OpenMP thread. Single-image reads used to take a separate raw-read
+    // path there, which always returned slice 0 of an uncompressed stack.
+    {
+        total++;
+        const uint64_t sx = 40, sy = 24, sz = 4, slice = sx*sy;
+        std::vector<uint16_t> st(slice*sz);
+        for(uint64_t i = 0; i < st.size(); i++) st[i] = (uint16_t)((i*7 + 3) % 50000);
+        const std::string sp = dir + "/one_thread.tif";
+        step("one-thread", "none", "write fixture");
+        bool ok = writePlainTiff(sp, (const uint8_t*)st.data(), sx, sy, sz, 1, 16);
+        const int prevThreads = omp_get_max_threads();
+        omp_set_num_threads(1);
+        step("one-thread", "none", "single-slice reads, both layouts");
+        for(uint64_t k = 0; ok && k < sz; k++){
+            const uint16_t* want = st.data() + k*slice;
+            const std::vector<uint8_t> wantFlip = flipped((const uint8_t*)want, sx, sy, 1, 1, 2);
+            void* one = readTiffParallelWrapperNoXYFlip(sp.c_str(), {k});
+            void* range = readTiffParallelWrapperNoXYFlip(sp.c_str(), {k, k + 1});
+            void* flip = readTiffParallelWrapper(sp.c_str(), {k, k + 1});
+            ok = one && range && flip
+                 && std::memcmp(one, want, slice*2) == 0 && std::memcmp(range, want, slice*2) == 0
+                 && std::memcmp(flip, wantFlip.data(), wantFlip.size()) == 0;
+            free(one); free(range); free(flip);
+        }
+        step("one-thread", "none", "full read");
+        void* all = ok ? readTiffParallelWrapperNoXYFlip(sp.c_str(), {}) : nullptr;
+        ok = all && std::memcmp(all, st.data(), st.size()*2) == 0;
+        free(all);
+        omp_set_num_threads(prevThreads);
+        std::remove(sp.c_str());
+        if(ok) std::printf("PASS  %-14s one thread\n", "u16-none");
+        else { std::printf("FAIL  %-14s one thread  (single-slice or full read wrong)\n", "u16-none"); failures++; }
+    }
+
+    // ---- Unreadable and damaged files: report failure, never crash.
+    {
+        const std::string missing = dir + "/does_not_exist.tif";
+        const std::string notTiff = dir + "/not_a_tiff.tif";
+        if(FILE* f = std::fopen(notTiff.c_str(), "wb")){
+            const char line[] = "this is not a tiff file\n";
+            for(int i = 0; i < 100; i++) std::fwrite(line, 1, sizeof line - 1, f);
+            std::fclose(f);
+        }
+        const std::string bad[] = {missing, notTiff};
+        for(const std::string& p : bad){
+            total++;
+            const char* nm = (&p == &bad[0]) ? "missing" : "not-a-tiff";
+            step(nm, "damaged", "metadata + reads");
+            uint64_t* d = getImageSize(p.c_str());
+            const bool ok = !d && getDataType(p.c_str()) == 0 && getImageSizeZ(p.c_str()) == 0
+                            && !readTiffParallelWrapperNoXYFlip(p.c_str(), {})
+                            && !readTiffParallelWrapper(p.c_str());
+            free(d);
+            if(ok) std::printf("PASS  %-14s damaged\n", nm);
+            else { std::printf("FAIL  %-14s damaged  (expected NULL/0 everywhere)\n", nm); failures++; }
+        }
+        std::remove(notTiff.c_str());
+
+        // Damage one LZW strip of page 2: reading that page must fail cleanly in
+        // both layouts and through the single-image path, and the undamaged
+        // pages must still read correctly.
+        total++;
+        const uint64_t cx = 64, cy = 48, cz = 4;
+        std::vector<uint16_t> vol(cx*cy*cz);
+        std::mt19937 crng(97531u);
+        for(auto& v16 : vol) v16 = (uint16_t)(crng() & 0xFFFF);
+        const std::string cp = dir + "/corrupt_strip.tif";
+        step("corrupt", "damaged", "write + damage page 2 strip 1");
+        uint64_t off = 0, cnt = 0;
+        bool ok = !writeTiffParallelWrapper(cx, cy, cz, cp.c_str(), vol.data(), 16, 0, 16, "w", false, "lzw", 1, 0)
+                  && stripLocation(cp, 2, 1, &off, &cnt) && cnt > 64;
+        if(ok){
+            FILE* f = std::fopen(cp.c_str(), "r+b");
+            std::vector<uint8_t> junk(std::min<uint64_t>(256, cnt/2), 0xFF);
+            ok = f && std::fseek(f, (long)(off + cnt/4), SEEK_SET) == 0 && std::fwrite(junk.data(), 1, junk.size(), f) == junk.size();
+            if(f) std::fclose(f);
+        }
+        step("corrupt", "damaged", "reads");
+        void* r3 = ok ? readTiffParallelWrapperNoXYFlip(cp.c_str(), {}) : nullptr;
+        void* rf = ok ? readTiffParallelWrapper(cp.c_str()) : nullptr;
+        void* r2 = ok ? readTiffParallelWrapperNoXYFlip(cp.c_str(), {2, 3}) : nullptr;
+        void* rg = ok ? readTiffParallelWrapperNoXYFlip(cp.c_str(), {0, 2}) : nullptr;
+        const bool good = rg && std::memcmp(rg, vol.data(), 2*cx*cy*sizeof(uint16_t)) == 0;
+        const bool pass = ok && !r3 && !rf && !r2 && good;
+        free(r3); free(rf); free(r2); free(rg);
+        std::remove(cp.c_str());
+        if(pass) std::printf("PASS  %-14s damaged\n", "corrupt-strip");
+        else { std::printf("FAIL  %-14s damaged  (setup=%d full=%d flip=%d page=%d undamaged=%d)\n", "corrupt-strip",
+                           (int)ok, (int)!r3, (int)!rf, (int)!r2, (int)good); failures++; }
+
+        // An ImageJ stack cut short, as an interrupted copy leaves it. Reading
+        // past the end must fail instead of returning unread memory (or, past
+        // 2 GB, retrying forever), while the complete slices still read.
+        {
+            total++;
+            const uint64_t tx = 40, ty = 24, tz = 6, slice = tx*ty, sliceBytes = slice*2;
+            std::vector<uint16_t> ij(slice*tz);
+            for(uint64_t i = 0; i < ij.size(); i++) ij[i] = (uint16_t)((i*13 + 5) % 60000);
+            const std::string tp = dir + "/truncated_imagej.tif";
+            step("truncated-ij", "damaged", "write + cut half of the last slice");
+            const bool setup = writeImageJTiff(tp, (const uint8_t*)ij.data(), tx, ty, tz, 1, 16, false)
+                               && truncateFile(tp, sliceBytes/2);
+            step("truncated-ij", "damaged", "reads");
+            void* full  = setup ? readTiffParallelWrapperNoXYFlip(tp.c_str(), {}) : nullptr;
+            void* fullF = setup ? readTiffParallelWrapper(tp.c_str()) : nullptr;
+            void* tail  = setup ? readTiffParallelWrapperNoXYFlip(tp.c_str(), {4, 6}) : nullptr;
+            void* head  = setup ? readTiffParallelWrapperNoXYFlip(tp.c_str(), {0, 5}) : nullptr;
+            const bool complete = head && std::memcmp(head, ij.data(), 5*sliceBytes) == 0;
+            const bool tpass = setup && !full && !fullF && !tail && complete;
+            free(full); free(fullF); free(tail); free(head);
+            std::remove(tp.c_str());
+            if(tpass) std::printf("PASS  %-14s damaged\n", "truncated-ij");
+            else { std::printf("FAIL  %-14s damaged  (setup=%d full=%d flip=%d tail=%d complete=%d)\n", "truncated-ij",
+                               (int)setup, (int)!full, (int)!fullF, (int)!tail, (int)complete); failures++; }
+        }
+
+        // A single uncompressed image cut short, read with every thread and
+        // with one (which used to take a raw-read path that ignored the error).
+        {
+            total++;
+            const uint64_t px = 64, py = 48, imgBytes = px*py*2;
+            std::vector<uint16_t> img(px*py);
+            for(uint64_t i = 0; i < img.size(); i++) img[i] = (uint16_t)((i*29 + 11) % 65000);
+            const std::string pp = dir + "/truncated_page.tif";
+            step("truncated-2d", "damaged", "write + cut half of the image");
+            const bool setup = writePlainTiff(pp, (const uint8_t*)img.data(), px, py, 1, 1, 16)
+                               && truncateFile(pp, imgBytes/2);
+            step("truncated-2d", "damaged", "reads, all threads and one");
+            void* a  = setup ? readTiffParallelWrapperNoXYFlip(pp.c_str(), {}) : nullptr;
+            void* af = setup ? readTiffParallelWrapper(pp.c_str()) : nullptr;
+            const int prevThreads = omp_get_max_threads();
+            omp_set_num_threads(1);
+            void* b  = setup ? readTiffParallelWrapperNoXYFlip(pp.c_str(), {}) : nullptr;
+            void* bf = setup ? readTiffParallelWrapper(pp.c_str()) : nullptr;
+            omp_set_num_threads(prevThreads);
+            const bool ppass = setup && !a && !af && !b && !bf;
+            free(a); free(af); free(b); free(bf);
+            std::remove(pp.c_str());
+            if(ppass) std::printf("PASS  %-14s damaged\n", "truncated-2d");
+            else { std::printf("FAIL  %-14s damaged  (setup=%d all=%d allFlip=%d one=%d oneFlip=%d)\n", "truncated-2d",
+                               (int)setup, (int)!a, (int)!af, (int)!b, (int)!bf); failures++; }
         }
     }
 

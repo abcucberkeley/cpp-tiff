@@ -146,7 +146,7 @@ uint64_t imageJImGetZ(const char* fileName){
 uint32_t getImageSizeZ(const char* fileName){
     TIFFSetWarningHandler(DummyHandler);
     TIFF* tif = openForDirectoryWalk(fileName);
-    if(!tif){ printf("File \"%s\" cannot be opened",fileName); return 0; }
+    if(!tif){ printf("File \"%s\" cannot be opened\n",fileName); return 0; }
 
     uint32_t s = 0, m = 0, t = 1, z = 1;
     while(TIFFSetDirectory(tif,t)){
@@ -176,7 +176,7 @@ uint32_t getImageSizeZ(const char* fileName){
 uint64_t* getImageSize(const char* fileName){
     TIFFSetWarningHandler(DummyHandler);
     TIFF* tif = TIFFOpen(fileName, "r");
-    if(!tif) printf("File \"%s\" cannot be opened",fileName);
+    if(!tif){ printf("File \"%s\" cannot be opened\n",fileName); return NULL; }
 
     uint64_t x = 1,y = 1,z = 1;
     TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &x);
@@ -195,7 +195,7 @@ uint64_t* getImageSize(const char* fileName){
 uint64_t getDataType(const char* fileName){
     TIFFSetWarningHandler(DummyHandler);
     TIFF* tif = TIFFOpen(fileName, "r");
-    if(!tif) printf("File \"%s\" cannot be opened",fileName);
+    if(!tif){ printf("File \"%s\" cannot be opened\n",fileName); return 0; }
 
     uint64_t bits = 1;
     TIFFGetField(tif, TIFFTAG_BITSPERSAMPLE, &bits);

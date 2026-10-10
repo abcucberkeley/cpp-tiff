@@ -43,6 +43,7 @@ pybind11::array_t<T> create_pybind11_array(void* data, const uint64_t* dims, uin
 
 pybind11::array pybind11_read_tiff(const std::string& fileName, const std::vector<uint64_t> &zRange = {}){
 	uint64_t* dimsPtr = getImageSize(fileName.c_str());
+	if(!dimsPtr) throw std::runtime_error("Could not open \"" + fileName + "\" as a TIFF");
 	uint64_t dims[3] = {dimsPtr[0], dimsPtr[1], dimsPtr[2]};
 	free(dimsPtr);
     if(isImageJIm(fileName.c_str())){
@@ -54,7 +55,7 @@ pybind11::array pybind11_read_tiff(const std::string& fileName, const std::vecto
 	uint64_t fmt = getSampleFormat(fileName.c_str());  // 1=uint, 2=int, 3=float
 
 	void* data = readTiffParallelWrapperNoXYFlip(fileName.c_str(), zRange);
-	if(!data) throw std::runtime_error("Failed to read TIFF (unsupported format, e.g. planar RGB)");
+	if(!data) throw std::runtime_error("Failed to read \"" + fileName + "\": the file is damaged or uses an unsupported layout such as planar RGB");
 
     if(zRange.size()){
         if(zRange.size() == 2){
@@ -116,6 +117,7 @@ void pybind11_write_tiff(const std::string &fileName, const pybind11::array &dat
 
 pybind11::tuple pybind11_get_image_shape(const std::string& fileName){
     uint64_t* dims = getImageSize(fileName.c_str());
+    if(!dims) throw std::runtime_error("Could not open \"" + fileName + "\" as a TIFF");
     uint64_t samples = getSamplesPerPixel(fileName.c_str());
     uint64_t z = dims[2], y = dims[0], x = dims[1];
     free(dims);

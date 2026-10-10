@@ -73,6 +73,43 @@ def tile_width(path):
     return None
 
 
+def strip_location(path, page, strip):
+    """(offset, byte count) of one strip, for damaging it on purpose.
+
+    Little-endian classic and BigTIFF, as written by this library.
+    """
+    with open(path, "rb") as fh:
+        head = fh.read(16)
+        big = struct.unpack("<H", head[2:4])[0] == 43
+        cnt_fmt, ent, off_fmt = ("<Q", 20, "<Q") if big else ("<H", 12, "<I")
+        cnt_sz, off_sz = struct.calcsize(cnt_fmt), struct.calcsize(off_fmt)
+        ifd = struct.unpack(off_fmt, head[8:16] if big else head[4:8])[0]
+        for _ in range(page):
+            fh.seek(ifd)
+            n = struct.unpack(cnt_fmt, fh.read(cnt_sz))[0]
+            fh.seek(ifd + cnt_sz + n * ent)
+            ifd = struct.unpack(off_fmt, fh.read(off_sz))[0]
+        fh.seek(ifd)
+        n = struct.unpack(cnt_fmt, fh.read(cnt_sz))[0]
+        table = fh.read(n * ent)
+        found = {}
+        for i in range(n):
+            e = table[i * ent:(i + 1) * ent]
+            tag, typ = struct.unpack("<HH", e[:4])
+            if tag not in (273, 279):
+                continue
+            count = struct.unpack("<Q" if big else "<I", e[4:12] if big else e[4:8])[0]
+            size = {3: 2, 4: 4, 16: 8}[typ]
+            field = e[12:20] if big else e[8:12]
+            if count * size <= off_sz:
+                raw = field[strip * size:(strip + 1) * size]
+            else:
+                fh.seek(struct.unpack(off_fmt, field[:off_sz])[0] + strip * size)
+                raw = fh.read(size)
+            found[tag] = int.from_bytes(raw, "little")
+    return found[273], found[279]
+
+
 def make(shape, dt, rng):
     n = int(np.prod(shape))
     if np.issubdtype(dt, np.integer):
@@ -210,6 +247,54 @@ def main():
         sub = cpptiff.read_tiff(path, [1, 3])
         check(np.array_equal(sub, arr[1:3]), f"imagej {name}: z-range [1,3)")
         os.remove(path)
+
+    # 5. Unreadable and damaged files raise instead of crashing the interpreter.
+    missing = os.path.join(tmp, "missing.tif")
+    not_tiff = os.path.join(tmp, "not_a_tiff.tif")
+    with open(not_tiff, "wb") as fh:
+        fh.write(b"this is not a tiff file\n" * 100)
+    for label, path in (("missing file", missing), ("non-TIFF file", not_tiff)):
+        for fn_name, fn in (("read_tiff", lambda p=path: cpptiff.read_tiff(p)),
+                            ("get_image_shape", lambda p=path: cpptiff.get_image_shape(p))):
+            try:
+                fn()
+                check(False, f"{label}: {fn_name} did not raise")
+            except Exception:
+                pass
+    os.remove(not_tiff)
+
+    # Damage one LZW strip of page 2. Reading it must raise, through the 3D and
+    # single-slice paths, while the undamaged pages still read correctly.
+    vol = rng.integers(0, 65536, (4, 48, 64), dtype=np.uint16)
+    path = os.path.join(tmp, "corrupt.tif")
+    cpptiff.write_tiff(path, vol, "lzw")
+    off, cnt = strip_location(path, page=2, strip=0)
+    with open(path, "r+b") as fh:
+        fh.seek(off + cnt // 4)
+        fh.write(b"\xff" * min(256, cnt // 2))
+    for label, zr in (("full read", None), ("damaged slice", [2, 3])):
+        try:
+            cpptiff.read_tiff(path, zr)
+            check(False, f"corrupt strip: {label} did not raise")
+        except RuntimeError:
+            pass
+    check(np.array_equal(cpptiff.read_tiff(path, [0, 2]), vol[0:2]), "corrupt strip: undamaged pages")
+    os.remove(path)
+
+    # An ImageJ stack cut short, as an interrupted copy leaves it. Reading past
+    # the end must raise, while the complete slices still read.
+    path = os.path.join(tmp, "ij_truncated.tif")
+    write_imagej_tiff(path, ij_g16)
+    with open(path, "r+b") as fh:
+        fh.truncate(os.path.getsize(path) - ij_g16[0].nbytes // 2)
+    for label, zr in (("full read", None), ("last slice", [3, 4])):
+        try:
+            cpptiff.read_tiff(path, zr)
+            check(False, f"truncated imagej: {label} did not raise")
+        except RuntimeError:
+            pass
+    check(np.array_equal(cpptiff.read_tiff(path, [0, 3]), ij_g16[0:3]), "truncated imagej: complete slices")
+    os.remove(path)
 
     if _failures:
         for f in _failures[:20]:
