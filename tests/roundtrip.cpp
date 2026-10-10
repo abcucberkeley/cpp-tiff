@@ -100,38 +100,91 @@ static bool writeImageJTiff(const std::string& path, const uint8_t* data,
 }
 
 // ---- Plain multi-page fixture writer -----------------------------------------
-// Little-endian classic TIFF, uncompressed, one strip per page, chunky samples.
-// The library's writer only writes grayscale, so RGB fixtures are written here.
+// Classic TIFF, uncompressed, one strip per page, chunky samples; little-endian
+// unless bigEndian (data is in host order and swapped as written). The library's
+// writer only writes grayscale little-endian, so these fixtures are written here.
 static bool writePlainTiff(const std::string& path, const uint8_t* data,
-                           uint64_t x, uint64_t y, uint64_t z, uint64_t spp, uint64_t bits){
+                           uint64_t x, uint64_t y, uint64_t z, uint64_t spp, uint64_t bits,
+                           bool bigEndian = false){
+    const bool be = bigEndian;
+    const uint64_t es = bits/8;
     const uint64_t pageBytes = x*y*spp*(bits/8);
     const uint32_t nEntries = 10;
     const uint32_t ifdSize = 2 + nEntries*12 + 4;
     const uint32_t bpsLen = (spp > 1) ? (uint32_t)(spp*2) : 0;
     std::vector<uint8_t> v;
-    v.push_back('I'); v.push_back('I'); ijPut16(v, 42, false); ijPut32(v, 8, false);
+    v.push_back(be ? 'M' : 'I'); v.push_back(be ? 'M' : 'I'); ijPut16(v, 42, be); ijPut32(v, 8, be);
     for(uint64_t k = 0; k < z; k++){
         const uint32_t ifdOff = (uint32_t)v.size();
         const uint32_t bpsOff = ifdOff + ifdSize;
         const uint32_t pixOff = bpsOff + bpsLen;
         const uint32_t next = (k + 1 < z) ? (uint32_t)(pixOff + pageBytes) : 0;
+        auto shortVal = [&](uint16_t sv){ ijPut16(v, sv, be); v.push_back(0); v.push_back(0); };
+        auto longVal  = [&](uint32_t lv){ ijPut32(v, lv, be); };
+        ijPut16(v, nEntries, be);
+        ijEntry(v,256,3,1,be); shortVal((uint16_t)x);                  // ImageWidth
+        ijEntry(v,257,3,1,be); shortVal((uint16_t)y);                  // ImageLength
+        ijEntry(v,258,3,(uint32_t)spp,be);                             // BitsPerSample
+        if(spp == 1) shortVal((uint16_t)bits); else longVal(bpsOff);
+        ijEntry(v,259,3,1,be); shortVal(1);                            // Compression: none
+        ijEntry(v,262,3,1,be); shortVal(spp == 3 ? 2 : 1);             // Photometric
+        ijEntry(v,273,4,1,be); longVal(pixOff);                        // StripOffsets
+        ijEntry(v,277,3,1,be); shortVal((uint16_t)spp);                // SamplesPerPixel
+        ijEntry(v,278,3,1,be); shortVal((uint16_t)y);                  // RowsPerStrip
+        ijEntry(v,279,4,1,be); longVal((uint32_t)pageBytes);           // StripByteCounts
+        ijEntry(v,284,3,1,be); shortVal(1);                            // PlanarConfig: chunky
+        ijPut32(v, next, be);                                          // next IFD
+        if(spp > 1) for(uint64_t i = 0; i < spp; i++) ijPut16(v, (uint16_t)bits, be);
+        if(!be || es == 1) v.insert(v.end(), data + k*pageBytes, data + (k + 1)*pageBytes);
+        else for(uint64_t i = 0; i < pageBytes; i += es)
+            for(int b = (int)es - 1; b >= 0; b--) v.push_back(data[k*pageBytes + i + b]);
+    }
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if(!f) return false;
+    const size_t w = std::fwrite(v.data(), 1, v.size(), f);
+    std::fclose(f);
+    return w == v.size();
+}
+
+// Little-endian uncompressed grayscale with several strips per page stored in
+// reverse order with gaps between them, a legal layout that cannot be read as
+// one contiguous block, so the readers must fall back to libtiff per strip.
+static bool writeReversedStripsTiff(const std::string& path, const uint8_t* data,
+                                    uint64_t x, uint64_t y, uint64_t z, uint64_t bits, uint64_t rps){
+    const uint64_t es = bits/8, rowBytes = x*es, nStrips = (y + rps - 1)/rps, gap = 16;
+    const uint32_t nEntries = 10;
+    std::vector<uint8_t> v;
+    v.push_back('I'); v.push_back('I'); ijPut16(v, 42, false); ijPut32(v, 8, false);
+    for(uint64_t k = 0; k < z; k++){
+        const uint32_t ifdOff = (uint32_t)v.size();
+        const uint32_t offsOff = ifdOff + 2 + nEntries*12 + 4, cntsOff = offsOff + 4*(uint32_t)nStrips;
+        std::vector<uint32_t> offs(nStrips), cnts(nStrips);
+        uint32_t pos = cntsOff + 4*(uint32_t)nStrips;
+        for(uint64_t i = nStrips; i-- > 0;){
+            cnts[i] = (uint32_t)(std::min<uint64_t>(rps, y - i*rps)*rowBytes);
+            offs[i] = pos; pos += cnts[i] + gap;
+        }
         auto shortVal = [&](uint16_t sv){ ijPut16(v, sv, false); v.push_back(0); v.push_back(0); };
         auto longVal  = [&](uint32_t lv){ ijPut32(v, lv, false); };
         ijPut16(v, nEntries, false);
         ijEntry(v,256,3,1,false); shortVal((uint16_t)x);                  // ImageWidth
         ijEntry(v,257,3,1,false); shortVal((uint16_t)y);                  // ImageLength
-        ijEntry(v,258,3,(uint32_t)spp,false);                             // BitsPerSample
-        if(spp == 1) shortVal((uint16_t)bits); else longVal(bpsOff);
+        ijEntry(v,258,3,1,false); shortVal((uint16_t)bits);               // BitsPerSample
         ijEntry(v,259,3,1,false); shortVal(1);                            // Compression: none
-        ijEntry(v,262,3,1,false); shortVal(spp == 3 ? 2 : 1);             // Photometric
-        ijEntry(v,273,4,1,false); longVal(pixOff);                        // StripOffsets
-        ijEntry(v,277,3,1,false); shortVal((uint16_t)spp);                // SamplesPerPixel
-        ijEntry(v,278,3,1,false); shortVal((uint16_t)y);                  // RowsPerStrip
-        ijEntry(v,279,4,1,false); longVal((uint32_t)pageBytes);           // StripByteCounts
+        ijEntry(v,262,3,1,false); shortVal(1);                            // Photometric
+        ijEntry(v,273,4,(uint32_t)nStrips,false); longVal(offsOff);       // StripOffsets
+        ijEntry(v,277,3,1,false); shortVal(1);                            // SamplesPerPixel
+        ijEntry(v,278,3,1,false); shortVal((uint16_t)rps);                // RowsPerStrip
+        ijEntry(v,279,4,(uint32_t)nStrips,false); longVal(cntsOff);       // StripByteCounts
         ijEntry(v,284,3,1,false); shortVal(1);                            // PlanarConfig: chunky
-        ijPut32(v, next, false);                                          // next IFD
-        if(spp > 1) for(uint64_t i = 0; i < spp; i++) ijPut16(v, (uint16_t)bits, false);
-        v.insert(v.end(), data + k*pageBytes, data + (k + 1)*pageBytes);
+        ijPut32(v, (k + 1 < z) ? pos : 0, false);                         // next IFD
+        for(uint32_t o : offs) ijPut32(v, o, false);
+        for(uint32_t c : cnts) ijPut32(v, c, false);
+        for(uint64_t i = nStrips; i-- > 0;){
+            const uint8_t* src = data + k*y*rowBytes + i*rps*rowBytes;
+            v.insert(v.end(), src, src + cnts[i]);
+            v.insert(v.end(), (size_t)gap, (uint8_t)0);
+        }
     }
     FILE* f = std::fopen(path.c_str(), "wb");
     if(!f) return false;
@@ -434,6 +487,150 @@ int main(int argc, char** argv){
             if(b3 && b2 && rd) std::printf("PASS  %-14s fallback\n", c.name);
             else { std::printf("FAIL  %-14s fallback  (3D=%d 2D=%d readers=%d)\n", c.name, (int)b3, (int)b2, (int)rd); failures++; }
         }
+    }
+
+    // ---- Short strips. Flip reads decode runs of short strips and transpose
+    // each run at once (stripsPerTranspose). Odd heights leave a partial last
+    // strip and a partial last run. Wide uncompressed single-strip images are
+    // split by libtiff into one-row strips on read, including RGB.
+    {
+        struct SS { const char* name; uint64_t x, y, z, spp, bits; uint16_t fmt; const char* comp; };
+        const SS sss[] = {
+            {"u8-none-rps3",    40,   41, 3, 1,  8, 1, "none"},
+            {"u16-lzw-rps3",    40,   41, 3, 1, 16, 1, "lzw"},
+            {"f32-none-rps3",   40,   41, 3, 1, 32, 3, "none"},
+            {"f64-zstd-rps3",   40,   41, 3, 1, 64, 3, "zstd"},
+            {"u16-onerow",    4100,   37, 2, 1, 16, 1, nullptr},
+            {"rgb8-onerow",   1500,   37, 2, 3,  8, 1, nullptr},
+        };
+        std::mt19937 srng(24680u);
+        std::uniform_int_distribution<int> sbyte(0, 255);
+        for(const SS& c : sss){
+            total++;
+            const uint64_t es = c.bits/8, slice = c.x*c.y*c.spp*es;
+            std::vector<uint8_t> src(slice*c.z);
+            for(auto& v8 : src) v8 = (uint8_t)sbyte(srng);
+            if(c.bits == 32) for(uint64_t i = 0; i < src.size(); i += 4) src[i + 3] &= 0x3F;   // keep floats finite
+            if(c.bits == 64) for(uint64_t i = 0; i < src.size(); i += 8) src[i + 7] &= 0x3F;
+            const std::string p3 = dir + "/ss3_" + c.name + ".tif", p2 = dir + "/ss2_" + c.name + ".tif";
+            step(c.name, "short strips", "write fixtures");
+            bool ok = c.comp ? !writeTiffParallelWrapper(c.x, c.y, c.z, p3.c_str(), src.data(), c.bits, 0, 3, "w", false, std::string(c.comp), c.fmt, 0)
+                               && !writeTiffParallelWrapper(c.x, c.y, 1, p2.c_str(), src.data(), c.bits, 0, 3, "w", false, std::string(c.comp), c.fmt, 0)
+                             : writePlainTiff(p3, src.data(), c.x, c.y, c.z, c.spp, c.bits)
+                               && writePlainTiff(p2, src.data(), c.x, c.y, 1, c.spp, c.bits);
+            step(c.name, "short strips", "3D, 2D and z-range reads, both layouts");
+            struct Read { const std::string* path; std::vector<uint64_t> range; uint64_t first, count; };
+            const Read reads[] = {{&p3, {}, 0, c.z}, {&p3, {1, c.z}, 1, c.z - 1}, {&p3, {1}, 1, 1}, {&p2, {}, 0, 1}};
+            for(const Read& r : reads){
+                if(!ok) break;
+                const uint8_t* want = src.data() + r.first*slice;
+                const std::vector<uint8_t> wantFlip = flipped(want, c.x, c.y, r.count, c.spp, es);
+                void* nf = readTiffParallelWrapperNoXYFlip(r.path->c_str(), r.range);
+                void* fl = readTiffParallelWrapper(r.path->c_str(), r.range);
+                ok = nf && fl && std::memcmp(nf, want, r.count*slice) == 0
+                     && std::memcmp(fl, wantFlip.data(), wantFlip.size()) == 0;
+                free(nf); free(fl);
+            }
+            std::remove(p3.c_str()); std::remove(p2.c_str());
+            if(ok) std::printf("PASS  %-14s short strips\n", c.name);
+            else { std::printf("FAIL  %-14s short strips\n", c.name); failures++; }
+        }
+    }
+
+    // ---- Many slices, few threads. With more slices than threads each thread
+    // reads its own block and then takes slices from the back of the others
+    // (Linux), so every slice must still be read exactly once, in its place.
+    {
+        struct MS { const char* name; const char* comp; };
+        const MS mss[] = {{"u16-none-37z", "none"}, {"u16-lzw-37z", "lzw"}};
+        const uint64_t mx = 24, my = 17, mz = 37, slice = mx*my;
+        std::vector<uint16_t> ms(slice*mz);
+        for(uint64_t i = 0; i < ms.size(); i++) ms[i] = (uint16_t)((i*31 + 7) % 65000);
+        const std::vector<uint8_t> wantFlip = flipped((const uint8_t*)ms.data(), mx, my, mz, 1, 2);
+        const std::vector<uint8_t> wantRangeFlip = flipped((const uint8_t*)(ms.data() + 3*slice), mx, my, 27, 1, 2);
+        const int prevThreads = omp_get_max_threads();
+        for(const MS& c : mss){
+            total++;
+            const std::string mp = dir + "/many_" + c.name + ".tif";
+            step(c.name, "many slices", "write fixture");
+            bool ok = !writeTiffParallelWrapper(mx, my, mz, mp.c_str(), ms.data(), 16, 0, 5, "w", false, std::string(c.comp), 1, 0);
+            const int threads[] = {2, 3, 5, prevThreads};
+            for(int t : threads){
+                if(!ok) break;
+                omp_set_num_threads(t);
+                step(c.name, "many slices", "full and z-range reads, both layouts");
+                void* nf = readTiffParallelWrapperNoXYFlip(mp.c_str(), {});
+                void* fl = readTiffParallelWrapper(mp.c_str());
+                void* rg = readTiffParallelWrapperNoXYFlip(mp.c_str(), {3, 30});
+                void* rf = readTiffParallelWrapper(mp.c_str(), {3, 30});
+                ok = nf && fl && rg && rf
+                     && std::memcmp(nf, ms.data(), ms.size()*2) == 0 && std::memcmp(fl, wantFlip.data(), wantFlip.size()) == 0
+                     && std::memcmp(rg, ms.data() + 3*slice, 27*slice*2) == 0 && std::memcmp(rf, wantRangeFlip.data(), wantRangeFlip.size()) == 0;
+                free(nf); free(fl); free(rg); free(rf);
+            }
+            omp_set_num_threads(prevThreads);
+            std::remove(mp.c_str());
+            if(ok) std::printf("PASS  %-14s many slices\n", c.name);
+            else { std::printf("FAIL  %-14s many slices\n", c.name); failures++; }
+        }
+    }
+
+    // ---- Big-endian uncompressed stacks. Each page is larger than libtiff's
+    // ~8 KB strip size, so libtiff splits it into short strips and the readers
+    // copy them straight from the file (readRawStrips), swapping bytes the way
+    // libtiff would.
+    {
+        struct BE { const char* name; uint64_t spp, bits; };
+        const BE bes[] = {{"be-u8", 1, 8}, {"be-u16", 1, 16}, {"be-32bit", 1, 32}, {"be-64bit", 1, 64}, {"be-rgb16", 3, 16}};
+        const uint64_t bx = 300, by = 41, bz = 3;
+        std::mt19937 brng(13579u);
+        std::uniform_int_distribution<int> bbyte(0, 255);
+        for(const BE& c : bes){
+            total++;
+            const uint64_t es = c.bits/8, slice = bx*by*c.spp*es;
+            std::vector<uint8_t> src(slice*bz);
+            for(auto& v8 : src) v8 = (uint8_t)bbyte(brng);
+            const std::string bp = dir + "/" + c.name + ".tif";
+            step(c.name, "big-endian", "write fixture");
+            bool ok = writePlainTiff(bp, src.data(), bx, by, bz, c.spp, c.bits, true);
+            step(c.name, "big-endian", "full, z-range and single-slice reads, both layouts");
+            struct Read { std::vector<uint64_t> range; uint64_t first, count; };
+            const Read reads[] = {{{}, 0, bz}, {{1, bz}, 1, bz - 1}, {{2}, 2, 1}};
+            for(const Read& r : reads){
+                if(!ok) break;
+                const uint8_t* want = src.data() + r.first*slice;
+                const std::vector<uint8_t> wantFlip = flipped(want, bx, by, r.count, c.spp, es);
+                void* nf = readTiffParallelWrapperNoXYFlip(bp.c_str(), r.range);
+                void* fl = readTiffParallelWrapper(bp.c_str(), r.range);
+                ok = nf && fl && std::memcmp(nf, want, r.count*slice) == 0
+                     && std::memcmp(fl, wantFlip.data(), wantFlip.size()) == 0;
+                free(nf); free(fl);
+            }
+            std::remove(bp.c_str());
+            if(ok) std::printf("PASS  %-14s big-endian\n", c.name);
+            else { std::printf("FAIL  %-14s big-endian\n", c.name); failures++; }
+        }
+
+        // Strips stored out of order cannot be copied as one block.
+        total++;
+        const uint64_t rx = 300, ry = 37, rz = 3, rslice = rx*ry*2;
+        std::vector<uint8_t> rsrc(rslice*rz);
+        for(auto& v8 : rsrc) v8 = (uint8_t)bbyte(brng);
+        const std::string rp = dir + "/reversed_strips.tif";
+        step("reversed", "strip order", "write + reads");
+        bool rok = writeReversedStripsTiff(rp, rsrc.data(), rx, ry, rz, 16, 4);
+        for(int flip = 0; rok && flip < 2; flip++){
+            const std::vector<uint8_t> want = flip ? flipped(rsrc.data(), rx, ry, rz, 1, 2) : rsrc;
+            const std::vector<uint8_t> want1 = flip ? flipped(rsrc.data() + rslice, rx, ry, 1, 1, 2)
+                                                    : std::vector<uint8_t>(rsrc.begin() + rslice, rsrc.begin() + 2*rslice);
+            void* r = flip ? readTiffParallelWrapper(rp.c_str()) : readTiffParallelWrapperNoXYFlip(rp.c_str(), {});
+            void* r1 = flip ? readTiffParallelWrapper(rp.c_str(), {1}) : readTiffParallelWrapperNoXYFlip(rp.c_str(), {1});
+            rok = r && r1 && std::memcmp(r, want.data(), want.size()) == 0 && std::memcmp(r1, want1.data(), want1.size()) == 0;
+            free(r); free(r1);
+        }
+        std::remove(rp.c_str());
+        if(rok) std::printf("PASS  %-14s strip order\n", "reversed");
+        else { std::printf("FAIL  %-14s strip order\n", "reversed"); failures++; }
     }
 
     // ---- One OpenMP thread. Single-image reads used to take a separate raw-read

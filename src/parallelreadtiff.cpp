@@ -68,6 +68,69 @@ static inline void flipTransposeStripRGB(T* out, const T* buf, int64_t x, int64_
     }
 }
 
+// Number of consecutive strips to decode before each flip transpose. One
+// transpose writes a few elements into every output column, so its cost per
+// column (a cache line, and a page once columns are 4 KB apart) is paid again
+// for every strip. Strips of only a row or two are common: libtiff splits a
+// single large uncompressed strip into one-row strips, and many writers use
+// ~8 KB strips. Transposing runs of about 16 rows made flip reads of one- and
+// two-row strips 2-12x faster (Xeon and Apple M2, 1-48 threads); longer runs
+// gained little and were slower with 8-row strips. Strips of 16+ rows are
+// transposed one at a time as before. The byte cap bounds the per-thread
+// buffer for very wide rows.
+static int64_t stripsPerTranspose(uint64_t stripSize, uint64_t rowBytes){
+    const uint64_t targetRows = 16;
+    const uint64_t maxBytes = (uint64_t)4 << 20;
+    const uint64_t rows = std::min<uint64_t>(targetRows, std::max<uint64_t>(1, maxBytes / std::max<uint64_t>(1, rowBytes)));
+    return (int64_t)std::max<uint64_t>(1, rows / std::max<uint64_t>(1, stripSize));
+}
+
+// Whether the strips of the current directory can be copied straight from the
+// file: no compression, normal bit order, and libtiff's strip size equal to
+// rows x row bytes (so no subsampling or padding to undo).
+static bool rawStripsOK(TIFF* tif, uint64_t stripSize, uint64_t rowBytes){
+    uint16_t compression = COMPRESSION_NONE, fillOrder = FILLORDER_MSB2LSB;
+    TIFFGetFieldDefaulted(tif, TIFFTAG_COMPRESSION, &compression);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_FILLORDER, &fillOrder);
+    return compression == COMPRESSION_NONE && fillOrder == FILLORDER_MSB2LSB && !TIFFIsTiled(tif)
+           && (uint64_t)TIFFStripSize(tif) == stripSize*rowBytes;
+}
+
+// Bytes per read when a flip read copies uncompressed strips into its buffer.
+static const uint64_t rawFlipBlockBytes = (uint64_t)1 << 20;
+
+// Read strips [first, last) of the current directory with one call when they
+// are stored back to back with exactly the expected sizes, swapping bytes the
+// way libtiff would. libtiff splits a large uncompressed strip into ~8 KB
+// strips and reads each one separately; on NFS every read call has a fixed
+// cost, which made stacks of small uncompressed slices up to 1.9x slower than
+// v1.6.2's memory-mapped reads. Returns false if the layout does not match or
+// the read comes up short, so the caller falls back to libtiff strip by strip,
+// which also reports real errors.
+static bool readRawStrips(TIFF* tif, int64_t first, int64_t last, uint64_t stripSize, uint64_t y,
+                          uint64_t rowBytes, uint64_t bits, uint8_t* dst){
+    uint64_t *offsets = NULL, *counts = NULL;
+    if(!TIFFGetField(tif, TIFFTAG_STRIPOFFSETS, &offsets) || !TIFFGetField(tif, TIFFTAG_STRIPBYTECOUNTS, &counts)
+       || !offsets || !counts || (uint64_t)last > TIFFNumberOfStrips(tif)) return false;
+    uint64_t total = 0;
+    for(int64_t i = first; i < last; i++){
+        const uint64_t rows = std::min<uint64_t>(stripSize, y - (uint64_t)i*stripSize);
+        if(counts[i] != rows*rowBytes || offsets[i] != offsets[first] + total) return false;
+        total += counts[i];
+    }
+    thandle_t h = TIFFClientdata(tif);
+    if(TIFFGetSeekProc(tif)(h, (toff_t)offsets[first], SEEK_SET) != (toff_t)offsets[first]) return false;
+    if((uint64_t)TIFFGetReadProc(tif)(h, dst, (tmsize_t)total) != total) return false;
+    if(TIFFIsByteSwapped(tif)){
+        switch(bits){
+            case 16: TIFFSwabArrayOfShort(reinterpret_cast<uint16_t*>(dst), (tmsize_t)(total/2)); break;
+            case 32: TIFFSwabArrayOfLong(reinterpret_cast<uint32_t*>(dst), (tmsize_t)(total/4)); break;
+            case 64: TIFFSwabArrayOfLong8(reinterpret_cast<uint64_t*>(dst), (tmsize_t)(total/8)); break;
+        }
+    }
+    return true;
+}
+
 // ---- Tiled TIFF support -------------------------------------------------
 // A tile is a sub-rectangle rather than a full-width strip, so its rows are not
 // contiguous in the output (the no-flip path cannot decode straight into the
@@ -320,6 +383,15 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
     uint8_t errBak = 0;
     std::atomic<uint8_t> err{0};
     char errString[10000];
+#ifdef __linux__
+    // Blocks for the work-stealing schedule below: block b covers slices
+    // [front, back) relative to startSlice, packed as front << 32 | back so one
+    // compare-and-swap updates both ends.
+    std::unique_ptr<std::atomic<uint64_t>[]> blocks(new std::atomic<uint64_t>[team]);
+    for(int32_t b = 0; b < team; b++)
+        blocks[b].store(((z*(uint64_t)b/team) << 32) | (z*(uint64_t)(b + 1)/team));
+    bool uncompressedStack = false;   // set by one thread below, read by all
+#endif
     // Each thread opens the file once and reads whichever slices it is handed.
     #pragma omp parallel num_threads(team)
     {
@@ -371,18 +443,29 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
 
         // One scratch buffer per thread, reused for every slice it reads. Tiles
         // always decode into it; strips only on the flip path, since the no-flip
-        // path decodes each strip straight into the output. new[] (not vector or
-        // make_unique) keeps it RAII-owned without zero-filling before the read.
+        // path decodes each strip straight into the output. The flip path
+        // decodes runs of strips into it and transposes each run at once (see
+        // stripsPerTranspose). new[] (not vector or make_unique) keeps it
+        // RAII-owned without zero-filling before the read.
+        const int64_t nStrips = (int64_t)((y + stripSize - 1) / stripSize);
+        const int64_t run = (!tiled && flipXY) ? std::max<int64_t>(1, std::min<int64_t>(stripsPerTranspose(stripSize, xs*bytes), nStrips)) : 1;
+        // Uncompressed slices are read with one call per slice (no-flip) or per
+        // ~1 MB block (flip); see readRawStrips. Sized from the first directory.
+        const bool rawCandidate = tif && !tiled && rawStripsOK(tif.get(), stripSize, xs*bytes);
+        const int64_t rawRun = flipXY ? std::max<int64_t>(run, std::min<int64_t>(nStrips, (int64_t)std::max<uint64_t>(1, rawFlipBlockBytes / (stripSize*xs*bytes))))
+                                      : nStrips;
         std::unique_ptr<uint8_t[]> buffer;
         if(tiled && tileBufBytes) buffer.reset(new uint8_t[tileBufBytes]);
-        else if(!tiled && flipXY) buffer.reset(new uint8_t[xs*stripSize*bytes]);
+        else if(!tiled && flipXY) buffer.reset(new uint8_t[(rawCandidate ? rawRun : run)*xs*stripSize*bytes]);
 
         // Read one slice into its place in the output.
         auto readOne = [&](int64_t dir){
             if(err || !tif) return;
 
+            // A fresh handle is already on directory 0, and TIFFSetDirectory
+            // would read it again.
             uint8_t counter = 0;
-            while(!TIFFSetDirectory(tif.get(), (uint64_t)dir)){
+            while(TIFFCurrentDirectory(tif.get()) != (tdir_t)dir && !TIFFSetDirectory(tif.get(), (uint64_t)dir)){
                 if(++counter == 3){
                     #pragma omp critical
                     {
@@ -410,33 +493,40 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
                 return;
             }
 
-            for (int64_t i = 0; i*stripSize < y; i++)
+            const bool raw = rawCandidate && rawStripsOK(tif.get(), stripSize, xs*bytes);
+            const int64_t step = raw ? rawRun : run;
+            for(int64_t first = 0; first < nStrips; first += step)
             {
-                // No-flip: decode the strip straight into the output array (no
-                // bounce buffer, no full-image memcpy). Flip: decode into the
-                // buffer and transpose below.
-                void* stripDst = flipXY
-                    ? static_cast<void*>(buffer.get())
-                    : static_cast<void*>(static_cast<uint8_t*>(tiff) + (((i*stripSize*xs)+((dir-startSlice)*(y*xs)))*bytes));
-                int64_t cBytes = TIFFReadEncodedStrip(tif.get(), i, stripDst, stripSize*xs*bytes);
-                if(cBytes < 0){
-                    #pragma omp critical
-                    {
-                        errBak = 1;
-                        err = 1;
-                        sprintf(errString,"Thread %d: Strip %ld cannot be read\n",w,(long)i);
+                const int64_t last = std::min<int64_t>(first + step, nStrips);
+                uint8_t* blockDst = flipXY ? buffer.get()
+                    : static_cast<uint8_t*>(tiff) + (((first*stripSize*xs)+((dir-startSlice)*(y*xs)))*bytes);
+                if(!(raw && readRawStrips(tif.get(), first, last, stripSize, y, xs*bytes, bits, blockDst)))
+                for(int64_t i = first; i < last; i++){
+                    // No-flip: decode the strip straight into the output array (no
+                    // bounce buffer, no full-image memcpy). Flip: decode into the
+                    // buffer and transpose below.
+                    void* stripDst = flipXY
+                        ? static_cast<void*>(buffer.get() + (i - first)*stripSize*xs*bytes)
+                        : static_cast<void*>(static_cast<uint8_t*>(tiff) + (((i*stripSize*xs)+((dir-startSlice)*(y*xs)))*bytes));
+                    int64_t cBytes = TIFFReadEncodedStrip(tif.get(), i, stripDst, stripSize*xs*bytes);
+                    if(cBytes < 0){
+                        #pragma omp critical
+                        {
+                            errBak = 1;
+                            err = 1;
+                            sprintf(errString,"Thread %d: Strip %ld cannot be read\n",w,(long)i);
+                        }
+                        return;
                     }
-                    return;
                 }
                 if(!flipXY){
                     continue;
                 }
                 // Flip x/y into the column-major MATLAB output with a cache-
                 // blocked transpose (see flipTransposeStrip). stripRows handles
-                // a partial final strip.
-                int64_t stripRows = y - (i*stripSize);
-                if(stripRows > (int64_t)stripSize) stripRows = (int64_t)stripSize;
-                int64_t rowOff = i*stripSize;
+                // a partial final strip of the image.
+                const int64_t rowOff = first*stripSize;
+                const int64_t stripRows = std::min<int64_t>((last - first)*(int64_t)stripSize, (int64_t)y - rowOff);
                 int64_t sliceOff = (dir-startSlice)*(x*y);
                 if(samples == 1){
                     switch(bits){
@@ -473,25 +563,66 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
             }
         };
 
-        // On Linux, slices are handed out one at a time once there are more of
-        // them than threads, so a thread that runs slow does not hold up the
-        // whole read. Together with the unmapped reads (openReaderTiff), that
-        // cut read time by 21-34% on our benchmarks and by up to ~70% on stacks
-        // of small slices. With no more slices than threads each thread simply
-        // takes one. Elsewhere each thread keeps one contiguous
-        // block, as before: on macOS the one-at-a-time split was no faster, and
-        // with a memory-mapped file each thread's walk past the slices it skips
-        // costs more than the balancing saves.
-        if(z <= (uint64_t)team){
-            #pragma omp for schedule(static)
+        // On Linux, once there are more slices than threads:
+        // - Compressed stacks hand slices out one at a time, so a thread that
+        //   decodes slowly does not hold up the whole read. With the unmapped
+        //   reads (openReaderTiff) that cut read time by 21-34% on our
+        //   benchmarks.
+        // - Uncompressed slices take about the same time each, so each thread
+        //   reads its own contiguous block front to back and then takes slices
+        //   from the back of other blocks. One at a time made every thread walk
+        //   the whole IFD chain (libtiff can only step forward to a directory it
+        //   has not seen); on NFS, where every step is a read call, that alone
+        //   kept 1000-slice uncompressed stacks 6-10% behind v1.6.2, while
+        //   contiguous blocks matched or beat it.
+        // With no more slices than threads each thread simply takes one.
+        // Elsewhere each thread keeps one contiguous block, as before: with a
+        // memory-mapped file the balancing was no faster on macOS.
+#ifdef __linux__
+        #pragma omp single
+        {
+            uint16_t compression = COMPRESSION_NONE;
+            if(tif) TIFFGetFieldDefaulted(tif.get(), TIFFTAG_COMPRESSION, &compression);
+            uncompressedStack = tif && compression == COMPRESSION_NONE;
+        }
+        if(z > (uint64_t)team && uncompressedStack){
+            // Take one slice from the front (owner) or the back (thief) of block b.
+            auto take = [&](int32_t b, bool front, uint64_t& slice){
+                uint64_t cur = blocks[b].load();
+                for(;;){
+                    const uint64_t f = cur >> 32, e = cur & 0xFFFFFFFFu;
+                    if(f >= e) return false;
+                    const uint64_t next = front ? ((f + 1) << 32) | e : (f << 32) | (e - 1);
+                    if(blocks[b].compare_exchange_weak(cur, next)){ slice = front ? f : e - 1; return true; }
+                }
+            };
+            // libtiff remembers the offset of every IFD a handle has stepped
+            // over, so jumping back to a slice at or below the furthest one this
+            // thread has read is free, while going past it walks the chain.
+            // Thieves therefore pick the block whose last slice is cheapest to
+            // reach, and the fullest block among equally cheap ones.
+            uint64_t slice, reached = 0;
+            while(!err && take(w, true, slice)){ readOne((int64_t)(startSlice + slice)); reached = std::max(reached, slice); }
+            while(!err){
+                int32_t victim = -1; uint64_t bestCost = UINT64_MAX, bestLeft = 0;
+                for(int32_t b = 0; b < team; b++){
+                    const uint64_t cur = blocks[b].load(), f = cur >> 32, e = cur & 0xFFFFFFFFu;
+                    if(e <= f) continue;
+                    const uint64_t cost = e - 1 <= reached ? 0 : e - 1 - reached;
+                    if(cost < bestCost || (cost == bestCost && e - f > bestLeft)){ bestCost = cost; bestLeft = e - f; victim = b; }
+                }
+                if(victim < 0) break;
+                if(take(victim, false, slice)){ readOne((int64_t)(startSlice + slice)); reached = std::max(reached, slice); }
+            }
+        }
+        else if(z > (uint64_t)team){
+            #pragma omp for schedule(dynamic, 1)
             for(int64_t dir = (int64_t)startSlice; dir < (int64_t)(startSlice+z); dir++) readOne(dir);
         }
-        else{
-#ifdef __linux__
-            #pragma omp for schedule(dynamic, 1)
-#else
-            #pragma omp for schedule(static)
+        else
 #endif
+        {
+            #pragma omp for schedule(static)
             for(int64_t dir = (int64_t)startSlice; dir < (int64_t)(startSlice+z); dir++) readOne(dir);
         }
     }
@@ -639,11 +770,15 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
         }
 
         if(!tif) continue;   // err is already set; never hand libtiff a null handle
-        // Tiles always decode into the buffer; strips only on the flip path,
-        // since the no-flip path decodes each strip straight into the output.
-        void* buffer = (tiled || flipXY) ? malloc(tiled ? tileBufBytes : xs*stripSize*bytes) : NULL;
+        // This worker's strips. The flip path decodes runs of them into the
+        // buffer and transposes each run at once (see stripsPerTranspose).
+        const int64_t sBegin = (int64_t)w*batchSize;
+        const int64_t sEnd = std::min<int64_t>(sBegin + batchSize, (int64_t)stripsPerDir);
+        const int64_t run = (!tiled && flipXY) ? std::max<int64_t>(1, std::min<int64_t>(stripsPerTranspose(stripSize, xs*bytes), sEnd - sBegin)) : 1;
+        // A fresh handle is already on directory 0, and TIFFSetDirectory would
+        // read it again.
         uint8_t counter = 0;
-        while(!TIFFSetDirectory(tif, startSlice) && counter<3){
+        while(TIFFCurrentDirectory(tif) != (tdir_t)startSlice && !TIFFSetDirectory(tif, startSlice) && counter<3){
             printf("Thread %d: File \"%s\" Directory \"%d\" failed to open. Try %d\n",w,fileName,0,counter+1);
             counter++;
             if(counter == 3){
@@ -654,6 +789,15 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
                 }
             }
         }
+        // An uncompressed image reads this worker's strips with one call
+        // (no-flip) or per ~1 MB block (flip); see readRawStrips.
+        const bool raw = !tiled && rawStripsOK(tif, stripSize, xs*bytes);
+        const int64_t step = !raw ? run
+            : flipXY ? std::max<int64_t>(run, std::min<int64_t>(sEnd - sBegin, (int64_t)std::max<uint64_t>(1, rawFlipBlockBytes / (stripSize*xs*bytes))))
+                     : std::max<int64_t>(1, sEnd - sBegin);
+        // Tiles always decode into the buffer; strips only on the flip path,
+        // since the no-flip path decodes each strip straight into the output.
+        void* buffer = (tiled || flipXY) ? malloc(tiled ? tileBufBytes : step*stripSize*xs*bytes) : NULL;
         if(tiled){
             int64_t tStart = (int64_t)w*tileBatch;
             int64_t tEnd = tStart + tileBatch;
@@ -672,30 +816,32 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
                 }
             }
         }
-        else for (int64_t i = (w*batchSize); i < (w+1)*batchSize; i++)
-        {
-            if(i*stripSize >= y || err) break;
-            // No-flip: decode the strip straight into the output, as the 3D
-            // path does. Flip: decode into the buffer and transpose below.
-            void* stripDst = flipXY ? buffer : static_cast<void*>(static_cast<uint8_t*>(tiff) + i*stripSize*xs*bytes);
-            int64_t cBytes = TIFFReadEncodedStrip(tif, i, stripDst, stripSize*xs*bytes);
-            if(cBytes < 0){
-                #pragma omp critical
-                {
-                    errBak = 1;
-                    err = 1;
-                    sprintf(errString,"Thread %d: Strip %ld cannot be read\n",w,(long)i);
+        else for(int64_t first = sBegin; first < sEnd && !err; first += step){
+            const int64_t last = std::min<int64_t>(first + step, sEnd);
+            uint8_t* blockDst = flipXY ? static_cast<uint8_t*>(buffer) : static_cast<uint8_t*>(tiff) + first*stripSize*xs*bytes;
+            if(!(raw && readRawStrips(tif, first, last, stripSize, y, xs*bytes, bits, blockDst)))
+            for(int64_t i = first; i < last; i++){
+                // No-flip: decode the strip straight into the output, as the 3D
+                // path does. Flip: decode into the buffer and transpose below.
+                void* stripDst = flipXY
+                    ? static_cast<void*>(static_cast<uint8_t*>(buffer) + (i - first)*stripSize*xs*bytes)
+                    : static_cast<void*>(static_cast<uint8_t*>(tiff) + i*stripSize*xs*bytes);
+                int64_t cBytes = TIFFReadEncodedStrip(tif, i, stripDst, stripSize*xs*bytes);
+                if(cBytes < 0){
+                    #pragma omp critical
+                    {
+                        errBak = 1;
+                        err = 1;
+                        sprintf(errString,"Thread %d: Strip %ld cannot be read\n",w,(long)i);
+                    }
+                    break;
                 }
-                break;
             }
-            if(!flipXY){
-                continue;
-            }
+            if(!flipXY || err) continue;
             // Same cache-blocked transpose as the 3D path, single image so
             // the slice offset is 0. samples==1 keeps the grayscale path.
-            int64_t stripRows = y - (i*stripSize);
-            if(stripRows > (int64_t)stripSize) stripRows = (int64_t)stripSize;
-            int64_t rowOff = i*stripSize;
+            const int64_t rowOff = first*stripSize;
+            const int64_t stripRows = std::min<int64_t>((last - first)*(int64_t)stripSize, (int64_t)y - rowOff);
             if(samples == 1){
                 switch(bits){
                     case 8:
