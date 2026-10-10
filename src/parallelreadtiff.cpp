@@ -4,6 +4,7 @@
 #include <vector>
 #include <atomic>
 #include <memory>
+#include <algorithm>
 #include <limits.h>
 #include <omp.h>
 #include "tiffio.h"
@@ -203,30 +204,18 @@ static uint8_t readTilesInto(TIFF* tif, uint8_t* buffer, int64_t tileBufBytes,
     return 0;
 }
 
-// One worker's whole tiled read: walk its directories and decode every tile of
-// each. Kept in its own function so readTiffParallel's body stays focused on the
-// strip path. Returns 2 if a directory could not be selected, 1 if a tile could
-// not be read, 0 on success.
-static uint8_t readTiledDirs(TIFF* tif, void* out, int64_t x, int64_t y, int64_t z,
-                             int64_t bits, int64_t samples, int64_t tw, int64_t tl,
-                             int64_t tilesAcross, int64_t tilesDown, int64_t startSlice,
-                             int64_t dirBegin, int64_t dirEnd, uint8_t flipXY,
-                             int64_t tileBufBytes, int64_t* failedDir, int64_t* failedTile)
-{
-    std::unique_ptr<uint8_t[]> tileBuf(new uint8_t[tileBufBytes]);
-    for(int64_t dir = dirBegin; dir < dirEnd; dir++){
-        if(dir >= z + startSlice) break;
-
-        uint8_t counter = 0;
-        while(!TIFFSetDirectory(tif, (uint64_t)dir) && counter < 3){
-            counter++;
-            if(counter == 3){ *failedDir = dir; return 2; }
-        }
-        if(readTilesInto(tif, tileBuf.get(), tileBufBytes, out, x, y, bits, samples,
-                         tw, tl, tilesAcross, 0, tilesAcross*tilesDown,
-                         dir - startSlice, flipXY, failedTile)) return 1;
-    }
-    return 0;
+// Open the file for one reader thread. On Linux this skips libtiff's memory
+// map. With every thread mapping the whole file, a read ended with each thread
+// unmapping it; the kernel serializes those unmaps and they stall the other
+// threads' page faults, which cost up to ~0.4 s at the end of a 2 s read.
+// Reading through read() only adds a copy of the compressed strips. macOS
+// measured no difference and Windows is unmeasured, so they keep the mapping.
+static TIFF* openReaderTiff(const char* fileName){
+#ifdef __linux__
+    return TIFFOpen(fileName, "rm");
+#else
+    return TIFFOpen(fileName, "r");
+#endif
 }
 
 // Backup method in case there are errors reading strips
@@ -305,21 +294,22 @@ uint8_t readTiffParallelBak(uint64_t x, uint64_t y, uint64_t z, const char* file
 }
 
 uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint8_t flipXY){
-    int32_t numWorkers = omp_get_max_threads();
-    int32_t batchSize = (z-1)/numWorkers+1;
     uint64_t bytes = bits/8;
+    // At most one thread per slice, so a short stack does not open the file
+    // once for every core.
+    const int32_t team = (int32_t)std::max<uint64_t>(1, std::min<uint64_t>((uint64_t)omp_get_max_threads(), z));
 
-    int32_t w;
     uint8_t errBak = 0;
     std::atomic<uint8_t> err{0};
     char errString[10000];
-    #pragma omp parallel for
-    for(w = 0; w < numWorkers; w++){
-
+    // Each thread opens the file once and reads whichever slices it is handed.
+    #pragma omp parallel num_threads(team)
+    {
+        const int32_t w = omp_get_thread_num();
         uint8_t outCounter = 0;
-        TiffPtr tif(TIFFOpen(fileName, "r"));   // RAII: TIFFClose on every exit path
+        TiffPtr tif(openReaderTiff(fileName));   // RAII: TIFFClose on every exit path
         while(!tif){
-            tif.reset(TIFFOpen(fileName, "r"));
+            tif.reset(openReaderTiff(fileName));
             if(outCounter == 3){
                 #pragma omp critical
                 {
@@ -334,12 +324,12 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
         // Samples per pixel (1=grayscale, 3=RGB, 4=RGBA). xs is the interleaved
         // row width in samples; xs==x when grayscale, so those paths are unchanged.
         uint16_t spp = 1;
-        TIFFGetFieldDefaulted(tif.get(), TIFFTAG_SAMPLESPERPIXEL, &spp);
+        if(tif) TIFFGetFieldDefaulted(tif.get(), TIFFTAG_SAMPLESPERPIXEL, &spp);
         const uint64_t samples = spp;
         const uint64_t xs = x * samples;
 
         // Tiled TIFFs store sub-rectangles instead of full-width strips.
-        const bool tiled = TIFFIsTiled(tif.get());
+        const bool tiled = tif && TIFFIsTiled(tif.get());
         uint32_t tw = 0, tl = 0;
         uint64_t tileBufBytes = 0, tilesAcross = 0, tilesDown = 0;
         if(tiled){
@@ -361,48 +351,47 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
             }
         }
 
-        // Tiled images run their own directory loop, leaving the strip loop below
-        // unchanged. This worker owns whole slices, so it reads every tile of each
-        // of its directories.
-        if(tiled){
-            int64_t failedDir = -1, failedTile = -1;
-            uint8_t terr = readTiledDirs(tif.get(), tiff, (int64_t)x, (int64_t)y, (int64_t)z,
-                                         (int64_t)bits, (int64_t)samples, (int64_t)tw, (int64_t)tl,
-                                         (int64_t)tilesAcross, (int64_t)tilesDown, (int64_t)startSlice,
-                                         startSlice+(w*batchSize), startSlice+((w+1)*batchSize),
-                                         flipXY, (int64_t)tileBufBytes, &failedDir, &failedTile);
-            if(terr){
-                #pragma omp critical
-                {
-                    // No errBak: the scanline fallback cannot read tiled images.
-                    err = 1;
-                    if(terr == 2) sprintf(errString,"Thread %d: TIFFSetDirectory(%ld) failed\n",w,(long)failedDir);
-                    else sprintf(errString,"Thread %d: Tile %ld cannot be read\n",w,(long)failedTile);
-                }
-            }
-            continue;
-        }
-
-        // Only the flip path needs an intermediate bounce buffer; the no-flip
-        // path decodes each strip directly into the output. new[] (not vector or
+        // One scratch buffer per thread, reused for every slice it reads. Tiles
+        // always decode into it; strips only on the flip path, since the no-flip
+        // path decodes each strip straight into the output. new[] (not vector or
         // make_unique) keeps it RAII-owned without zero-filling before the read.
         std::unique_ptr<uint8_t[]> buffer;
-        if(flipXY) buffer.reset(new uint8_t[xs*stripSize*bytes]);
-        for(int64_t dir = startSlice+(w*batchSize); dir < startSlice+((w+1)*batchSize); dir++){
-            if(dir>=z+startSlice || err) break;
+        if(tiled && tileBufBytes) buffer.reset(new uint8_t[tileBufBytes]);
+        else if(!tiled && flipXY) buffer.reset(new uint8_t[xs*stripSize*bytes]);
+
+        // Read one slice into its place in the output.
+        auto readOne = [&](int64_t dir){
+            if(err || !tif) return;
 
             uint8_t counter = 0;
-            while(!TIFFSetDirectory(tif.get(), (uint64_t)dir) && counter<3){
-                counter++;
-                if(counter == 3){
+            while(!TIFFSetDirectory(tif.get(), (uint64_t)dir)){
+                if(++counter == 3){
                     #pragma omp critical
                     {
                         err = 1;
                         sprintf(errString,"Thread %d: TIFFSetDirectory(%ld) failed\n",w,(long)dir);
                     }
+                    return;
                 }
             }
-            if(err) break;
+
+            if(tiled){
+                int64_t failedTile = -1;
+                if(readTilesInto(tif.get(), buffer.get(), (int64_t)tileBufBytes, tiff,
+                                 (int64_t)x, (int64_t)y, (int64_t)bits, (int64_t)samples,
+                                 (int64_t)tw, (int64_t)tl, (int64_t)tilesAcross,
+                                 0, (int64_t)(tilesAcross*tilesDown),
+                                 dir - (int64_t)startSlice, flipXY, &failedTile)){
+                    #pragma omp critical
+                    {
+                        // No errBak: the scanline fallback cannot read tiled images.
+                        err = 1;
+                        sprintf(errString,"Thread %d: Tile %ld cannot be read\n",w,(long)failedTile);
+                    }
+                }
+                return;
+            }
+
             for (int64_t i = 0; i*stripSize < y; i++)
             {
                 // No-flip: decode the strip straight into the output array (no
@@ -419,7 +408,7 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
                         err = 1;
                         sprintf(errString,"Thread %d: Strip %ld cannot be read\n",w,i);
                     }
-                    break;
+                    return;
                 }
                 if(!flipXY){
                     continue;
@@ -464,8 +453,29 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
                     }
                 }
             }
+        };
+
+        // On Linux, slices are handed out one at a time once there are more of
+        // them than threads, so a thread that runs slow does not hold up the
+        // whole read. Together with the unmapped reads (openReaderTiff), that
+        // cut read time by 21-34% on our benchmarks and by up to ~70% on stacks
+        // of small slices. With no more slices than threads each thread simply
+        // takes one. Elsewhere each thread keeps one contiguous
+        // block, as before: on macOS the one-at-a-time split was no faster, and
+        // with a memory-mapped file each thread's walk past the slices it skips
+        // costs more than the balancing saves.
+        if(z <= (uint64_t)team){
+            #pragma omp for schedule(static)
+            for(int64_t dir = (int64_t)startSlice; dir < (int64_t)(startSlice+z); dir++) readOne(dir);
         }
-        // bounce buffer auto-freed (unique_ptr); tif auto-closed (TiffPtr)
+        else{
+#ifdef __linux__
+            #pragma omp for schedule(dynamic, 1)
+#else
+            #pragma omp for schedule(static)
+#endif
+            for(int64_t dir = (int64_t)startSlice; dir < (int64_t)(startSlice+z); dir++) readOne(dir);
+        }
     }
     if(err){
         if(errBak) return readTiffParallelBak(x, y, z, fileName, tiff, bits, startSlice, flipXY);
@@ -596,13 +606,19 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
     // so start slice must also be 0. It also reads the strips as one contiguous
     // block straight off disk, which is not how tiled data is laid out.
     if(numWorkers > 1 || compressed > 1 || tiled){
-        #pragma omp parallel for
-        for(w = 0; w < numWorkers; w++){
+        // Only start as many workers as there are strips or tiles to read. A
+        // small image has just a few, and every extra worker opened the file
+        // and selected its directory for nothing.
+        const uint64_t workItems = tiled ? numTiles : stripsPerDir;
+        const uint64_t perWorker = tiled ? (uint64_t)tileBatch : (uint64_t)batchSize;
+        const int32_t activeWorkers = (int32_t)std::max<uint64_t>(1, std::min<uint64_t>((uint64_t)numWorkers, (workItems + perWorker - 1) / perWorker));
+        #pragma omp parallel for num_threads(activeWorkers)
+        for(w = 0; w < activeWorkers; w++){
     
             uint8_t outCounter = 0;
-            TIFF* tif = TIFFOpen(fileName, "r");
+            TIFF* tif = openReaderTiff(fileName);
             while(!tif){
-                tif = TIFFOpen(fileName, "r");
+                tif = openReaderTiff(fileName);
                 if(outCounter == 3){
                     #pragma omp critical
                     {
@@ -614,6 +630,7 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
                 outCounter++;
             }
     
+            if(!tif) continue;   // err is already set; never hand libtiff a null handle
             void* buffer = malloc(tiled ? tileBufBytes : xs*stripSize*bytes);
             uint8_t counter = 0;
             while(!TIFFSetDirectory(tif, startSlice) && counter<3){
