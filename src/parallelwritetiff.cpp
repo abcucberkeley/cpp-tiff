@@ -321,10 +321,10 @@ uint8_t writeJob(const WriteJob& j, const char* fileName, const char* mode, int 
         // in v1.6.2. Under Linux's automatic NUMA balancing, a thread that has
         // been running a while, like the caller, keeps marking the process's
         // memory so that the next touch of each page faults and may move the
-        // page. Writing from the caller took over a million such faults and
-        // half a million page moves for a 5 GB volume, 30-90% slower than
-        // v1.6.2 on two-socket machines. A new thread does not start marking
-        // during a write, and the waiting caller marks nothing.
+        // page. Writing a 5 GB volume from the caller took about 580,000 such
+        // faults and 290,000 page moves per write, 17-93% slower than v1.6.2
+        // on two-socket machines. A new thread does not start marking during a
+        // write, and the waiting caller marks nothing.
         err = std::async(std::launch::async, writeSlices, std::cref(j), fileName, mode, chunks.get(),
                          std::ref(writerChunk), std::ref(failed), true, (uint8_t*)NULL, &pool).get();
     }
