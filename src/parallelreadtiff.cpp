@@ -1082,6 +1082,8 @@ void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t fl
 	TIFFGetFieldDefaulted(tif, TIFFTAG_PLANARCONFIG, &planar);
 	uint64_t samples = spp;   // 1=grayscale, 3=RGB, 4=RGBA
 	const bool tiled = TIFFIsTiled(tif);
+	uint16_t compression = COMPRESSION_NONE;
+	TIFFGetFieldDefaulted(tif, TIFFTAG_COMPRESSION, &compression);
 	TIFFClose(tif);
 
 	// Planar (separate-plane) multi-sample TIFFs are not supported yet; reject
@@ -1121,9 +1123,25 @@ void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t fl
 		tiff = malloc(x*y*z*samples*(bits/8));
 		if(!tiff) return NULL;
 	}
-	uint8_t err;
+	// A stack of a few large slices with many strips each (two 4096 x 4096
+	// planes, say) left most threads idle in the 3D reader, which gives each
+	// slice one thread: LZW took 108 ms against 28 ms read slice by slice with
+	// every thread. Each slice read that way has a fixed cost, since every
+	// thread opens the file and walks to the slice, so this is only for large
+	// slices (4 MB, or 16 MB uncompressed, where reading is only a copy) near
+	// the start of the file.
+	const uint64_t sliceStrips = (y + stripSize - 1) / std::max<uint64_t>(1, stripSize);
+	const uint64_t sliceBytesAll = x*y*samples*(bits/8);
+	const bool sliceBySlice = !imageJIm && !tiled && z > 1 && startSlice + z <= 64
+	                          && sliceBytesAll >= (compression == COMPRESSION_NONE ? (uint64_t)16 << 20 : (uint64_t)4 << 20)
+	                          && 2*z <= std::min<uint64_t>((uint64_t)omp_get_max_threads(), sliceStrips);
+	uint8_t err = 0;
 	if(imageJIm)    err = readTiffParallelImageJ(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY);
 	else if(z <= 1) err = readTiffParallel2D(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY);
+	else if(sliceBySlice){
+		for(uint64_t s = 0; s < z && !err; s++)
+			err = readTiffParallel2D(x,y,1,fileName, static_cast<uint8_t*>(tiff) + s*sliceBytesAll, bits, startSlice + s, stripSize, flipXY);
+	}
 	else            err = readTiffParallel(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY);
 	// A failed read leaves part of the buffer unwritten, so report it instead of
 	// returning partial data. The reader has already printed why.

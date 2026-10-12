@@ -263,6 +263,28 @@ static std::vector<uint8_t> readFileBytes(const std::string& path){
     return v;
 }
 
+// RowsPerStrip of a file's first directory, read from the bytes (0 if absent),
+// so the test needs no libtiff headers. Little-endian TIFF or BigTIFF.
+static uint64_t firstRowsPerStrip(const std::vector<uint8_t>& f){
+    auto u = [&](uint64_t off, int n){
+        uint64_t v = 0;
+        for(int i = n - 1; i >= 0; i--) v = (v << 8) | f[off + i];
+        return v;
+    };
+    if(f.size() < 16 || f[0] != 'I' || f[1] != 'I') return 0;
+    const bool big = u(2, 2) == 43;
+    const uint64_t ifd = big ? u(8, 8) : u(4, 4);
+    if(ifd + 8 > f.size()) return 0;
+    const uint64_t n = big ? u(ifd, 8) : u(ifd, 2), size = big ? 20 : 12, first = ifd + (big ? 8 : 2);
+    for(uint64_t e = 0; e < n && first + (e + 1)*size <= f.size(); e++){
+        const uint64_t p = first + e*size;
+        if(u(p, 2) != 278) continue;
+        const uint64_t type = u(p + 2, 2), val = p + (big ? 12 : 8);
+        return type == 3 ? u(val, 2) : type == 4 ? u(val, 4) : type == 16 ? u(val, 8) : 0;
+    }
+    return 0;
+}
+
 // Column-major MATLAB layout (y, x[, c], z) of a chunky row-major source.
 static std::vector<uint8_t> flipped(const uint8_t* src, uint64_t x, uint64_t y, uint64_t z,
                                     uint64_t spp, uint64_t es){
@@ -722,6 +744,93 @@ int main(int argc, char** argv){
             if(ok) std::printf("PASS  %-14s writer layouts\n", c.name);
             else { std::printf("FAIL  %-14s writer layouts  (files differ or read back wrong)\n", c.name); failures++; }
         }
+    }
+
+    // ---- Automatic strip size (strip size 0, what the Python and MATLAB writers
+    // pass). 2D images and short stacks get smaller strips so more threads can
+    // compress them; tall stacks keep 512 rows. Only the image size decides, so
+    // one thread and many must give the same file, and it must read back.
+    {
+        struct AS { const char* name; uint64_t x, y, z, bits; const char* comp; uint64_t rows; };
+        const AS cases[] = {
+            {"auto-2d",    2048, 2048,   1, 16, "lzw",   16},   // 8 rows would give 256 strips; 64 KB minimum
+            {"auto-short", 2000, 1500,   3, 16, "zstd",  18},   // 86 strips per slice
+            {"auto-tall",   256,  700, 260,  8, "none", 512},   // already enough strips
+        };
+        std::mt19937 arng(77u);
+        const int prevThreads = omp_get_max_threads();
+        for(const AS& c : cases){
+            total++;
+            const uint64_t es = c.bits/8;
+            std::vector<uint8_t> src(c.x*c.y*c.z*es);
+            for(auto& v8 : src) v8 = (uint8_t)(arng() & 0x3F);
+            const std::string pa = dir + "/" + c.name + "_n.tif", pb = dir + "/" + c.name + "_1.tif";
+            step(c.name, "automatic strips", "strip size 0 at full and one thread, read back both ways");
+            bool ok = !writeTiffParallelWrapper(c.x, c.y, c.z, pa.c_str(), src.data(), c.bits, 0, 0, "w", false, std::string(c.comp), 1, 0);
+            omp_set_num_threads(1);
+            ok = ok && !writeTiffParallelWrapper(c.x, c.y, c.z, pb.c_str(), src.data(), c.bits, 0, 0, "w", false, std::string(c.comp), 1, 0);
+            omp_set_num_threads(prevThreads);
+            const std::vector<uint8_t> fa = readFileBytes(pa), fb = readFileBytes(pb);
+            const uint64_t rows = firstRowsPerStrip(fa);
+            ok = ok && !fa.empty() && fa == fb && rows == c.rows;
+            void* back = ok ? readTiffParallelWrapperNoXYFlip(pa.c_str(), {}) : nullptr;
+            ok = ok && back && std::memcmp(back, src.data(), src.size()) == 0;
+            free(back);
+            if(ok){
+                const std::vector<uint8_t> cm = flipped(src.data(), c.x, c.y, c.z, 1, es);
+                void* fl = readTiffParallelWrapper(pa.c_str());
+                ok = fl && std::memcmp(fl, cm.data(), cm.size()) == 0;
+                free(fl);
+            }
+            std::remove(pa.c_str()); std::remove(pb.c_str());
+            if(ok) std::printf("PASS  %-14s automatic strips (%llu rows)\n", c.name, (unsigned long long)rows);
+            else { std::printf("FAIL  %-14s automatic strips  (%llu rows per strip, expected %llu; or the files differ or read back wrong)\n",
+                               c.name, (unsigned long long)rows, (unsigned long long)c.rows); failures++; }
+        }
+    }
+
+    // ---- Short stacks (a few slices with many strips each) are read slice by
+    // slice with every thread instead of one thread per slice. Grayscale stacks
+    // written by the library, an RGB fixture, and a z-range must match the
+    // source in both layouts.
+    {
+        const int prevThreads = omp_get_max_threads();
+        omp_set_num_threads(8);   // 2 x slices <= threads, so the slice-by-slice path is taken
+        struct SS { const char* name; uint64_t x, y, z, spp, bits; const char* comp; };
+        // Slices must be at least 4 MB (16 MB uncompressed) to be read this way.
+        const SS cases[] = {
+            {"short-u16-lzw",  2048, 1024, 3, 1, 16, "lzw"},
+            {"short-u8-none",  4096, 4096, 3, 1,  8, "none"},
+            {"short-rgb",      2400, 2400, 2, 3,  8, nullptr},   // fixture, one strip per page split by libtiff
+        };
+        std::mt19937 srng(31u);
+        for(const SS& c : cases){
+            total++;
+            const uint64_t es = c.bits/8, slice = c.x*c.y*c.spp*es;
+            std::vector<uint8_t> src(slice*c.z);
+            for(auto& v8 : src) v8 = (uint8_t)srng();
+            const std::string path = dir + "/" + c.name + ".tif";
+            step(c.name, "short stacks", "read slice by slice in both layouts and a z-range");
+            bool ok = c.comp ? !writeTiffParallelWrapper(c.x, c.y, c.z, path.c_str(), src.data(), c.bits, 0, 64, "w", false, std::string(c.comp), 1, 0)
+                             : writePlainTiff(path, src.data(), c.x, c.y, c.z, c.spp, c.bits);
+            void* rm = ok ? readTiffParallelWrapperNoXYFlip(path.c_str(), {}) : nullptr;
+            ok = ok && rm && std::memcmp(rm, src.data(), src.size()) == 0;
+            free(rm);
+            void* fl = ok ? readTiffParallelWrapper(path.c_str()) : nullptr;
+            if(fl){
+                const std::vector<uint8_t> cm = flipped(src.data(), c.x, c.y, c.z, c.spp, es);
+                ok = std::memcmp(fl, cm.data(), cm.size()) == 0;
+            }
+            else ok = false;
+            free(fl);
+            void* part = ok ? readTiffParallelWrapperNoXYFlip(path.c_str(), {1, c.z}) : nullptr;
+            ok = ok && part && std::memcmp(part, src.data() + slice, slice*(c.z - 1)) == 0;
+            free(part);
+            std::remove(path.c_str());
+            if(ok) std::printf("PASS  %-14s short stacks\n", c.name);
+            else { std::printf("FAIL  %-14s short stacks  (read back wrong)\n", c.name); failures++; }
+        }
+        omp_set_num_threads(prevThreads);
     }
 
     // ---- Write failures must be reported instead of leaving a broken file and

@@ -121,7 +121,8 @@ void mexFunction(int nlhs, mxArray *plhs[],
         mexErrMsgIdAndTxt("tiff:dataTypeError","Data type not suppported");
     }
 
-    uint64_t stripSize = 512;
+    // 0 lets the writer choose the rows per strip from the image size.
+    uint64_t stripSize = 0;
     void* data = mxGetData(prhs[1]);
     uint8_t err = writeTiffParallelWrapper(x,y,z,fileName,data,bits,startSlice,stripSize,mode,true,compression,sampleFormat,tileSize);
 

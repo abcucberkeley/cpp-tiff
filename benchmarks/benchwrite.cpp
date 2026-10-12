@@ -119,6 +119,7 @@ void usage(const char* prog) {
         "  --csv <path>         CSV file to append results to (default: benchWriteResults.csv)\n"
         "  --compression <s>    lzw (default), zstd, or none\n"
         "  --transpose          Write the MATLAB column-major path (transpose=true)\n"
+        "  --stripsize <n>      Rows per strip (default: 0, chosen from the image size)\n"
         "  --fsync              fsync the output to disk inside the timed region\n"
         "  --no-csv             Console output only\n"
         "  --verify             Round-trip: read the written file back and check its\n"
@@ -136,7 +137,7 @@ int main(int argc, char* argv[]) {
     std::string csvPath = "benchWriteResults.csv";
     std::string compression = "lzw";
     int iters = 3, warmup = 1;
-    uint64_t stripSize = 512;
+    uint64_t stripSize = 0;   // chosen from the image size, like the Python and MATLAB writers
     bool writeCsv = true, verify = false, transpose = false, doFsync = false;
 
     for (int i = 1; i < argc; i++) {

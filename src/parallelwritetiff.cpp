@@ -16,6 +16,10 @@
 #ifndef _WIN32
 #include <unistd.h>
 #endif
+#ifdef __linux__
+#include <sched.h>
+#include <sys/syscall.h>
+#endif
 #include "tiffio.h"
 #include "lzwencode.h"
 #include "helperfunctions.h"
@@ -288,6 +292,46 @@ uint8_t writeSlices(const WriteJob& j, const char* fileName, const char* mode, C
     return err;
 }
 
+#ifdef __linux__
+// The CPUs of the NUMA node holding most of [p, p + bytes), limited to those
+// this thread may run on. Samples 64 pages. False when that cannot be told or
+// would not narrow anything (a single node), and then nothing is pinned.
+bool dataNodeCpus(const uint8_t* p, uint64_t bytes, cpu_set_t& cpus){
+    int counts[64] = {0};
+    int seen = 0;
+    for(int i = 0; i < 64 && bytes; i++){
+        int node = -1;
+        // get_mempolicy(MPOL_F_NODE | MPOL_F_ADDR): the node of the page at an address.
+        if(syscall(SYS_get_mempolicy, &node, NULL, 0UL, (void*)(p + bytes/64*i), 3UL) == 0 && node >= 0 && node < 64){
+            counts[node]++;
+            seen++;
+        }
+    }
+    if(!seen) return false;
+    char path[64];
+    snprintf(path, sizeof path, "/sys/devices/system/node/node%d/cpulist", (int)(std::max_element(counts, counts + 64) - counts));
+    FILE* f = fopen(path, "r");
+    if(!f) return false;
+    char list[4096];
+    const size_t n = fread(list, 1, sizeof list - 1, f);
+    fclose(f);
+    list[n] = 0;
+    CPU_ZERO(&cpus);
+    for(char* s = list; *s >= '0' && *s <= '9';){   // e.g. "0-23,48-71"
+        char* e;
+        const long a = strtol(s, &e, 10);
+        long b = a;
+        if(*e == '-') b = strtol(e + 1, &e, 10);
+        for(long c = a; c <= b && c < CPU_SETSIZE; c++) CPU_SET((int)c, &cpus);
+        s = (*e == ',') ? e + 1 : e;
+    }
+    cpu_set_t allowed;
+    if(sched_getaffinity(0, sizeof allowed, &allowed) != 0) return false;
+    CPU_AND(&cpus, &cpus, &allowed);
+    return CPU_COUNT(&cpus) > 0 && !CPU_EQUAL(&cpus, &allowed);
+}
+#endif
+
 // Write a whole job. Strips and tiles are prepared (transposed, gathered and/or
 // compressed) by `threads` threads, handed out one at a time in file order,
 // while a separate writer thread writes them in order as they become ready.
@@ -325,8 +369,19 @@ uint8_t writeJob(const WriteJob& j, const char* fileName, const char* mode, int 
         // faults and 290,000 page moves per write, 17-93% slower than v1.6.2
         // on two-socket machines. A new thread does not start marking during a
         // write, and the waiting caller marks nothing.
-        err = std::async(std::launch::async, writeSlices, std::cref(j), fileName, mode, chunks.get(),
-                         std::ref(writerChunk), std::ref(failed), true, (uint8_t*)NULL, &pool).get();
+        // On Linux that thread also stays on the NUMA node holding most of the
+        // data: left to the scheduler, it landed on the other socket of a
+        // 24-core node and a 3.7 GB write took 22% longer.
+#ifdef __linux__
+        cpu_set_t cpus;
+        const bool pin = dataNodeCpus(j.data, j.sliceBytes()*j.nSlices, cpus);
+#endif
+        err = std::async(std::launch::async, [&]{
+#ifdef __linux__
+            if(pin) sched_setaffinity(0, sizeof cpus, &cpus);
+#endif
+            return writeSlices(j, fileName, mode, chunks.get(), writerChunk, failed, true, (uint8_t*)NULL, &pool);
+        }).get();
     }
     else{
         std::future<uint8_t> writer = std::async(std::launch::async, writeSlices, std::cref(j), fileName, mode,
@@ -364,8 +419,24 @@ uint8_t writeJob(const WriteJob& j, const char* fileName, const char* mode, int 
     return err;
 }
 
+// Rows per strip when the caller passes 0. Each strip is compressed by one
+// thread, so 512-row strips left most cores idle on a 2D image (16 strips
+// for 8k x 8k). So strips stay at 512 rows unless the write would have fewer
+// than 256 in all, and then shrink toward 256, but never below 64 KB. Only
+// the image size decides, so the same data gives the same file on any machine
+// and thread count.
+uint64_t autoStripRows(uint64_t x, uint64_t y, uint64_t nSlices, uint64_t bytes){
+    const uint64_t kRows = 512, kStrips = 256, kMinBytes = (uint64_t)64 << 10;
+    const uint64_t slices = std::max<uint64_t>(nSlices, 1);
+    const uint64_t perSlice = (kStrips + slices - 1) / slices;
+    const uint64_t rowBytes = std::max<uint64_t>(x*bytes, 1);
+    const uint64_t rows = std::max((y + perSlice - 1) / perSlice, (kMinBytes + rowBytes - 1) / rowBytes);
+    return std::max<uint64_t>(1, std::min(rows, kRows));
+}
+
 // Fill in a job from the public functions' arguments. Slices [startSlice, z)
-// are written, taken from the start of data.
+// are written, taken from the start of data. A stripSize of 0 picks the rows
+// per strip automatically (autoStripRows).
 uint8_t makeJob(WriteJob& j, uint64_t x, uint64_t y, uint64_t z, const void* data, uint64_t bits, uint64_t startSlice,
                 uint64_t stripSize, bool transpose, const std::string& compression, uint16_t sampleFormat, uint64_t tileSize){
     if(bits != 8 && bits != 16 && bits != 32 && bits != 64){
@@ -377,12 +448,9 @@ uint8_t makeJob(WriteJob& j, uint64_t x, uint64_t y, uint64_t z, const void* dat
         printf("Error: tile size %llu is not a multiple of 16\n",(unsigned long long)tileSize);
         return 1;
     }
-    if(!tileSize && !stripSize){
-        printf("Error: strip size must be at least 1 row\n");
-        return 1;
-    }
     j.x = x; j.y = y; j.bits = bits; j.bytes = bits/8;
     j.nSlices = z > startSlice ? z - startSlice : 0;
+    if(!tileSize && !stripSize) stripSize = autoStripRows(x, y, j.nSlices, j.bytes);
     j.stripSize = stripSize; j.tileSize = tileSize;
     j.tilesAcross = tileSize ? (x + tileSize - 1)/tileSize : 0;
     j.tilesDown = tileSize ? (y + tileSize - 1)/tileSize : 0;
@@ -451,7 +519,8 @@ uint8_t writeTiffParallelHelper(const char* fileName, const void* tiffOld, uint6
 		z = 1;
 	}
 
-	uint64_t stripSize = 512;
+	// 0 lets the writer choose the rows per strip from the image size.
+	uint64_t stripSize = 0;
 
     return writeTiffParallelWrapper(x, y, z, fileName, tiffOld, bits, startSlice, stripSize, mode, transpose, compression, sampleFormat, tileSize);
 }
