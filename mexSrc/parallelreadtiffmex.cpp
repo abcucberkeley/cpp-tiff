@@ -88,6 +88,8 @@ void mexFunction(int nlhs, mxArray *plhs[],
     uint32_t rowsPerStrip = 0;
     TIFFGetFieldDefaulted(tif, TIFFTAG_ROWSPERSTRIP, &rowsPerStrip);
     uint64_t stripSize = rowsPerStrip;
+    uint16_t compression = COMPRESSION_NONE;
+    TIFFGetFieldDefaulted(tif, TIFFTAG_COMPRESSION, &compression);
     TIFFClose(tif);
 
     uint64_t samples = spp;
@@ -117,6 +119,6 @@ void mexFunction(int nlhs, mxArray *plhs[],
     uint8_t err = 0;
     if(imageJIm)    err = readTiffParallelImageJ(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY);
     else if(z <= 1) err = readTiffParallel2D(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY);
-    else            err = readTiffParallel(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY);
+    else            err = readTiffParallel(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY, compression);
     if(err) mexErrMsgIdAndTxt("tiff:tiffError","An Error occured within the read function");
 }

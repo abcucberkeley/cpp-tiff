@@ -906,6 +906,53 @@ int main(int argc, char** argv){
         omp_set_num_threads(prevThreads);
     }
 
+    // ---- Pieces of slices. A compressed stack of large slices with fewer than
+    // 8 slices per thread is read in pieces of whole strips (or tiles) handed
+    // out to the threads; every piece must land in its place, for strips,
+    // tiles, color and planar color, whole stacks and z-ranges. With 11 strips
+    // per slice the pieces differ in size (6 + 5 strips on 5 threads).
+    {
+        struct PC { const char* name; uint64_t x, y, z, spp; const char* comp; uint64_t strip, tile; bool planar; };
+        const PC pcs[] = {
+            {"pc-lzw-strips", 1024, 1024, 7, 1, "lzw",   64,   0, false},
+            {"pc-lzw-11",     1024, 1100, 7, 1, "lzw",  100,   0, false},   // unequal pieces
+            {"pc-zstd-tiles", 1040, 1000, 7, 1, "zstd",   0, 128, false},   // ragged tiles
+            {"pc-rgb-lzw",    1024,  600, 5, 3, "lzw",   50,   0, false},
+            {"pc-planar-lzw", 1024,  600, 5, 3, "lzw",   40,   0, true},
+        };
+        std::mt19937 qrng(2468u);
+        const int prevThreads = omp_get_max_threads();
+        for(const PC& c : pcs){
+            total++;
+            const uint64_t slice = c.x*c.y*c.spp*2;   // 16-bit
+            std::vector<uint8_t> src(slice*c.z);
+            for(uint64_t i = 0; i < src.size(); i++) src[i] = (uint8_t)(qrng() & 0x3F);
+            const std::string path = dir + "/" + c.name + ".tif";
+            step(c.name, "slice pieces", "write fixture");
+            bool ok = c.planar ? writeLibtiff(path, src.data(), c.x, c.y, c.z, c.spp, 16, 1, COMPRESSION_LZW, (uint32_t)c.strip, 0, true)
+                               : !writeTiffParallelWrapper(c.x, c.y, c.z, path.c_str(), src.data(), 16, 0, c.strip, "w", false, std::string(c.comp), 1, c.tile, c.spp);
+            struct Read { std::vector<uint64_t> range; uint64_t first, count; };
+            const Read reads[] = {{{}, 0, c.z}, {{1, c.z - 1}, 1, c.z - 2}, {{2, c.z}, 2, c.z - 2}};
+            for(int t : {2, 3, 5, 6, 8}){
+                omp_set_num_threads(t);
+                step(c.name, "slice pieces", "full and z-range reads, both layouts");
+                for(const Read& r : reads){
+                    if(!ok) break;
+                    const uint8_t* want = src.data() + r.first*slice;
+                    const std::vector<uint8_t> wantFlip = flipped(want, c.x, c.y, r.count, c.spp, 2);
+                    void* nf = readTiffParallelWrapperNoXYFlip(path.c_str(), r.range);
+                    void* fl = readTiffParallelWrapper(path.c_str(), r.range);
+                    ok = nf && fl && std::memcmp(nf, want, r.count*slice) == 0 && std::memcmp(fl, wantFlip.data(), wantFlip.size()) == 0;
+                    free(nf); free(fl);
+                }
+            }
+            omp_set_num_threads(prevThreads);
+            std::remove(path.c_str());
+            if(ok) std::printf("PASS  %-16s slice pieces\n", c.name);
+            else { std::printf("FAIL  %-16s slice pieces  (read back wrong)\n", c.name); failures++; }
+        }
+    }
+
     // ---- Color writes: RGB (3 samples) and RGBA (4), each pixel's samples
     // together (chunky). Row-major (z, y, x, c) and MATLAB-layout (y, x, c, z)
     // input must give the same file, as must one thread, and the file must read

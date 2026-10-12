@@ -14,6 +14,10 @@
 #include <thread>
 #include <omp.h>
 #ifndef _WIN32
+#include <fcntl.h>
+#include <limits.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #endif
 #ifdef __linux__
@@ -260,21 +264,268 @@ bool produceChunk(const WriteJob& j, uint64_t s, uint64_t c, Chunk* chunks, uint
     return true;
 }
 
+#ifndef _WIN32
+// File I/O for libtiff that batches writes (Linux and macOS). libtiff writes
+// each strip with a seek and a write, and each directory with about ten small
+// seeks, reads and writes (it reads the previous directory back to link the
+// new one to it): about 25 calls per slice of an uncompressed stack, where
+// tifffile writes the whole stack in a few. Here writes are queued in file
+// order and sent with pwritev (writev elsewhere): small ones are copied, large
+// ones from the caller's own array (stable) are queued by address, and large
+// ones from buffers that are about to be reused are sent at once together with
+// the queue. Seeks, and reads of queued data or of the small writes sent last,
+// are answered from memory. Uncompressed writes of 500-slice stacks became
+// 1-4% faster to RAM and local disk, with identical files.
+class BatchedFile {
+public:
+    explicit BatchedFile(bool stable) : stable_(stable) {}
+    ~BatchedFile(){ if(fd_ >= 0) ::close(fd_); }
+    bool open(const char* fileName, bool append){
+        fd_ = ::open(fileName, O_RDWR | O_CREAT | (append ? 0 : O_TRUNC), 0666);
+        struct stat st;
+        if(fd_ < 0 || fstat(fd_, &st) != 0) return false;
+        base_ = end_ = (uint64_t)st.st_size;
+        return true;
+    }
+    bool failed() const { return failed_; }
+
+    tmsize_t write(const void* data, tmsize_t size){
+        if(size <= 0) return size;
+        const uint8_t* src = static_cast<const uint8_t*>(data);
+        uint64_t n = (uint64_t)size;
+        // Into data already sent: libtiff links each directory to the one
+        // before it, which may have gone out with the last batch.
+        if(pos_ < base_){
+            const uint64_t k = std::min<uint64_t>(n, base_ - pos_);
+            if(!sendAt(src, k, pos_)) return -1;
+            patchSent(pos_, src, k);
+            pos_ += k; src += k; n -= k;
+        }
+        // Into the queue (directory entries written before the data they point to).
+        while(n && pos_ < end_){
+            const Seg& sg = segFor(pos_);
+            if(sg.ext){   // libtiff does not rewrite strip data, but stay correct if it does
+                if(!flush() || !sendAt(src, n, pos_)) return -1;
+                pos_ += n;
+                return size;
+            }
+            const uint64_t k = std::min<uint64_t>(n, sg.off + sg.len - pos_);
+            memcpy(&small_[sg.at + (pos_ - sg.off)], src, (size_t)k);
+            pos_ += k; src += k; n -= k;
+        }
+        if(!n) return size;
+        // Past the end, after a gap that libtiff fills in later.
+        if(pos_ > end_) appendSmall(NULL, pos_ - end_);
+        if(n >= kLarge && stable_){
+            segs_.push_back(Seg{end_, n, src, 0});
+            end_ += n;
+            queued_ += n;
+        }
+        else if(n >= kLarge){
+            Seg sg{end_, n, src, 0};
+            if(!send(&sg)) return -1;
+        }
+        else appendSmall(src, n);
+        pos_ += n;
+        if((queued_ >= kBatchBytes || segs_.size() >= kMaxSegs) && !flush()) return -1;
+        return size;
+    }
+
+    tmsize_t read(void* data, tmsize_t size){
+        uint8_t* dst = static_cast<uint8_t*>(data);
+        uint64_t got = 0;
+        while(got < (uint64_t)size && pos_ + got < end_){
+            const uint64_t p = pos_ + got, want = (uint64_t)size - got;
+            if(p >= base_){
+                const Seg& sg = segFor(p);
+                const uint64_t k = std::min<uint64_t>(want, sg.off + sg.len - p);
+                memcpy(dst + got, sg.ext ? sg.ext + (p - sg.off) : &small_[sg.at + (p - sg.off)], (size_t)k);
+                got += k;
+                continue;
+            }
+            const Seg* r = sentFor(p);
+            if(r){
+                const uint64_t k = std::min<uint64_t>(want, r->off + r->len - p);
+                memcpy(dst + got, &sent_[r->at + (p - r->off)], (size_t)k);
+                got += k;
+                continue;
+            }
+            const ssize_t k = pread(fd_, dst + got, (size_t)std::min<uint64_t>(want, base_ - p), (off_t)p);
+            if(k <= 0) break;
+            got += (uint64_t)k;
+        }
+        pos_ += got;
+        return (tmsize_t)got;
+    }
+
+    toff_t seek(toff_t off, int whence){
+        pos_ = whence == SEEK_SET ? off : whence == SEEK_CUR ? pos_ + off : end_ + off;
+        return pos_;
+    }
+    toff_t size() const { return end_; }
+
+    // Sends the queue and closes the file. NFS can accept every write and only
+    // report a failure (such as a full quota) at close, so that counts too.
+    int close(){
+        const bool ok = flush();
+        const int r = fd_ >= 0 ? ::close(fd_) : 0;
+        fd_ = -1;
+        if(!ok || r != 0) failed_ = true;
+        return failed_ ? -1 : 0;
+    }
+
+    bool flush(){ return send(NULL); }
+
+private:
+    // A run of bytes at file offset off: borrowed from the caller (ext), or
+    // copied into small_ (or, once sent, sent_) at offset at.
+    struct Seg { uint64_t off, len; const uint8_t* ext; uint64_t at; };
+    static const uint64_t kLarge = (uint64_t)64 << 10, kBatchBytes = (uint64_t)64 << 20;
+    static const size_t kMaxSegs = 512;
+
+    const Seg& segFor(uint64_t p) const {
+        size_t lo = 0, hi = segs_.size();   // last segment starting at or before p
+        while(hi - lo > 1){ const size_t mid = (lo + hi)/2; if(segs_[mid].off <= p) lo = mid; else hi = mid; }
+        return segs_[lo];
+    }
+    const Seg* sentFor(uint64_t p) const {
+        for(const Seg& s : sentSegs_) if(p >= s.off && p < s.off + s.len) return &s;
+        return NULL;
+    }
+    void patchSent(uint64_t p, const uint8_t* src, uint64_t n){
+        for(const Seg& s : sentSegs_){
+            const uint64_t a = std::max(p, s.off), b = std::min(p + n, s.off + s.len);
+            if(a < b) memcpy(&sent_[s.at + (a - s.off)], src + (a - p), (size_t)(b - a));
+        }
+    }
+    // Copy n bytes (zeros when src is NULL) to the end of the queue.
+    void appendSmall(const uint8_t* src, uint64_t n){
+        if(segs_.empty() || segs_.back().ext || segs_.back().at + segs_.back().len != small_.size())
+            segs_.push_back(Seg{end_, 0, NULL, small_.size()});
+        if(src) small_.insert(small_.end(), src, src + n);
+        else small_.insert(small_.end(), (size_t)n, (uint8_t)0);
+        segs_.back().len += n;
+        end_ += n;
+        queued_ += n;
+    }
+    bool sendAt(const uint8_t* src, uint64_t n, uint64_t off){
+        while(n){
+            const ssize_t k = pwrite(fd_, src, (size_t)n, (off_t)off);
+            if(k <= 0){ failed_ = true; return false; }
+            src += k; n -= (uint64_t)k; off += (uint64_t)k;
+        }
+        return true;
+    }
+    // Send the queue, followed by extra (a large write that cannot wait) if any.
+    bool send(const Seg* extra){
+        if(failed_) return false;
+        std::vector<struct iovec> iov;
+        iov.reserve(segs_.size() + 1);
+        for(const Seg& s : segs_)
+            iov.push_back(iovec{const_cast<uint8_t*>(s.ext ? s.ext : &small_[s.at]), (size_t)s.len});
+        if(extra) iov.push_back(iovec{const_cast<uint8_t*>(extra->ext), (size_t)extra->len});
+        size_t i = 0;
+        const size_t iovMax = kIovMax;
+        uint64_t off = base_;
+#ifndef __linux__
+        if(!iov.empty() && lseek(fd_, (off_t)off, SEEK_SET) != (off_t)off){ failed_ = true; return false; }
+#endif
+        while(i < iov.size()){
+            const int cnt = (int)std::min<size_t>(iov.size() - i, iovMax);
+#ifdef __linux__
+            const ssize_t k = pwritev(fd_, &iov[i], cnt, (off_t)off);
+#else
+            const ssize_t k = writev(fd_, &iov[i], cnt);
+#endif
+            if(k <= 0){ failed_ = true; return false; }
+            off += (uint64_t)k;
+            uint64_t left = (uint64_t)k;   // skip what was written, resume mid-vector after a short write
+            while(i < iov.size() && left >= iov[i].iov_len){ left -= iov[i].iov_len; i++; }
+            if(i < iov.size() && left){ iov[i].iov_base = static_cast<uint8_t*>(iov[i].iov_base) + left; iov[i].iov_len -= left; }
+        }
+        // Keep the small writes just sent: libtiff reads the last directory
+        // back. A batch of strips alone leaves the previous ones in place.
+        bool small = false;
+        for(const Seg& s : segs_) small = small || !s.ext;
+        if(small){
+            sent_.swap(small_);
+            sentSegs_.clear();
+            for(const Seg& s : segs_) if(!s.ext) sentSegs_.push_back(s);
+        }
+        small_.clear();
+        segs_.clear();
+        if(extra) end_ += extra->len;
+        base_ = end_;
+        queued_ = 0;
+        return true;
+    }
+
+    static const size_t kIovMax =
+#ifdef IOV_MAX
+        IOV_MAX;
+#else
+        16;
+#endif
+    int fd_ = -1;
+    bool stable_, failed_ = false;
+    uint64_t pos_ = 0, base_ = 0, end_ = 0, queued_ = 0;   // file [base_, end_) is queued
+    std::vector<Seg> segs_, sentSegs_;
+    std::vector<uint8_t> small_, sent_;
+};
+
+tmsize_t bfRead(thandle_t h, void* p, tmsize_t n){ return static_cast<BatchedFile*>(h)->read(p, n); }
+tmsize_t bfWrite(thandle_t h, void* p, tmsize_t n){ return static_cast<BatchedFile*>(h)->write(p, n); }
+toff_t bfSeek(thandle_t h, toff_t off, int whence){ return static_cast<BatchedFile*>(h)->seek(off, whence); }
+int bfClose(thandle_t h){ return static_cast<BatchedFile*>(h)->close(); }
+toff_t bfSize(thandle_t h){ return static_cast<BatchedFile*>(h)->size(); }
+int bfMap(thandle_t, void**, toff_t*){ return 0; }
+void bfUnmap(thandle_t, void*, toff_t){}
+#endif
+
+// Hands out the chunks to prepare, in file order. A producer takes the next
+// one and waits while it is too far ahead of the writer. The writer, when the
+// chunk it needs next is not ready yet, takes one within the window and
+// prepares it itself instead of waiting, as long as at least `reserve` chunks
+// are left for the producers: one taken near the end kept it from writing the
+// last chunks for as long as compressing it took (up to tens of ms for large
+// LZW strips).
+struct ChunkClaims {
+    std::atomic<int64_t> next{0};
+    int64_t total = 0, window = 0, reserve = 0;
+    uint8_t* writerScratch = nullptr;
+    // A chunk the writer, at chunk `at`, may prepare now, or -1.
+    int64_t forWriter(int64_t at){
+        int64_t k = next.load();
+        while(k < total - reserve && k < at + window)
+            if(next.compare_exchange_weak(k, k + 1)) return k;
+        return -1;
+    }
+};
+
 // Write every slice in order: tags, its chunks (waiting for producers unless
 // produceInline, where this thread makes each chunk just before writing it),
-// then its directory. writerChunk tells producers how far the writer is.
+// then its directory. writerChunk tells producers how far the writer is;
+// while it waits, the writer prepares chunks from claims, if given.
 // Returns 0 on success.
 uint8_t writeSlices(const WriteJob& j, const char* fileName, const char* mode, Chunk* chunks,
                     std::atomic<int64_t>& writerChunk, std::atomic<bool>& failed,
-                    bool produceInline, uint8_t* scratch, BufferPool* pool){
-    TIFF* tif = NULL;
-    if(!strcmp(mode,"w")) tif = TIFFOpen(fileName, "w8");
-    else if(!strcmp(mode,"a")) tif = TIFFOpen(fileName, "a8");
-    else{
+                    bool produceInline, uint8_t* scratch, BufferPool* pool, ChunkClaims* claims){
+    if(strcmp(mode,"w") && strcmp(mode,"a")){
         printf("Error: mode \"%s\" is not supported. Use w or a for mode type\n", mode);
         failed = true;
         return 1;
     }
+    const bool append = !strcmp(mode,"a");
+    TIFF* tif = NULL;
+#ifndef _WIN32
+    // Uncompressed row-major strips come straight from the caller's array,
+    // which outlives the write, so they can wait in the queue.
+    BatchedFile io(j.direct());
+    if(io.open(fileName, append))
+        tif = TIFFClientOpen(fileName, append ? "a8" : "w8", (thandle_t)&io, bfRead, bfWrite, bfSeek, bfClose, bfSize, bfMap, bfUnmap);
+#else
+    tif = TIFFOpen(fileName, append ? "a8" : "w8");
+#endif
     if(!tif){
         printf("Error: File \"%s\" cannot be opened\n",fileName);
         failed = true;
@@ -323,7 +574,10 @@ uint8_t writeSlices(const WriteJob& j, const char* fileName, const char* mode, C
                 ch = &chunks[s*j.chunksPerSlice + c];
                 while((n = ch->size.load(std::memory_order_acquire)) == 0){
                     if(failed.load()) break;
-                    std::this_thread::sleep_for(std::chrono::microseconds(20));
+                    const int64_t k = claims ? claims->forWriter((int64_t)(s*j.chunksPerSlice + c)) : -1;
+                    if(k < 0) std::this_thread::sleep_for(std::chrono::microseconds(20));
+                    else if(!produceChunk(j, (uint64_t)k / j.chunksPerSlice, (uint64_t)k % j.chunksPerSlice, chunks, claims->writerScratch, *pool))
+                        failed = true;
                 }
                 if(n <= 0){ err = 1; what = "could not compress or prepare a strip (out of memory?)"; break; }
                 p = ch->data;
@@ -336,16 +590,13 @@ uint8_t writeSlices(const WriteJob& j, const char* fileName, const char* mode, C
         if(!err && !TIFFWriteDirectory(tif)){ err = 1; what = "a directory could not be written (disk full or I/O error?)"; }
     }
     if(!err && !TIFFFlush(tif)){ err = 1; what = "the file could not be flushed (disk full or I/O error?)"; }
-#ifndef _WIN32
-    // NFS can accept every write and only report a failure (such as a full
-    // quota) when the file is closed, and TIFFClose discards that. Closing a
-    // duplicate descriptor first makes the client flush and report it here.
-    if(!err){
-        const int fd = dup(TIFFFileno(tif));
-        if(fd < 0 || close(fd) != 0){ err = 1; what = "the file could not be closed (disk full or I/O error?)"; }
-    }
-#endif
     TIFFClose(tif);
+#ifndef _WIN32
+    // TIFFClose sends the rest of the queue and closes the file, and ignores
+    // the result (NFS, for one, can accept every write and only report a
+    // failure such as a full quota at close).
+    if(!err && io.failed()){ err = 1; what = "the file could not be written or closed (disk full or I/O error?)"; }
+#endif
     if(err){
         printf("Error: writing \"%s\" failed: %s. The file is incomplete.\n", fileName, what);
         failed = true;
@@ -419,7 +670,7 @@ uint8_t writeJob(const WriteJob& j, const char* fileName, const char* mode, int 
             printf("Error: out of memory writing \"%s\"\n", fileName);
             return 1;
         }
-        err = writeSlices(j, fileName, mode, chunks.get(), writerChunk, failed, true, scratch.get(), &pool);
+        err = writeSlices(j, fileName, mode, chunks.get(), writerChunk, failed, true, scratch.get(), &pool, NULL);
     }
     else if(j.direct()){
         // Nothing needs preparing, but a new thread still does the writing, as
@@ -441,12 +692,23 @@ uint8_t writeJob(const WriteJob& j, const char* fileName, const char* mode, int 
 #ifdef __linux__
             if(pin) sched_setaffinity(0, sizeof cpus, &cpus);
 #endif
-            return writeSlices(j, fileName, mode, chunks.get(), writerChunk, failed, true, (uint8_t*)NULL, &pool);
+            return writeSlices(j, fileName, mode, chunks.get(), writerChunk, failed, true, (uint8_t*)NULL, &pool, (ChunkClaims*)NULL);
         }).get();
     }
     else{
-        std::future<uint8_t> writer = std::async(std::launch::async, writeSlices, std::cref(j), fileName, mode,
-                                                 chunks.get(), std::ref(writerChunk), std::ref(failed), false, (uint8_t*)NULL, &pool);
+        // The writer needs a core of its own. With a producer on every core
+        // besides the writer, it shared one with a busy producer (and at the
+        // end with producers spinning in OpenMP's barrier), and the whole
+        // pipeline waited on it: LZW writes of short stacks took 1.3-1.4x as
+        // long, 2D images 1.15x and 500-slice stacks up to 7% longer on 24-
+        // and 48-core nodes. So when the threads fill every core there is one
+        // producer fewer. With cores to spare (fewer threads asked for than
+        // cores), the writer has a core anyway and instead prepares chunks
+        // too while the one it needs next is not ready, which made LZW writes
+        // with 4 and 8 threads 1.1-1.25x faster; with every core busy that only
+        // delayed the writer (RGB LZW writes 8% slower).
+        const bool fullCores = threads >= omp_get_num_procs();
+        const int producers = fullCores ? std::max(1, threads - 1) : threads;
         // Producers stay within 64 MB (and at least two chunks per thread) of
         // the writer: enough to keep it busy, while a few dozen buffers carry
         // the whole volume. Uncompressed strips are prepared much faster than
@@ -456,16 +718,28 @@ uint8_t writeJob(const WriteJob& j, const char* fileName, const char* mode, int 
         const uint64_t kInFlightBytes = (uint64_t)64 << 20;
         const int64_t window = std::max<int64_t>(2*(int64_t)threads, (int64_t)(kInFlightBytes / std::max<uint64_t>(1, j.maxChunkBytes())));
         const int64_t nChunks = (int64_t)(j.nSlices*j.chunksPerSlice);
-        #pragma omp parallel num_threads(threads)
+        ChunkClaims claims;
+        claims.total = nChunks;
+        claims.window = window;
+        claims.reserve = producers;
+        std::unique_ptr<uint8_t[]> writerScratch(needScratch && !fullCores ? new (std::nothrow) uint8_t[j.maxChunkBytes()] : NULL);
+        if(needScratch && !fullCores && !writerScratch){
+            printf("Error: out of memory writing \"%s\"\n", fileName);
+            return 1;
+        }
+        claims.writerScratch = writerScratch.get();
+        std::future<uint8_t> writer = std::async(std::launch::async, writeSlices, std::cref(j), fileName, mode,
+                                                 chunks.get(), std::ref(writerChunk), std::ref(failed), false, (uint8_t*)NULL, &pool,
+                                                 fullCores ? (ChunkClaims*)NULL : &claims);
+        #pragma omp parallel num_threads(producers)
         {
             std::unique_ptr<uint8_t[]> scratch(needScratch ? new (std::nothrow) uint8_t[j.maxChunkBytes()] : NULL);
             if(needScratch && !scratch) failed = true;
-            #pragma omp for schedule(dynamic, 1)
-            for(int64_t k = 0; k < nChunks; k++){
+            for(int64_t k = claims.next.fetch_add(1); k < nChunks && !failed.load(); k = claims.next.fetch_add(1)){
                 // Far ahead of the writer: back off to 1 ms, well under the time the window takes to write.
                 for(int us = 50; !failed.load() && k >= writerChunk.load(std::memory_order_acquire) + window; us = std::min(2*us, 1000))
                     std::this_thread::sleep_for(std::chrono::microseconds(us));
-                if(failed.load()) continue;
+                if(failed.load()) break;
                 if(!produceChunk(j, (uint64_t)k / j.chunksPerSlice, (uint64_t)k % j.chunksPerSlice, chunks.get(), scratch.get(), pool)) failed = true;
             }
         }
