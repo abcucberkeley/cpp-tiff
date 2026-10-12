@@ -172,7 +172,9 @@ if(BUILD_TESTS)
     enable_testing()
     add_executable(roundtripTest ${CMAKE_CURRENT_SOURCE_DIR}/tests/roundtrip.cpp)
     set_target_properties(roundtripTest PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
-    target_include_directories(roundtripTest PRIVATE ${SRC_DIR})
+    # libtiff's headers: the tests write fixtures the library cannot, such as
+    # planar color, with the libtiff built into it.
+    target_include_directories(roundtripTest PRIVATE ${SRC_DIR} ${LIBTIFF_DIR}/libtiff)
     target_link_libraries(roundtripTest PRIVATE cppTiff_shared OpenMP::OpenMP_CXX)
     add_test(NAME roundtrip COMMAND roundtripTest ${CMAKE_CURRENT_BINARY_DIR})
 endif()

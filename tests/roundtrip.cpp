@@ -24,6 +24,7 @@
 #include "parallelreadtiff.h"
 #include "parallelwritetiff.h"
 #include "helperfunctions.h"
+#include "tiffio.h"
 
 struct Case { const char* name; uint64_t bits; uint16_t sampleFormat; };
 
@@ -106,7 +107,8 @@ static bool writeImageJTiff(const std::string& path, const uint8_t* data,
 // ---- Plain multi-page fixture writer -----------------------------------------
 // Classic TIFF, uncompressed, one strip per page, chunky samples; little-endian
 // unless bigEndian (data is in host order and swapped as written). The library's
-// writer only writes grayscale little-endian, so these fixtures are written here.
+// writer picks its own strips and only writes little-endian, so these fixtures
+// are written here.
 static bool writePlainTiff(const std::string& path, const uint8_t* data,
                            uint64_t x, uint64_t y, uint64_t z, uint64_t spp, uint64_t bits,
                            bool bigEndian = false){
@@ -197,6 +199,64 @@ static bool writeReversedStripsTiff(const std::string& path, const uint8_t* data
     return w == v.size();
 }
 
+// ---- libtiff fixture writer ---------------------------------------------------
+// Files the library's writer cannot produce, written by the libtiff built into
+// it: planar color (PLANARCONFIG=2: every strip or tile of the first color,
+// then of the next, one sample per pixel), any libtiff codec, any RowsPerStrip
+// (rps) or tile size, big-endian. data is chunky (z, y, x, c) in host order.
+static bool writeLibtiff(const std::string& path, const uint8_t* data, uint64_t x, uint64_t y, uint64_t z,
+                         uint64_t spp, uint64_t bits, uint16_t fmt, uint16_t comp, uint32_t rps, uint32_t tile,
+                         bool planar, bool bigEndian = false){
+    TIFF* tif = TIFFOpen(path.c_str(), bigEndian ? "wb" : "wl");
+    if(!tif) return false;
+    const uint64_t es = bits/8, planes = planar ? spp : 1, px = planar ? es : spp*es;   // px: bytes per pixel of one plane
+    std::vector<uint8_t> img(x*y*px), chunk;
+    bool ok = true;
+    for(uint64_t k = 0; k < z && ok; k++){
+        TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, (uint32_t)x);
+        TIFFSetField(tif, TIFFTAG_IMAGELENGTH, (uint32_t)y);
+        TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, (uint16_t)bits);
+        TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, (uint16_t)spp);
+        TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT, fmt);
+        TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, spp >= 3 ? PHOTOMETRIC_RGB : PHOTOMETRIC_MINISBLACK);
+        if(spp == 2 || spp == 4){
+            const uint16_t extra = spp == 4 ? EXTRASAMPLE_UNASSALPHA : EXTRASAMPLE_UNSPECIFIED;
+            TIFFSetField(tif, TIFFTAG_EXTRASAMPLES, (uint16_t)1, &extra);
+        }
+        TIFFSetField(tif, TIFFTAG_PLANARCONFIG, planar ? PLANARCONFIG_SEPARATE : PLANARCONFIG_CONTIG);
+        TIFFSetField(tif, TIFFTAG_COMPRESSION, comp);
+        if(tile){ TIFFSetField(tif, TIFFTAG_TILEWIDTH, tile); TIFFSetField(tif, TIFFTAG_TILELENGTH, tile); }
+        else TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, rps);
+        const uint8_t* slice = data + k*x*y*spp*es;
+        for(uint64_t p = 0; p < planes && ok; p++){
+            if(planar) for(uint64_t i = 0; i < x*y; i++) std::memcpy(&img[i*es], slice + (i*spp + p)*es, es);
+            else std::memcpy(img.data(), slice, img.size());
+            // libtiff swaps big-endian data in place, so it always gets a copy.
+            if(tile){
+                for(uint64_t ty = 0; ty < y && ok; ty += tile)
+                    for(uint64_t tx = 0; tx < x && ok; tx += tile){
+                        chunk.assign((size_t)tile*tile*px, 0);
+                        for(uint64_t r = 0; r < tile && ty + r < y; r++)
+                            std::memcpy(&chunk[r*tile*px], &img[((ty + r)*x + tx)*px], std::min<uint64_t>(tile, x - tx)*px);
+                        ok = TIFFWriteEncodedTile(tif, TIFFComputeTile(tif, (uint32_t)tx, (uint32_t)ty, 0, (uint16_t)p),
+                                                  chunk.data(), (tmsize_t)chunk.size()) >= 0;
+                    }
+            }
+            else{
+                const uint64_t rows = std::min<uint64_t>(rps, y), strips = (y + rows - 1)/rows;
+                for(uint64_t s = 0; s < strips && ok; s++){
+                    const uint64_t n = std::min<uint64_t>(rows, y - s*rows)*x*px;
+                    chunk.assign(img.begin() + s*rows*x*px, img.begin() + s*rows*x*px + n);
+                    ok = TIFFWriteEncodedStrip(tif, (uint32_t)(p*strips + s), chunk.data(), (tmsize_t)n) == (tmsize_t)n;
+                }
+            }
+        }
+        ok = ok && TIFFWriteDirectory(tif);
+    }
+    TIFFClose(tif);
+    return ok;
+}
+
 // Offset and byte count of one strip, for damaging it on purpose. Handles the
 // little-endian classic and BigTIFF files this test writes.
 static bool stripLocation(const std::string& path, uint64_t page, uint64_t strip,
@@ -263,26 +323,39 @@ static std::vector<uint8_t> readFileBytes(const std::string& path){
     return v;
 }
 
-// RowsPerStrip of a file's first directory, read from the bytes (0 if absent),
-// so the test needs no libtiff headers. Little-endian TIFF or BigTIFF.
-static uint64_t firstRowsPerStrip(const std::vector<uint8_t>& f){
+// The first value of a SHORT, LONG or LONG8 tag in a file's first directory,
+// read from the bytes so it checks what is on disk rather than what libtiff
+// makes of it. False if the tag is absent. Little-endian TIFF or BigTIFF.
+static bool firstTag(const std::vector<uint8_t>& f, uint64_t tag, uint64_t* value){
     auto u = [&](uint64_t off, int n){
         uint64_t v = 0;
         for(int i = n - 1; i >= 0; i--) v = (v << 8) | f[off + i];
         return v;
     };
-    if(f.size() < 16 || f[0] != 'I' || f[1] != 'I') return 0;
+    if(f.size() < 16 || f[0] != 'I' || f[1] != 'I') return false;
     const bool big = u(2, 2) == 43;
     const uint64_t ifd = big ? u(8, 8) : u(4, 4);
-    if(ifd + 8 > f.size()) return 0;
+    if(ifd + 8 > f.size()) return false;
     const uint64_t n = big ? u(ifd, 8) : u(ifd, 2), size = big ? 20 : 12, first = ifd + (big ? 8 : 2);
     for(uint64_t e = 0; e < n && first + (e + 1)*size <= f.size(); e++){
         const uint64_t p = first + e*size;
-        if(u(p, 2) != 278) continue;
-        const uint64_t type = u(p + 2, 2), val = p + (big ? 12 : 8);
-        return type == 3 ? u(val, 2) : type == 4 ? u(val, 4) : type == 16 ? u(val, 8) : 0;
+        if(u(p, 2) != tag) continue;
+        const uint64_t type = u(p + 2, 2), count = big ? u(p + 4, 8) : u(p + 4, 4), val = p + (big ? 12 : 8);
+        const int width = type == 3 ? 2 : type == 4 ? 4 : type == 16 ? 8 : 0;
+        if(!width || !count) return false;
+        // Values that do not fit in the entry are stored elsewhere, at the offset it holds.
+        const uint64_t at = count*width <= (big ? 8u : 4u) ? val : (big ? u(val, 8) : u(val, 4));
+        if(at + width > f.size()) return false;
+        *value = u(at, width);
+        return true;
     }
-    return 0;
+    return false;
+}
+
+// RowsPerStrip of a file's first directory (0 if absent).
+static uint64_t firstRowsPerStrip(const std::vector<uint8_t>& f){
+    uint64_t v = 0;
+    return firstTag(f, 278, &v) ? v : 0;
 }
 
 // Column-major MATLAB layout (y, x[, c], z) of a chunky row-major source.
@@ -831,6 +904,206 @@ int main(int argc, char** argv){
             else { std::printf("FAIL  %-14s short stacks  (read back wrong)\n", c.name); failures++; }
         }
         omp_set_num_threads(prevThreads);
+    }
+
+    // ---- Color writes: RGB (3 samples) and RGBA (4), each pixel's samples
+    // together (chunky). Row-major (z, y, x, c) and MATLAB-layout (y, x, c, z)
+    // input must give the same file, as must one thread, and the file must read
+    // back in both layouts. The tags are the ones tifffile writes: RGB, chunky,
+    // and unassociated alpha for RGBA.
+    {
+        struct CW { const char* name; uint64_t x, y, z, spp, bits; uint16_t fmt; const char* comp; uint64_t strip, tile; };
+        const CW cws[] = {
+            {"rgb8-none-s7",      40, 41, 3, 3,  8, 1, "none",   7,  0},
+            {"rgb8-lzw-auto",    333, 77, 1, 3,  8, 1, "lzw",    0,  0},   // 2D, automatic strips
+            {"rgba16-zstd-t16",   50, 37, 2, 4, 16, 1, "zstd", 512, 16},   // ragged tiles
+            {"rgbf32-lzw-t32",    70, 45, 3, 3, 32, 3, "lzw",  512, 32},
+            {"rgbaf64-none-s5",   61, 29, 2, 4, 64, 3, "none",   5,  0},
+            {"rgbi16-zstd-s512", 333, 77, 4, 3, 16, 2, "zstd", 512,  0},
+            {"rgba8-none-t16",    33, 70, 2, 4,  8, 1, "none", 512, 16},
+        };
+        std::mt19937 crng(8642u);
+        const int prevThreads = omp_get_max_threads();
+        for(const CW& c : cws){
+            total++;
+            const uint64_t es = c.bits/8, slice = c.x*c.y*c.spp*es;
+            std::vector<uint8_t> rm(slice*c.z);
+            for(auto& v8 : rm) v8 = (uint8_t)(crng() & 0x3F);   // compressible, and floats stay finite
+            const std::vector<uint8_t> cm = flipped(rm.data(), c.x, c.y, c.z, c.spp, es);
+            const std::string pa = dir + "/cw_row_" + c.name + ".tif", pb = dir + "/cw_matlab_" + c.name + ".tif",
+                              pc = dir + "/cw_one_" + c.name + ".tif";
+            step(c.name, "color writes", "row-major, MATLAB-layout and one-thread writes");
+            bool ok = !writeTiffParallelWrapper(c.x, c.y, c.z, pa.c_str(), rm.data(), c.bits, 0, c.strip, "w", false, std::string(c.comp), c.fmt, c.tile, c.spp)
+                      && !writeTiffParallelWrapper(c.x, c.y, c.z, pb.c_str(), cm.data(), c.bits, 0, c.strip, "w", true, std::string(c.comp), c.fmt, c.tile, c.spp);
+            omp_set_num_threads(1);
+            ok = ok && !writeTiffParallelWrapper(c.x, c.y, c.z, pc.c_str(), cm.data(), c.bits, 0, c.strip, "w", true, std::string(c.comp), c.fmt, c.tile, c.spp);
+            omp_set_num_threads(prevThreads);
+            const std::vector<uint8_t> fa = readFileBytes(pa), fb = readFileBytes(pb), fc = readFileBytes(pc);
+            const bool same = ok && !fa.empty() && fa == fb && fa == fc;
+            uint64_t spp = 0, photometric = 0, planarConfig = 0, extra = 0;
+            const bool tags = firstTag(fa, 277, &spp) && spp == c.spp && firstTag(fa, 262, &photometric) && photometric == 2
+                              && firstTag(fa, 284, &planarConfig) && planarConfig == 1
+                              && (c.spp == 4 ? firstTag(fa, 338, &extra) && extra == 2 : !firstTag(fa, 338, &extra))
+                              && getSamplesPerPixel(pa.c_str()) == c.spp;
+            step(c.name, "color writes", "read back in both layouts and a z-range");
+            void* nf = same ? readTiffParallelWrapperNoXYFlip(pa.c_str(), {}) : nullptr;
+            void* fl = same ? readTiffParallelWrapper(pa.c_str()) : nullptr;
+            bool back = nf && fl && std::memcmp(nf, rm.data(), rm.size()) == 0 && std::memcmp(fl, cm.data(), cm.size()) == 0;
+            free(nf); free(fl);
+            if(back && c.z > 1){
+                void* part = readTiffParallelWrapperNoXYFlip(pa.c_str(), {1, c.z});
+                back = part && std::memcmp(part, rm.data() + slice, slice*(c.z - 1)) == 0;
+                free(part);
+            }
+            std::remove(pa.c_str()); std::remove(pb.c_str()); std::remove(pc.c_str());
+            if(same && tags && back) std::printf("PASS  %-16s color writes\n", c.name);
+            else { std::printf("FAIL  %-16s color writes  (files same=%d tags=%d read back=%d)\n", c.name, (int)same, (int)tags, (int)back); failures++; }
+        }
+        // Other sample counts are refused rather than written with RGB tags.
+        total++;
+        step("bad-samples", "color writes", "2 and 5 samples per pixel");
+        std::vector<uint8_t> small(16*16*5);
+        const std::string bp = dir + "/bad_samples.tif";
+        const bool refused = writeTiffParallelWrapper(16, 16, 1, bp.c_str(), small.data(), 8, 0, 0, "w", false, "lzw", 1, 0, 2) != 0
+                             && writeTiffParallelWrapper(16, 16, 1, bp.c_str(), small.data(), 8, 0, 0, "w", false, "lzw", 1, 0, 5) != 0;
+        std::remove(bp.c_str());
+        if(refused) std::printf("PASS  %-16s color writes\n", "bad-samples");
+        else { std::printf("FAIL  %-16s color writes  (2 or 5 samples per pixel accepted)\n", "bad-samples"); failures++; }
+    }
+
+    // ---- Planar color (PLANARCONFIG=2), each color stored as its own image.
+    // Every reader returns the same layouts as for chunky color: (z, y, x, c)
+    // no-flip and (y, x, c, z) flip. libtiff writes the fixtures in several
+    // codecs, as strips of one row, several rows or a whole plane and as tiles,
+    // so the per-strip, back-to-back uncompressed (raw) and tiled paths all
+    // run, along with 2D images, z-ranges and the scanline fallbacks.
+    {
+        struct PL { const char* name; uint64_t x, y, z, spp, bits; uint16_t fmt, comp; uint32_t rps, tile; bool be; };
+        const PL pls[] = {
+            {"pl-rgb8-lzw-r5",      40,  41, 3, 3,  8, 1, COMPRESSION_LZW,           5,           0, false},
+            {"pl-rgba16-zstd-t16",  50,  37, 3, 4, 16, 1, COMPRESSION_ZSTD,          0,          16, false},
+            {"pl-rgb16-none-r7",   300,  41, 3, 3, 16, 1, COMPRESSION_NONE,          7,           0, false},
+            {"pl-rgb16-none-be",   300,  41, 3, 3, 16, 1, COMPRESSION_NONE,          3,           0, true},
+            {"pl-rgbf32-zip-r1",    33,  29, 2, 3, 32, 3, COMPRESSION_ADOBE_DEFLATE, 1,           0, false},
+            {"pl-rgbaf64-none-1s",  45,  23, 2, 4, 64, 3, COMPRESSION_NONE,          0xFFFFFFFFu, 0, false},   // one strip per color
+            {"pl-2ch-u16-lzw-t32",  70,  45, 2, 2, 16, 1, COMPRESSION_LZW,           0,          32, false},
+            {"pl-rgb8-pack-2d",    130, 200, 1, 3,  8, 1, COMPRESSION_PACKBITS,     64,           0, false},
+            {"pl-rgba8-none-2d",   300, 100, 1, 4,  8, 1, COMPRESSION_NONE,         10,           0, false},
+        };
+        std::mt19937 prng(97531u);
+        for(const PL& c : pls){
+            total++;
+            const uint64_t es = c.bits/8, slice = c.x*c.y*c.spp*es;
+            std::vector<uint8_t> src(slice*c.z);
+            for(auto& v8 : src) v8 = (uint8_t)prng();
+            if(c.bits == 32) for(uint64_t i = 0; i < src.size(); i += 4) src[i + 3] &= 0x3F;   // keep floats finite
+            if(c.bits == 64) for(uint64_t i = 0; i < src.size(); i += 8) src[i + 7] &= 0x3F;
+            const std::string path = dir + "/" + c.name + ".tif";
+            step(c.name, "planar", "write fixture");
+            bool ok = writeLibtiff(path, src.data(), c.x, c.y, c.z, c.spp, c.bits, c.fmt, c.comp, c.rps, c.tile, true, c.be);
+            uint64_t* dims = ok ? getImageSize(path.c_str()) : nullptr;
+            ok = ok && dims && dims[0] == c.y && dims[1] == c.x && dims[2] == c.z && getSamplesPerPixel(path.c_str()) == c.spp;
+            free(dims);
+            step(c.name, "planar", "full, z-range and single-slice reads, both layouts");
+            struct Read { std::vector<uint64_t> range; uint64_t first, count; };
+            std::vector<Read> reads = {{{}, 0, c.z}};
+            if(c.z > 1){ reads.push_back({{1, c.z}, 1, c.z - 1}); reads.push_back({{c.z - 1}, c.z - 1, 1}); }
+            for(const Read& r : reads){
+                if(!ok) break;
+                const uint8_t* want = src.data() + r.first*slice;
+                const std::vector<uint8_t> wantFlip = flipped(want, c.x, c.y, r.count, c.spp, es);
+                void* nf = readTiffParallelWrapperNoXYFlip(path.c_str(), r.range);
+                void* fl = readTiffParallelWrapper(path.c_str(), r.range);
+                ok = nf && fl && std::memcmp(nf, want, r.count*slice) == 0 && std::memcmp(fl, wantFlip.data(), wantFlip.size()) == 0;
+                free(nf); free(fl);
+            }
+            // The scanline fallbacks read strips only; libtiff has no scanlines for tiles.
+            bool fb = true;
+            if(ok && !c.tile){
+                step(c.name, "planar", "scanline fallbacks");
+                const uint64_t last = c.z - 1;
+                const std::vector<uint8_t> lastSlice(src.begin() + last*slice, src.end());
+                fb = fallbackMatches(false, path, c.x, c.y, c.z, c.spp, c.bits, 0, false, src)
+                     && fallbackMatches(false, path, c.x, c.y, c.z, c.spp, c.bits, 0, true, flipped(src.data(), c.x, c.y, c.z, c.spp, es))
+                     && fallbackMatches(true, path, c.x, c.y, 1, c.spp, c.bits, last, false, lastSlice)
+                     && fallbackMatches(true, path, c.x, c.y, 1, c.spp, c.bits, last, true, flipped(lastSlice.data(), c.x, c.y, 1, c.spp, es));
+            }
+            std::remove(path.c_str());
+            if(ok && fb) std::printf("PASS  %-16s planar\n", c.name);
+            else { std::printf("FAIL  %-16s planar  (reads=%d fallbacks=%d)\n", c.name, (int)ok, (int)fb); failures++; }
+        }
+
+        // Many slices with few threads (on Linux each thread reads its own block
+        // and then takes slices from the others), and short stacks of large
+        // slices, which are read slice by slice with every thread.
+        const int prevThreads = omp_get_max_threads();
+        struct PT { const char* name; uint64_t x, y, z; uint16_t comp; uint32_t rps; std::vector<int> threads; };
+        const PT pts[] = {
+            {"pl-many-none",    24,   17, 37, COMPRESSION_NONE,    5, {2, 3, 5, prevThreads}},
+            {"pl-many-lzw",     24,   17, 37, COMPRESSION_LZW,     5, {2, 3, 5, prevThreads}},
+            {"pl-short-lzw",  1200, 1200,  2, COMPRESSION_LZW,    64, {8}},   // 4.3 MB slices
+            {"pl-short-none", 2400, 2400,  2, COMPRESSION_NONE, 2400, {8}},   // 17 MB slices, one strip per color
+        };
+        for(const PT& c : pts){
+            total++;
+            const uint64_t slice = c.x*c.y*3;
+            std::vector<uint8_t> src(slice*c.z);
+            for(uint64_t i = 0; i < src.size(); i++) src[i] = (uint8_t)(prng() & 0x7F);
+            const std::string path = dir + "/" + c.name + ".tif";
+            step(c.name, "planar", "write fixture");
+            bool ok = writeLibtiff(path, src.data(), c.x, c.y, c.z, 3, 8, 1, c.comp, c.rps, 0, true);
+            const std::vector<uint8_t> wantFlip = flipped(src.data(), c.x, c.y, c.z, 3, 1);
+            const std::vector<uint8_t> wantTailFlip = flipped(src.data() + slice, c.x, c.y, c.z - 1, 3, 1);
+            for(int t : c.threads){
+                if(!ok) break;
+                omp_set_num_threads(t);
+                step(c.name, "planar", "full and z-range reads, both layouts");
+                void* nf = readTiffParallelWrapperNoXYFlip(path.c_str(), {});
+                void* fl = readTiffParallelWrapper(path.c_str());
+                void* rg = readTiffParallelWrapperNoXYFlip(path.c_str(), {1, c.z});
+                void* rf = readTiffParallelWrapper(path.c_str(), {1, c.z});
+                ok = nf && fl && rg && rf
+                     && std::memcmp(nf, src.data(), src.size()) == 0 && std::memcmp(fl, wantFlip.data(), wantFlip.size()) == 0
+                     && std::memcmp(rg, src.data() + slice, slice*(c.z - 1)) == 0 && std::memcmp(rf, wantTailFlip.data(), wantTailFlip.size()) == 0;
+                free(nf); free(fl); free(rg); free(rf);
+            }
+            omp_set_num_threads(prevThreads);
+            std::remove(path.c_str());
+            if(ok) std::printf("PASS  %-16s planar\n", c.name);
+            else { std::printf("FAIL  %-16s planar  (read back wrong)\n", c.name); failures++; }
+        }
+    }
+
+    // ---- RowsPerStrip past the image height. With 2^32 - 1, the TIFF default
+    // for a single strip, flip reads sized their buffers from it and a
+    // compressed single-strip image crashed; planar files, which libtiff never
+    // splits into smaller strips, hit it uncompressed too.
+    {
+        struct RP { const char* name; uint64_t x, y, z, spp, bits; uint16_t comp; uint32_t rps; bool planar; };
+        const RP rps[] = {
+            {"rps-max-lzw-2d",  300, 200, 1, 1, 16, COMPRESSION_LZW,  0xFFFFFFFFu, false},
+            {"rps-max-zstd-3d", 120,  50, 3, 1,  8, COMPRESSION_ZSTD, 0xFFFFFFFFu, false},
+            {"rps-big-rgb-lzw",  90,  60, 2, 3,  8, COMPRESSION_LZW,  1000,        false},
+            {"rps-max-planar",   90,  60, 2, 3, 16, COMPRESSION_NONE, 0xFFFFFFFFu, true},
+        };
+        std::mt19937 rrng(1357u);
+        for(const RP& c : rps){
+            total++;
+            const uint64_t es = c.bits/8;
+            std::vector<uint8_t> src(c.x*c.y*c.z*c.spp*es);
+            for(auto& v8 : src) v8 = (uint8_t)(rrng() & 0x7F);
+            const std::string path = dir + "/" + c.name + ".tif";
+            step(c.name, "rows per strip", "write fixture + reads, both layouts");
+            bool ok = writeLibtiff(path, src.data(), c.x, c.y, c.z, c.spp, c.bits, 1, c.comp, c.rps, 0, c.planar);
+            void* nf = ok ? readTiffParallelWrapperNoXYFlip(path.c_str(), {}) : nullptr;
+            void* fl = ok ? readTiffParallelWrapper(path.c_str()) : nullptr;
+            const std::vector<uint8_t> cm = flipped(src.data(), c.x, c.y, c.z, c.spp, es);
+            ok = nf && fl && std::memcmp(nf, src.data(), src.size()) == 0 && std::memcmp(fl, cm.data(), cm.size()) == 0;
+            free(nf); free(fl);
+            std::remove(path.c_str());
+            if(ok) std::printf("PASS  %-16s rows per strip\n", c.name);
+            else { std::printf("FAIL  %-16s rows per strip  (read back wrong)\n", c.name); failures++; }
+        }
     }
 
     // ---- Write failures must be reported instead of leaving a broken file and

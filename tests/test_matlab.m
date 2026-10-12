@@ -1,9 +1,9 @@
 function test_matlab(mexDir)
 % Smoke test for the compiled MATLAB mex files: write small volumes, read them
 % back, and check the data survives the round trip -- across every supported
-% class, each compression, 2D and 3D, striped and tiled, plus z-range reads and
-% getImageSizeMex. Errors (non-zero exit under `matlab -batch`) on any failure so
-% Jenkins fails the build.
+% class, each compression, 2D and 3D, striped and tiled, grayscale, RGB and
+% RGBA, plus z-range reads, planar color files and getImageSizeMex. Errors
+% (non-zero exit under `matlab -batch`) on any failure so Jenkins fails the build.
 %
 % With no argument it auto-detects the platform's mex folder (matching the
 % compile_*.m scripts), so Jenkins can call it quote-free right after compiling:
@@ -144,7 +144,86 @@ function test_matlab(mexDir)
         fprintf('PASS  imagej %s\n', name);
     end
 
-    % 6. Unreadable and damaged files raise MATLAB errors instead of crashing
+    % 6. RGB and RGBA writes: 4D (y, x, c, z) data is color, and so is 3D
+    %    (y, x, c) data when the sixth argument is true. They read back as
+    %    written, getImageSizeMex reports [y x z c], and MATLAB's own reader
+    %    sees an RGB image with straight (unassociated) alpha for RGBA.
+    rgbTypes = {'uint8', 'uint16', 'single'};
+    for k = 1:numel(rgbTypes)
+        t = rgbTypes{k};
+        for spp = [3 4]
+            for ci = 1:numel(comps)
+                for tile = tiles
+                    for nz = [2 1]
+                        data = makeData([24 40 spp nz], t);
+                        tag = sprintf('rgb %s/spp%d/%s/tile%d/z%d', t, spp, comps{ci}, tile, nz);
+                        f = fullfile(tmp, sprintf('rgb_%s_%d_%s_%d_%d.tif', t, spp, comps{ci}, tile, nz));
+                        if nz > 1
+                            parallelWriteTiff(f, data, 'w', comps{ci}, tile);
+                        else
+                            parallelWriteTiff(f, data, 'w', comps{ci}, tile, true);
+                        end
+                        back = parallelReadTiff(f);
+                        assert(isa(back, t) && isequal(back, data), '%s: read back', tag);
+                        dims = getImageSizeMex(f);
+                        assert(isequal(double(dims), [24 40 nz spp]), '%s: getImageSizeMex %s', tag, mat2str(dims));
+                        info = imfinfo(f);
+                        assert(strcmp(info(1).PhotometricInterpretation, 'RGB') && info(1).SamplesPerPixel == spp ...
+                               && strcmp(info(1).PlanarConfiguration, 'Chunky'), '%s: imfinfo', tag);
+                        if spp == 4
+                            assert(isequal(info(1).ExtraSamples, 2), '%s: ExtraSamples %s', tag, mat2str(info(1).ExtraSamples));
+                        end
+                        % MATLAB's reader has no zstd.
+                        if strcmp(t, 'uint8') && ~strcmp(comps{ci}, 'zstd')
+                            assert(isequal(imread(f, nz), data(:,:,:,nz)), '%s: imread', tag);
+                        end
+                        delete(f);
+                        nchecked = nchecked + 1;
+                    end
+                end
+            end
+        end
+        fprintf('PASS  rgb %s\n', t);
+    end
+    % Without the sixth argument, 3D data is still a grayscale stack.
+    f = fullfile(tmp, 'gray3.tif');
+    g = makeData([24 40 3], 'uint16');
+    parallelWriteTiff(f, g);
+    assert(isequal(parallelReadTiff(f), g) && isequal(double(getImageSizeMex(f)), [24 40 3]), ...
+           'a 3-slice stack was not written as grayscale');
+    delete(f);
+    % Color data other than RGB or RGBA is refused.
+    f = fullfile(tmp, 'bad_rgb.tif');
+    assert(throws(@() parallelWriteTiff(f, makeData([8 8 2 2], 'uint8'))), '4D data with 2 samples was accepted');
+    assert(throws(@() parallelWriteTiff(f, makeData([8 8 5], 'uint8'), 'w', 'lzw', 0, true)), '5 samples were written as color');
+    assert(throws(@() parallelWriteTiff(f, makeData([8 8], 'uint8'), 'w', 'lzw', 0, true)), '2D data was written as color');
+
+    % 7. Planar color (PlanarConfiguration Separate): each color stored as its
+    %    own image. MATLAB's Tiff class writes the fixtures, as strips and
+    %    tiles, 2D and 3D; they read like chunky color, (y, x, c, z).
+    pcases = { ...
+        'uint8',  3, 'LZW',          0, 3; ...
+        'uint16', 4, 'None',         0, 2; ...
+        'single', 3, 'AdobeDeflate', 16, 3; ...
+        'uint16', 3, 'PackBits',     0, 1};
+    for ci = 1:size(pcases, 1)
+        [t, spp, comp, tile, nz] = pcases{ci, :};
+        data = makeData([24 40 spp nz], t);
+        tag = sprintf('planar %s/spp%d/%s/tile%d/z%d', t, spp, comp, tile, nz);
+        f = fullfile(tmp, sprintf('planar_%d.tif', ci));
+        writePlanarTiff(f, data, comp, tile);
+        info = imfinfo(f);
+        assert(strcmp(info(1).PlanarConfiguration, 'Planar'), '%s: fixture is not planar', tag);
+        assert(isequal(parallelReadTiff(f), data), '%s: full read', tag);
+        if nz > 2
+            assert(isequal(parallelReadTiff(f, [2 3]), data(:,:,:,2:3)), '%s: z-range', tag);
+        end
+        assert(isequal(double(getImageSizeMex(f)), [24 40 nz spp]), '%s: getImageSizeMex', tag);
+        delete(f);
+    end
+    fprintf('PASS  planar\n');
+
+    % 8. Unreadable and damaged files raise MATLAB errors instead of crashing
     %    MATLAB.
     missing = fullfile(tmp, 'missing.tif');
     assert(throws(@() parallelReadTiff(missing)), 'missing file: parallelReadTiff did not error');
@@ -247,6 +326,46 @@ function writeImageJTiff(f, arr, byteorder)
     v = permute(arr, perm);
     fwrite(fid, v(:), class(arr));
     fclose(fid);
+end
+
+
+function writePlanarTiff(f, data, compression, tile)
+%WRITEPLANARTIFF Planar (separate color planes) RGB/RGBA fixture written with
+%   MATLAB's Tiff class: every strip or tile of the first color, then of the
+%   next. data is (y, x, c, z); compression is a Tiff.Compression name and
+%   tile 0 for 5-row strips. The library's writer only writes chunky color.
+    [y, x, spp, z] = size(data);
+    t = Tiff(f, 'w');
+    closer = onCleanup(@() t.close()); %#ok<NASGU>
+    for k = 1:z
+        tags = struct();
+        tags.ImageLength = y;
+        tags.ImageWidth = x;
+        tags.Photometric = Tiff.Photometric.RGB;
+        tags.BitsPerSample = 8 * numel(typecast(cast(0, class(data)), 'uint8'));
+        tags.SamplesPerPixel = spp;
+        if isfloat(data)
+            tags.SampleFormat = Tiff.SampleFormat.IEEEFP;
+        else
+            tags.SampleFormat = Tiff.SampleFormat.UInt;
+        end
+        tags.PlanarConfiguration = Tiff.PlanarConfiguration.Separate;
+        tags.Compression = Tiff.Compression.(compression);
+        if spp == 4
+            tags.ExtraSamples = Tiff.ExtraSamples.UnassociatedAlpha;
+        end
+        if tile
+            tags.TileWidth = tile;
+            tags.TileLength = tile;
+        else
+            tags.RowsPerStrip = 5;
+        end
+        t.setTag(tags);
+        t.write(data(:, :, :, k));
+        if k < z
+            t.writeDirectory();
+        end
+    end
 end
 
 

@@ -55,7 +55,7 @@ pybind11::array pybind11_read_tiff(const std::string& fileName, const std::vecto
 	uint64_t fmt = getSampleFormat(fileName.c_str());  // 1=uint, 2=int, 3=float
 
 	void* data = readTiffParallelWrapperNoXYFlip(fileName.c_str(), zRange);
-	if(!data) throw std::runtime_error("Failed to read \"" + fileName + "\": the file is damaged or uses an unsupported layout such as planar RGB");
+	if(!data) throw std::runtime_error("Failed to read \"" + fileName + "\": the file is damaged or uses an unsupported layout, such as samples that are not 8, 16, 32 or 64 bits");
 
     if(zRange.size()){
         if(zRange.size() == 2){
@@ -102,18 +102,22 @@ void pybind11_write_tiff(const std::string &fileName, const pybind11::array &dat
     if (dtype != 8 && dtype != 16 && dtype != 32 && dtype != 64)
         throw std::runtime_error("Unsupported data type");
 
-    // Get the dimensions of the array. A 2D array only has two entries in shape,
+    // Get the dimensions of the array: (x, y[, z[, c]]), the wrapper's view of
+    // row-major (z, y, x[, c]) data. A 2D array only has two entries in shape,
     // so reading shape[2] unconditionally is out of bounds -- it fed a garbage z
     // to the writer (seen producing a 247 MB file for a 24x40 image).
-    if (info.ndim < 2 || info.ndim > 3)
-        throw std::runtime_error("data must be 2D or 3D");
-    uint64_t dims[3] = {static_cast<uint64_t>(info.shape[0]),
+    if (info.ndim < 2 || info.ndim > 4)
+        throw std::runtime_error("data must be 2D, 3D, or 4D color data");
+    uint64_t dims[4] = {static_cast<uint64_t>(info.shape[0]),
                         static_cast<uint64_t>(info.shape[1]),
-                        info.ndim > 2 ? static_cast<uint64_t>(info.shape[2]) : 1};
+                        info.ndim > 2 ? static_cast<uint64_t>(info.shape[2]) : 1,
+                        info.ndim > 3 ? static_cast<uint64_t>(info.shape[3]) : 1};
+    if (dims[3] != 1 && dims[3] != 3 && dims[3] != 4)
+        throw std::runtime_error("color data must have 3 (RGB) or 4 (RGBA) samples");
 
     // Call the function to write the data to a TIFF file. The library prints
     // why a write failed; without this check Python never heard about it.
-    if(writeTiffParallelHelper(fileName.c_str(), info.ptr, dtype, "w", dims[0], dims[1], dims[2], 0, transpose, compression, sampleFormat, tile))
+    if(writeTiffParallelHelper(fileName.c_str(), info.ptr, dtype, "w", dims[0], dims[1], dims[2], 0, transpose, compression, sampleFormat, tile, dims[3]))
         throw std::runtime_error("Failed to write \"" + fileName + "\"");
 }
 

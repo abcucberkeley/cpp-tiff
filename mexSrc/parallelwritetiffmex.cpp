@@ -58,6 +58,16 @@ void mexFunction(int nlhs, mxArray *plhs[],
             mexErrMsgIdAndTxt("tiff:inputError","Tile size must be a multiple of 16");
     }
 
+    // Optional sixth argument: true writes 3D (y, x, c) data as one RGB (c = 3)
+    // or RGBA (c = 4) image instead of c grayscale slices. 4D (y, x, c, z) data
+    // is always color.
+    bool rgb = false;
+    if(nrhs >= 6){
+        if(!(mxIsLogical(prhs[5]) || mxIsNumeric(prhs[5])) || mxGetNumberOfElements(prhs[5]) != 1)
+            mexErrMsgIdAndTxt("tiff:inputError","The sixth argument (rgb) must be true or false");
+        rgb = mxGetScalar(prhs[5]) != 0;
+    }
+
     // Handle the tilde character in filenames on Linux/Mac
     #ifndef _WIN32
     if(strchr(fileName,'~')) fileName = expandTilde(fileName);
@@ -92,7 +102,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
         mode = "w";
     }
     int nDims = (int) mxGetNumberOfDimensions(prhs[1]);
-    if(nDims < 2 || nDims > 3) mexErrMsgIdAndTxt("tiff:inputError","Data must be 2D or 3D");
+    if(nDims < 2 || nDims > 4) mexErrMsgIdAndTxt("tiff:inputError","Data must be 2D, 3D, or 4D (y, x, c, z) color");
     uint64_t* dims = (uint64_t*) mxGetDimensions(prhs[1]);
 
 
@@ -101,6 +111,14 @@ void mexFunction(int nlhs, mxArray *plhs[],
     // mxGetDimensions returns exactly nDims entries, so reading dims[2] for a 2D
     // image is out of bounds -- MATLAB does not pad the array with a trailing 0.
     uint64_t z = (nDims > 2) ? dims[2] : 1;
+    uint64_t samples = 1;
+    if(nDims == 4 || rgb){
+        if(nDims < 3) mexErrMsgIdAndTxt("tiff:inputError","RGB data must be (y, x, c) or (y, x, c, z)");
+        samples = dims[2];
+        z = (nDims > 3) ? dims[3] : 1;
+        if(samples != 3 && samples != 4)
+            mexErrMsgIdAndTxt("tiff:inputError","Color data must have 3 (RGB) or 4 (RGBA) samples in its third dimension");
+    }
     if(!z){
         z = 1;
     }
@@ -124,7 +142,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     // 0 lets the writer choose the rows per strip from the image size.
     uint64_t stripSize = 0;
     void* data = mxGetData(prhs[1]);
-    uint8_t err = writeTiffParallelWrapper(x,y,z,fileName,data,bits,startSlice,stripSize,mode,true,compression,sampleFormat,tileSize);
+    uint8_t err = writeTiffParallelWrapper(x,y,z,fileName,data,bits,startSlice,stripSize,mode,true,compression,sampleFormat,tileSize,samples);
 
     if(err) mexErrMsgIdAndTxt("tiff:tiffError","An Error occured within the write function");
 }

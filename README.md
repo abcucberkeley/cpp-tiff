@@ -1,10 +1,6 @@
 # cpp-tiff
 An efficient parallel Tiff reader/writer that utilizes LibTIFF and OpenMP.
 
-## Limitations
-1. RGB and RGBA tiffs are supported for reading only; writing RGB/RGBA is not yet supported
-2. Only chunky (interleaved) RGB/RGBA is supported. Planar RGB (separate color planes) will return an error
-
 ## Python
 
 A Python version of cpp-tiff is available through pip
@@ -30,9 +26,9 @@ pip install cpp-tiff
 
 ### Usage
 
-The reader returns a zyx numpy array for the given tiff file (zyxc for RGB/RGBA tiffs, with the color channel last)
+The reader returns a zyx numpy array for the given tiff file (zyxc for RGB/RGBA tiffs, with the color channel last, whether the file stores the colors interleaved or as separate planes)
 
-The writer takes an output filename and a zyx numpy array
+The writer takes an output filename and a zyx numpy array, or a zyxc array for RGB/RGBA (3 or 4 colors last). A single yxc color image needs rgb=True, since a 3D array is otherwise written as a stack of grayscale images
 
 By default, the writer uses lzw compression but you can also pass 'none' as the third argument
 
@@ -42,6 +38,17 @@ import cpptiff
 im = cpptiff.read_tiff('filename.tif')
 # Do some processing here
 cpptiff.write_tiff('outputFilename.tif', im)
+````
+
+#### Write an RGB or RGBA tiff file
+````
+import numpy as np
+import cpptiff
+# A stack of RGB images is zyxc with 3 colors (4 for RGBA)
+im = np.zeros((10, 512, 512, 3), dtype=np.uint8)
+cpptiff.write_tiff('rgbStack.tif', im)
+# A single RGB image is yxc
+cpptiff.write_tiff('rgbImage.tif', im[0], rgb=True)
 ````
 
 #### Read a single slice of a tiff file
@@ -98,11 +105,13 @@ make install
 
 #### getImageSizeMex - Get the dimensions of a Tiff image
 ````
+% [y x z], or [y x z c] for RGB/RGBA
 size = getImageSizeMex('path/to/file.tif');
 ````
 
 #### parallelReadTiff - Read a Tiff image into an array
 ````
+% (y, x, z), or (y, x, c, z) for RGB/RGBA
 im = parallelReadTiff('path/to/file.tif');
 ````
 
@@ -110,6 +119,14 @@ im = parallelReadTiff('path/to/file.tif');
 ````
 im = rand(100,100,100);
 parallelWriteTiff('path/to/file.tif',im);
+````
+
+RGB/RGBA data is (y, x, c, z) with 3 or 4 colors. A single (y, x, c) color image needs the sixth argument set to true, since a 3D array is otherwise written as a stack of grayscale images
+````
+rgbStack = zeros(512,512,3,10,'uint8');
+parallelWriteTiff('path/to/rgbStack.tif',rgbStack);
+rgbImage = zeros(512,512,3,'uint8');
+parallelWriteTiff('path/to/rgbImage.tif',rgbImage,'w','lzw',0,true);
 ````
 
 ## Reference

@@ -2,7 +2,8 @@
 
 Writes small volumes, reads them back, and checks the data survives the round
 trip -- across every supported dtype, each compression, 2D and 3D, striped and
-tiled, plus z-range reads. Run automatically by cibuildwheel against the freshly
+tiled, grayscale, RGB and RGBA, plus z-range reads and planar color files. Run
+automatically by cibuildwheel against the freshly
 built+installed wheel, so it also verifies the wheel imports and bundles its
 native library. Exits non-zero on any failure.
 
@@ -13,6 +14,7 @@ import os
 import struct
 import sys
 import tempfile
+import zlib
 
 import numpy as np
 import cpptiff
@@ -31,8 +33,9 @@ def check(cond, msg):
     return cond
 
 
-def tile_width(path):
-    """TileWidth (tag 322) of the first IFD, or None if the file is striped.
+def first_tag(path, tag):
+    """First value of a SHORT, LONG or LONG8 tag in the first IFD, or None if
+    the file does not have it.
 
     Handles the classic and BigTIFF headers libtiff writes. Only little-endian
     files are decoded (every platform cpp-tiff targets is little-endian); a
@@ -56,21 +59,30 @@ def tile_width(path):
         if count > 4096:     # not a directory we understand
             return None
         table = fh.read(count * entry)
-    for i in range(count):
-        e = table[i * entry:(i + 1) * entry]
-        if len(e) < entry:
-            break
-        tag, typ = struct.unpack("<HH", e[:4])
-        if tag != 322:                       # TIFFTAG_TILEWIDTH
-            continue
-        # Value field: BigTIFF is tag(2)+type(2)+count(8) then 8 bytes of value,
-        # classic is tag(2)+type(2)+count(4) then 4. Little-endian, so left-aligned.
-        value = e[12:20] if entry == 20 else e[8:12]
-        width = {3: 2, 4: 4, 16: 8}.get(typ)
-        if width is None:
-            return None
-        return int.from_bytes(value[:width], "little")
+        for i in range(count):
+            e = table[i * entry:(i + 1) * entry]
+            if len(e) < entry:
+                break
+            t, typ = struct.unpack("<HH", e[:4])
+            if t != tag:
+                continue
+            # Value field: BigTIFF is tag(2)+type(2)+count(8) then 8 bytes of value,
+            # classic is tag(2)+type(2)+count(4) then 4. Little-endian, so left-aligned.
+            n = int.from_bytes(e[4:12] if entry == 20 else e[4:8], "little")
+            value = e[12:20] if entry == 20 else e[8:12]
+            width = {3: 2, 4: 4, 16: 8}.get(typ)
+            if width is None or n == 0:
+                return None
+            if n * width > len(value):       # stored elsewhere; the field holds its offset
+                fh.seek(int.from_bytes(value, "little"))
+                value = fh.read(width)
+            return int.from_bytes(value[:width], "little")
     return None
+
+
+def tile_width(path):
+    """TileWidth (tag 322) of the first IFD, or None if the file is striped."""
+    return first_tag(path, 322)
 
 
 def strip_location(path, page, strip):
@@ -174,6 +186,65 @@ def write_imagej_tiff(path, arr, byteorder="<"):
         f.write(np.ascontiguousarray(arr).astype(arr.dtype.newbyteorder(e)).tobytes())
 
 
+def _append_ifd(out, entries, e):
+    """Append an IFD of (tag, type, values) entries to out, with values that do
+    not fit in an entry stored just before it. Types are 3 (SHORT) and 4
+    (LONG). Returns where its next-IFD offset is, for linking the next IFD."""
+    fields = []
+    for tag, typ, vals in sorted(entries):
+        raw = struct.pack(e + ("H" if typ == 3 else "I") * len(vals), *vals)
+        if len(raw) > 4:
+            out += b"\x00" * (len(out) % 2)
+            fields.append((tag, typ, len(vals), struct.pack(e + "I", len(out))))
+            out += raw
+        else:
+            fields.append((tag, typ, len(vals), raw.ljust(4, b"\x00")))
+    out += b"\x00" * (len(out) % 2)
+    ifd = len(out)
+    out += struct.pack(e + "H", len(fields))
+    for tag, typ, n, value in fields:
+        out += struct.pack(e + "HHI", tag, typ, n) + value
+    out += struct.pack(e + "I", 0)
+    return ifd, len(out) - 4
+
+
+def write_planar_tiff(path, arr, rps, compression=1, byteorder="<"):
+    """Planar (PLANARCONFIG=2) RGB or RGBA TIFF: each color stored as its own
+    image, every strip of the first color, then of the next. arr is
+    (z, y, x, c); compression is 1 (none) or 8 (deflate, with zlib). The
+    library's writer only writes chunky color, hence this fixture writer."""
+    e = byteorder
+    z, y, x, spp = arr.shape
+    rps = min(rps, y)
+    nstrips = -(-y // rps)
+    out = bytearray((b"II" if e == "<" else b"MM") + struct.pack(e + "HI", 42, 0))
+    link = 4                                 # where the next IFD's offset goes
+    for k in range(z):
+        offsets, counts = [], []
+        for p in range(spp):
+            plane = arr[k, :, :, p].astype(arr.dtype.newbyteorder(e))
+            for s in range(nstrips):
+                raw = plane[s * rps:(s + 1) * rps].tobytes()
+                data = zlib.compress(raw) if compression == 8 else raw
+                offsets.append(len(out))
+                counts.append(len(data))
+                out += data
+        entries = [
+            (256, 4, [x]), (257, 4, [y]), (258, 3, [arr.dtype.itemsize * 8] * spp),
+            (259, 3, [compression]), (262, 3, [2]),                  # RGB
+            (273, 4, offsets), (277, 3, [spp]), (278, 4, [rps]), (279, 4, counts),
+            (284, 3, [2]),                                           # PlanarConfig: separate
+            (339, 3, [{"u": 1, "i": 2, "f": 3}[arr.dtype.kind]] * spp),
+        ]
+        if spp == 4:
+            entries.append((338, 3, [2]))     # ExtraSamples: unassociated alpha
+        ifd, nxt = _append_ifd(out, entries, e)
+        out[link:link + 4] = struct.pack(e + "I", ifd)
+        link = nxt
+    with open(path, "wb") as f:
+        f.write(out)
+
+
 def main():
     rng = np.random.default_rng(1234567)
     tmp = tempfile.mkdtemp()
@@ -248,7 +319,79 @@ def main():
         check(np.array_equal(sub, arr[1:3]), f"imagej {name}: z-range [1,3)")
         os.remove(path)
 
-    # 5. Unreadable and damaged files raise instead of crashing the interpreter.
+    # 5. RGB and RGBA writes: (z, y, x, c) stacks, and single (y, x, c) images
+    #    with rgb=True. They read back as written, with the tags tifffile uses:
+    #    RGB, chunky, and unassociated alpha for RGBA.
+    for dt in (np.uint8, np.uint16, np.int16, np.float32, np.float64):
+        name = np.dtype(dt).name
+        for spp in (3, 4):
+            for comp in COMPRESSIONS:
+                for tile in (0, 16):
+                    for shape in ((3, 24, 40, spp), (24, 40, spp)):
+                        data = make(shape, dt, rng)
+                        tag = f"rgb {name}/spp{spp}/{comp}/tile{tile}/{len(shape)}D"
+                        path = os.path.join(tmp, f"rgb_{name}_{spp}_{comp}_{tile}_{len(shape)}.tif")
+                        if len(shape) == 4:
+                            cpptiff.write_tiff(path, data, comp, tile)        # 4D is color by default
+                        else:
+                            cpptiff.write_tiff(path, data, comp, tile, rgb=True)
+                        back = cpptiff.read_tiff(path)
+                        check(back.dtype == data.dtype and back.shape == data.shape
+                              and np.array_equal(back, data), f"{tag}: read back {back.dtype} {back.shape}")
+                        z = shape[0] if len(shape) == 4 else 1
+                        check(cpptiff.get_image_shape(path) == (z, 24, 40, spp), f"{tag}: shape")
+                        check(first_tag(path, 262) == 2 and first_tag(path, 277) == spp
+                              and first_tag(path, 284) == 1
+                              and first_tag(path, 338) == (2 if spp == 4 else None), f"{tag}: tags")
+                        os.remove(path)
+    # A Fortran-order color stack is written by its values, not its memory order.
+    rgb = make((2, 24, 40, 3), np.uint16, rng)
+    path = os.path.join(tmp, "rgb_f_order.tif")
+    cpptiff.write_tiff(path, np.asfortranarray(rgb))
+    check(np.array_equal(cpptiff.read_tiff(path), rgb), "rgb: Fortran-order input")
+    os.remove(path)
+    # 3D data stays a grayscale stack unless rgb=True, even with 3 columns.
+    gray = make((4, 8, 3), np.uint16, rng)
+    path = os.path.join(tmp, "gray_x3.tif")
+    cpptiff.write_tiff(path, gray)
+    check(cpptiff.read_tiff(path).shape == (4, 8, 3) and first_tag(path, 277) == 1, "gray stack with x == 3")
+    os.remove(path)
+    # Color data that is not RGB or RGBA is refused, and nothing is written.
+    path = os.path.join(tmp, "bad_rgb.tif")
+    bad = (("4D with 2 samples", np.zeros((2, 8, 8, 2), np.uint8), None),
+           ("(y, x, 5) with rgb=True", np.zeros((8, 8, 5), np.uint8), True),
+           ("2D with rgb=True", np.zeros((8, 8), np.uint8), True),
+           ("4D with rgb=False", np.zeros((2, 8, 8, 3), np.uint8), False))
+    for label, arr, as_rgb in bad:
+        try:
+            cpptiff.write_tiff(path, arr, rgb=as_rgb)
+            check(False, f"{label}: did not raise")
+        except Exception:
+            pass
+        check(not os.path.exists(path), f"{label}: left a file")
+
+    # 6. Planar color (PLANARCONFIG=2): each color stored as its own image. It
+    #    reads channel-last like chunky color, uncompressed and deflate, little-
+    #    and big-endian, 2D and 3D, whole or a z-range.
+    planar = (("u8-none", make((3, 24, 40, 3), np.uint8, rng), 5, 1, "<"),
+              ("u16-deflate-rgba", make((4, 24, 40, 4), np.uint16, rng), 7, 8, "<"),
+              ("u16-none-be", make((3, 24, 40, 3), np.uint16, rng), 3, 1, ">"),
+              ("f32-deflate-2d", make((1, 24, 40, 3), np.float32, rng), 24, 8, "<"))
+    for name, arr, rps, comp, bo in planar:
+        path = os.path.join(tmp, f"planar_{name}.tif")
+        write_planar_tiff(path, arr, rps, comp, bo)
+        z = arr.shape[0]
+        want = arr[0] if z == 1 else arr
+        back = cpptiff.read_tiff(path)
+        check(back.dtype == arr.dtype and back.shape == want.shape
+              and np.array_equal(back, want), f"planar {name}: full read {back.shape}")
+        check(cpptiff.get_image_shape(path) == arr.shape, f"planar {name}: shape")
+        if z > 2:
+            check(np.array_equal(cpptiff.read_tiff(path, [1, 3]), arr[1:3]), f"planar {name}: z-range [1,3)")
+            check(np.array_equal(cpptiff.read_tiff(path, 2), arr[2]), f"planar {name}: slice 2")
+        os.remove(path)
+
+    # 7. Unreadable and damaged files raise instead of crashing the interpreter.
     missing = os.path.join(tmp, "missing.tif")
     not_tiff = os.path.join(tmp, "not_a_tiff.tif")
     with open(not_tiff, "wb") as fh:

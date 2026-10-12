@@ -85,6 +85,39 @@ static void gatherTileTransposed(T* tile, const T* slice, uint64_t y, uint64_t t
     }
 }
 
+// Color versions of the two above. A MATLAB color array is (y, x, c, z), so
+// each color is its own column-major plane x*y apart, while a TIFF row holds
+// every pixel's samples together (x, c). Grayscale keeps the functions above.
+template <typename T>
+static void transposeRowsColor(T* out, const T* slice, uint64_t x, uint64_t y, uint64_t samples, uint64_t r0, uint64_t rows){
+    const uint64_t B = 64, plane = x*y;
+    for(uint64_t rb = 0; rb < rows; rb += B){
+        const uint64_t rEnd = std::min(rb + B, rows);
+        for(uint64_t cb = 0; cb < x; cb += B){
+            const uint64_t cEnd = std::min(cb + B, x);
+            for(uint64_t r = rb; r < rEnd; r++){
+                T* o = out + r*x*samples;
+                const T* in = slice + r0 + r;
+                for(uint64_t s = 0; s < samples; s++)
+                    for(uint64_t c = cb; c < cEnd; c++) o[c*samples + s] = in[c*y + s*plane];
+            }
+        }
+    }
+}
+
+template <typename T>
+static void gatherTileTransposedColor(T* tile, const T* slice, uint64_t x, uint64_t y, uint64_t samples,
+                                      uint64_t tileX0, uint64_t tileY0, uint64_t validW, uint64_t validH, uint64_t tw, uint64_t tl){
+    if(validW < tw || validH < tl) memset(tile, 0, (size_t)(tw*tl*samples*sizeof(T)));
+    const uint64_t plane = x*y;
+    for(uint64_t r = 0; r < validH; r++){
+        T* o = tile + r*tw*samples;
+        const T* in = slice + (tileY0 + r) + tileX0*y;
+        for(uint64_t s = 0; s < samples; s++)
+            for(uint64_t c = 0; c < validW; c++) o[c*samples + s] = in[c*y + s*plane];
+    }
+}
+
 namespace {
 
 // One strip or tile on its way to the file. A producer fills data and then
@@ -122,22 +155,26 @@ private:
 };
 
 struct WriteJob {
-    uint64_t x, y, nSlices, bits, bytes, stripSize, tileSize;
+    uint64_t x, y, nSlices, bits, bytes, samples, stripSize, tileSize;
     uint64_t tilesAcross, tilesDown, chunksPerSlice;
     const uint8_t* data;     // first slice to write
-    bool transpose;          // data is column-major (y, x, z) instead of row-major (z, y, x)
+    bool transpose;          // data is column-major (y, x[, c], z) instead of row-major (z, y, x[, c])
     int compression;         // COMPRESSION_NONE, COMPRESSION_LZW or COMPRESSION_ZSTD
     uint16_t sampleFormat;
 
     // Uncompressed row-major strips go straight from the caller's buffer to the file.
     bool direct() const { return compression == COMPRESSION_NONE && !transpose && !tileSize; }
-    uint64_t sliceBytes() const { return x*y*bytes; }
+    // A pixel's samples (1 gray, 3 RGB or 4 RGBA) are stored together.
+    uint64_t pixelBytes() const { return bytes*samples; }
+    uint64_t sliceBytes() const { return x*y*pixelBytes(); }
+    // Where strip c starts in a row-major slice.
+    uint64_t stripOffset(uint64_t c) const { return c*stripSize*x*pixelBytes(); }
     // Uncompressed bytes of chunk c (tiles are always full, zero padded).
     uint64_t chunkBytes(uint64_t c) const {
-        if(tileSize) return tileSize*tileSize*bytes;
-        return std::min<uint64_t>(stripSize, y - c*stripSize)*x*bytes;
+        if(tileSize) return tileSize*tileSize*pixelBytes();
+        return std::min<uint64_t>(stripSize, y - c*stripSize)*x*pixelBytes();
     }
-    uint64_t maxChunkBytes() const { return tileSize ? tileSize*tileSize*bytes : std::min<uint64_t>(stripSize, y)*x*bytes; }
+    uint64_t maxChunkBytes() const { return tileSize ? tileSize*tileSize*pixelBytes() : std::min<uint64_t>(stripSize, y)*x*pixelBytes(); }
     // Room for any chunk once prepared: compressed output can exceed its input.
     uint64_t chunkBufferBytes() const { return compression == COMPRESSION_NONE ? maxChunkBytes() : (maxChunkBytes() + 2000*bytes)*2 + 1; }
 };
@@ -151,7 +188,16 @@ void fillChunk(const WriteJob& j, uint64_t s, uint64_t c, uint8_t* dst){
         const uint64_t validH = std::min<uint64_t>(j.tileSize, j.y - tileY0), validW = std::min<uint64_t>(j.tileSize, j.x - tileX0);
         if(!j.transpose){
             gatherTile(dst, slice, (int64_t)j.x, (int64_t)tileX0, (int64_t)tileY0, (int64_t)validW, (int64_t)validH,
-                       (int64_t)j.tileSize, (int64_t)j.tileSize, (int64_t)j.bytes);
+                       (int64_t)j.tileSize, (int64_t)j.tileSize, (int64_t)j.pixelBytes());
+            return;
+        }
+        if(j.samples > 1){
+            switch(j.bytes){
+                case 1: gatherTileTransposedColor((uint8_t*)dst,  (const uint8_t*)slice,  j.x, j.y, j.samples, tileX0, tileY0, validW, validH, j.tileSize, j.tileSize); break;
+                case 2: gatherTileTransposedColor((uint16_t*)dst, (const uint16_t*)slice, j.x, j.y, j.samples, tileX0, tileY0, validW, validH, j.tileSize, j.tileSize); break;
+                case 4: gatherTileTransposedColor((uint32_t*)dst, (const uint32_t*)slice, j.x, j.y, j.samples, tileX0, tileY0, validW, validH, j.tileSize, j.tileSize); break;
+                case 8: gatherTileTransposedColor((uint64_t*)dst, (const uint64_t*)slice, j.x, j.y, j.samples, tileX0, tileY0, validW, validH, j.tileSize, j.tileSize); break;
+            }
             return;
         }
         switch(j.bytes){
@@ -164,7 +210,16 @@ void fillChunk(const WriteJob& j, uint64_t s, uint64_t c, uint8_t* dst){
     }
     const uint64_t r0 = c*j.stripSize, rows = std::min<uint64_t>(j.stripSize, j.y - r0);
     if(!j.transpose){
-        memcpy(dst, slice + r0*j.x*j.bytes, (size_t)(rows*j.x*j.bytes));
+        memcpy(dst, slice + j.stripOffset(c), (size_t)(rows*j.x*j.pixelBytes()));
+        return;
+    }
+    if(j.samples > 1){
+        switch(j.bytes){
+            case 1: transposeRowsColor((uint8_t*)dst,  (const uint8_t*)slice,  j.x, j.y, j.samples, r0, rows); break;
+            case 2: transposeRowsColor((uint16_t*)dst, (const uint16_t*)slice, j.x, j.y, j.samples, r0, rows); break;
+            case 4: transposeRowsColor((uint32_t*)dst, (const uint32_t*)slice, j.x, j.y, j.samples, r0, rows); break;
+            case 8: transposeRowsColor((uint64_t*)dst, (const uint64_t*)slice, j.x, j.y, j.samples, r0, rows); break;
+        }
         return;
     }
     switch(j.bytes){
@@ -190,7 +245,7 @@ bool produceChunk(const WriteJob& j, uint64_t s, uint64_t c, Chunk* chunks, uint
         return true;
     }
     const uint8_t* src = scratch;
-    if(!j.tileSize && !j.transpose) src = j.data + s*j.sliceBytes() + c*j.stripSize*j.x*j.bytes;   // compress in place
+    if(!j.tileSize && !j.transpose) src = j.data + s*j.sliceBytes() + j.stripOffset(c);   // compress in place
     else fillChunk(j, s, c, scratch);
     const uint64_t bound = j.chunkBufferBytes();
     uint8_t* out = pool.get();
@@ -240,9 +295,15 @@ uint8_t writeSlices(const WriteJob& j, const char* fileName, const char* mode, C
         }
         else TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, (uint32_t)j.stripSize);
         TIFFSetField(tif, TIFFTAG_COMPRESSION, j.compression);
-        TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, 1);
-        TIFFSetField(tif, TIFFTAG_PLANARCONFIG, 1);
-        TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 1);
+        // Color is RGB with each pixel's samples together (chunky). RGBA's
+        // fourth sample is straight (unassociated) alpha, as tifffile writes it.
+        TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, j.samples > 1 ? PHOTOMETRIC_RGB : PHOTOMETRIC_MINISBLACK);
+        TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+        TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, (uint16_t)j.samples);
+        if(j.samples == 4){
+            const uint16_t alpha = EXTRASAMPLE_UNASSALPHA;
+            TIFFSetField(tif, TIFFTAG_EXTRASAMPLES, (uint16_t)1, &alpha);
+        }
         TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT, sf);
 
         for(uint64_t c = 0; c < j.chunksPerSlice; c++){
@@ -250,7 +311,7 @@ uint8_t writeSlices(const WriteJob& j, const char* fileName, const char* mode, C
             int64_t n;
             Chunk* ch = NULL;
             if(j.direct()){
-                p = j.data + s*j.sliceBytes() + c*j.stripSize*j.x*j.bytes;
+                p = j.data + s*j.sliceBytes() + j.stripOffset(c);
                 n = (int64_t)j.chunkBytes(c);
             }
             else{
@@ -425,11 +486,11 @@ uint8_t writeJob(const WriteJob& j, const char* fileName, const char* mode, int 
 // than 256 in all, and then shrink toward 256, but never below 64 KB. Only
 // the image size decides, so the same data gives the same file on any machine
 // and thread count.
-uint64_t autoStripRows(uint64_t x, uint64_t y, uint64_t nSlices, uint64_t bytes){
+uint64_t autoStripRows(uint64_t x, uint64_t y, uint64_t nSlices, uint64_t pixelBytes){
     const uint64_t kRows = 512, kStrips = 256, kMinBytes = (uint64_t)64 << 10;
     const uint64_t slices = std::max<uint64_t>(nSlices, 1);
     const uint64_t perSlice = (kStrips + slices - 1) / slices;
-    const uint64_t rowBytes = std::max<uint64_t>(x*bytes, 1);
+    const uint64_t rowBytes = std::max<uint64_t>(x*pixelBytes, 1);
     const uint64_t rows = std::max((y + perSlice - 1) / perSlice, (kMinBytes + rowBytes - 1) / rowBytes);
     return std::max<uint64_t>(1, std::min(rows, kRows));
 }
@@ -438,7 +499,8 @@ uint64_t autoStripRows(uint64_t x, uint64_t y, uint64_t nSlices, uint64_t bytes)
 // are written, taken from the start of data. A stripSize of 0 picks the rows
 // per strip automatically (autoStripRows).
 uint8_t makeJob(WriteJob& j, uint64_t x, uint64_t y, uint64_t z, const void* data, uint64_t bits, uint64_t startSlice,
-                uint64_t stripSize, bool transpose, const std::string& compression, uint16_t sampleFormat, uint64_t tileSize){
+                uint64_t stripSize, bool transpose, const std::string& compression, uint16_t sampleFormat, uint64_t tileSize,
+                uint64_t samples){
     if(bits != 8 && bits != 16 && bits != 32 && bits != 64){
         printf("Error: %llu-bit samples are not supported\n", (unsigned long long)bits);
         return 1;
@@ -448,9 +510,13 @@ uint8_t makeJob(WriteJob& j, uint64_t x, uint64_t y, uint64_t z, const void* dat
         printf("Error: tile size %llu is not a multiple of 16\n",(unsigned long long)tileSize);
         return 1;
     }
-    j.x = x; j.y = y; j.bits = bits; j.bytes = bits/8;
+    if(samples != 1 && samples != 3 && samples != 4){
+        printf("Error: %llu samples per pixel are not supported (1 = grayscale, 3 = RGB, 4 = RGBA)\n", (unsigned long long)samples);
+        return 1;
+    }
+    j.x = x; j.y = y; j.bits = bits; j.bytes = bits/8; j.samples = samples;
     j.nSlices = z > startSlice ? z - startSlice : 0;
-    if(!tileSize && !stripSize) stripSize = autoStripRows(x, y, j.nSlices, j.bytes);
+    if(!tileSize && !stripSize) stripSize = autoStripRows(x, y, j.nSlices, j.pixelBytes());
     j.stripSize = stripSize; j.tileSize = tileSize;
     j.tilesAcross = tileSize ? (x + tileSize - 1)/tileSize : 0;
     j.tilesDown = tileSize ? (y + tileSize - 1)/tileSize : 0;
@@ -466,29 +532,29 @@ uint8_t makeJob(WriteJob& j, uint64_t x, uint64_t y, uint64_t z, const void* dat
 }
 
 // Single-threaded write of row-major data.
-uint8_t writeTiffSingle(const uint64_t x, const uint64_t y, const uint64_t z, const char* fileName, const void* tiff, const void* tiffOld, const uint64_t bits, const uint64_t startSlice, const uint64_t stripSize, const char* mode, const bool transpose, const std::string &compression, const uint16_t sampleFormat, const uint64_t tileSize){
+uint8_t writeTiffSingle(const uint64_t x, const uint64_t y, const uint64_t z, const char* fileName, const void* tiff, const void* tiffOld, const uint64_t bits, const uint64_t startSlice, const uint64_t stripSize, const char* mode, const bool transpose, const std::string &compression, const uint16_t sampleFormat, const uint64_t tileSize, const uint64_t samples){
     (void)tiffOld; (void)transpose;   // tiff is already row-major
     WriteJob j;
-    if(makeJob(j, x, y, z, tiff, bits, startSlice, stripSize, false, compression, sampleFormat, tileSize)) return 1;
+    if(makeJob(j, x, y, z, tiff, bits, startSlice, stripSize, false, compression, sampleFormat, tileSize, samples)) return 1;
     return writeJob(j, fileName, mode, 1);
 }
 
 // Parallel write of row-major data.
-uint8_t writeTiffParallel(const uint64_t x, const uint64_t y, const uint64_t z, const char* fileName, const void* tiff, const void* tiffOld, const uint64_t bits, const uint64_t startSlice, const uint64_t stripSize, const char* mode, const bool transpose, const std::string &compression, const uint16_t sampleFormat, const uint64_t tileSize){
+uint8_t writeTiffParallel(const uint64_t x, const uint64_t y, const uint64_t z, const char* fileName, const void* tiff, const void* tiffOld, const uint64_t bits, const uint64_t startSlice, const uint64_t stripSize, const char* mode, const bool transpose, const std::string &compression, const uint16_t sampleFormat, const uint64_t tileSize, const uint64_t samples){
     (void)tiffOld; (void)transpose;   // tiff is already row-major
     WriteJob j;
-    if(makeJob(j, x, y, z, tiff, bits, startSlice, stripSize, false, compression, sampleFormat, tileSize)) return 1;
+    if(makeJob(j, x, y, z, tiff, bits, startSlice, stripSize, false, compression, sampleFormat, tileSize, samples)) return 1;
     return writeJob(j, fileName, mode, omp_get_max_threads());
 }
 
-// data is row-major (z, y, x), or column-major MATLAB order (y, x, z) when transpose.
-uint8_t writeTiffParallelWrapper(const uint64_t x, const uint64_t y, const uint64_t z, const char* fileName, const void* data, const uint64_t bits, const uint64_t startSlice, const uint64_t stripSize, const char* mode, const bool transpose, const std::string &compression, const uint16_t sampleFormat, const uint64_t tileSize){
+// data is row-major (z, y, x[, c]), or column-major MATLAB order (y, x[, c], z) when transpose.
+uint8_t writeTiffParallelWrapper(const uint64_t x, const uint64_t y, const uint64_t z, const char* fileName, const void* data, const uint64_t bits, const uint64_t startSlice, const uint64_t stripSize, const char* mode, const bool transpose, const std::string &compression, const uint16_t sampleFormat, const uint64_t tileSize, const uint64_t samples){
     WriteJob j;
-    if(makeJob(j, x, y, z, data, bits, startSlice, stripSize, transpose, compression, sampleFormat, tileSize)) return 1;
+    if(makeJob(j, x, y, z, data, bits, startSlice, stripSize, transpose, compression, sampleFormat, tileSize, samples)) return 1;
     return writeJob(j, fileName, mode, omp_get_max_threads());
 }
 
-uint8_t writeTiffParallelHelper(const char* fileName, const void* tiffOld, uint64_t bits, const char* mode, uint64_t x, uint64_t y, uint64_t z, uint64_t startSlice, const bool transpose, const std::string &compression, const uint16_t sampleFormat, const uint64_t tileSize)
+uint8_t writeTiffParallelHelper(const char* fileName, const void* tiffOld, uint64_t bits, const char* mode, uint64_t x, uint64_t y, uint64_t z, uint64_t startSlice, const bool transpose, const std::string &compression, const uint16_t sampleFormat, const uint64_t tileSize, const uint64_t samples)
 {
 	// Check if folder exists, if not then make it (recursive if needed)
 	char* folderName = strdup(fileName);
@@ -522,5 +588,5 @@ uint8_t writeTiffParallelHelper(const char* fileName, const void* tiffOld, uint6
 	// 0 lets the writer choose the rows per strip from the image size.
 	uint64_t stripSize = 0;
 
-    return writeTiffParallelWrapper(x, y, z, fileName, tiffOld, bits, startSlice, stripSize, mode, transpose, compression, sampleFormat, tileSize);
+    return writeTiffParallelWrapper(x, y, z, fileName, tiffOld, bits, startSlice, stripSize, mode, transpose, compression, sampleFormat, tileSize, samples);
 }

@@ -47,11 +47,17 @@ void mexFunction(int nlhs, mxArray *plhs[],
     uint64_t x = 1,y = 1,z = 1,bits = 1, startSlice = 0;
     TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &x);
     TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &y);
-    
+    uint16_t spp = 1, planar = 1;
+    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_PLANARCONFIG, &planar);
+    // The ImageJ reader takes the pixels as one contiguous block, which is not
+    // how tiled or planar (separate color planes) data is laid out.
+    const bool contiguous = !TIFFIsTiled(tif) && !(spp > 1 && planar == PLANARCONFIG_SEPARATE);
+
     uint8_t imageJIm = 0;
     if(nrhs == 1){
         z = getImageSizeZ(fileName);
-        if(isImageJIm(fileName)){
+        if(contiguous && isImageJIm(fileName)){
             imageJIm = 1;
             uint64_t tempZ = imageJImGetZ(fileName);
             if(tempZ) z = tempZ;
@@ -65,7 +71,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
             startSlice = (uint64_t)*(mxGetPr(prhs[1]))-1;
             z = (uint64_t)*((mxGetPr(prhs[1])+1))-startSlice;
             uint64_t maxSize = 0;
-            if(isImageJIm(fileName)){
+            if(contiguous && isImageJIm(fileName)){
                 imageJIm = 1;
                 maxSize = imageJImGetZ(fileName);
             }
@@ -77,18 +83,17 @@ void mexFunction(int nlhs, mxArray *plhs[],
     }
 
     TIFFGetField(tif, TIFFTAG_BITSPERSAMPLE, &bits);
-    uint64_t stripSize = 1;
-    TIFFGetField(tif, TIFFTAG_ROWSPERSTRIP, &stripSize);
-    uint16_t spp = 1, planar = 1;
-    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
-    TIFFGetFieldDefaulted(tif, TIFFTAG_PLANARCONFIG, &planar);
+    // libtiff's own value: the TIFF default (2^32 - 1, one strip) when the tag
+    // is missing. The readers limit it to the image height.
+    uint32_t rowsPerStrip = 0;
+    TIFFGetFieldDefaulted(tif, TIFFTAG_ROWSPERSTRIP, &rowsPerStrip);
+    uint64_t stripSize = rowsPerStrip;
     TIFFClose(tif);
 
     uint64_t samples = spp;
-    if(samples > 1 && planar == 2)
-        mexErrMsgIdAndTxt("tiff:planarError","Planar (PLANARCONFIG=2) RGB TIFFs are not supported");
 
-    // Channel-last MATLAB layout: 3D (y,x,z) grayscale, or 4D (y,x,c,z) for RGB/RGBA.
+    // Channel-last MATLAB layout: 3D (y,x,z) grayscale, or 4D (y,x,c,z) for RGB/RGBA,
+    // whether the file stores the colors interleaved (chunky) or as separate planes.
     uint64_t dim[4];
     dim[0] = y;
     dim[1] = x;

@@ -104,17 +104,18 @@ static const uint64_t rawFlipBlockBytes = (uint64_t)1 << 20;
 // way libtiff would. libtiff splits a large uncompressed strip into ~8 KB
 // strips and reads each one separately; on NFS every read call has a fixed
 // cost, which made stacks of small uncompressed slices up to 1.9x slower than
-// v1.6.2's memory-mapped reads. Returns false if the layout does not match or
-// the read comes up short, so the caller falls back to libtiff strip by strip,
-// which also reports real errors.
-static bool readRawStrips(TIFF* tif, int64_t first, int64_t last, uint64_t stripSize, uint64_t y,
+// v1.6.2's memory-mapped reads. base is the first strip of the plane being
+// read (0 unless the file is planar). Returns false if the layout does not
+// match or the read comes up short, so the caller falls back to libtiff strip
+// by strip, which also reports real errors.
+static bool readRawStrips(TIFF* tif, int64_t first, int64_t last, int64_t base, uint64_t stripSize, uint64_t y,
                           uint64_t rowBytes, uint64_t bits, uint8_t* dst){
     uint64_t *offsets = NULL, *counts = NULL;
     if(!TIFFGetField(tif, TIFFTAG_STRIPOFFSETS, &offsets) || !TIFFGetField(tif, TIFFTAG_STRIPBYTECOUNTS, &counts)
        || !offsets || !counts || (uint64_t)last > TIFFNumberOfStrips(tif)) return false;
     uint64_t total = 0;
     for(int64_t i = first; i < last; i++){
-        const uint64_t rows = std::min<uint64_t>(stripSize, y - (uint64_t)i*stripSize);
+        const uint64_t rows = std::min<uint64_t>(stripSize, y - (uint64_t)(i - base)*stripSize);
         if(counts[i] != rows*rowBytes || offsets[i] != offsets[first] + total) return false;
         total += counts[i];
     }
@@ -204,21 +205,135 @@ static inline void flipTransposeTileRGB(T* out, const T* buf, int64_t x, int64_t
     }
 }
 
+// ---- Planar color -------------------------------------------------------
+// A planar (PLANARCONFIG=2) file stores each color as its own image: every
+// strip or tile of the first color, then of the next, each holding one sample
+// per pixel. The output layouts are the same as for chunky files. The flip
+// (MATLAB) layout already keeps each color in its own (y, x) plane, so a
+// planar strip or tile is transposed into it like a grayscale one. The no-flip
+// layout keeps each pixel's colors together, so the planes are interleaved.
+
+// Flip: transpose `rows` decoded rows of color p, starting at image row
+// rowOff, into that color's plane of output slice sliceIdx.
+static void flipPlanarRows(void* out, const uint8_t* buf, int64_t x, int64_t y, int64_t bits, int64_t samples,
+                           int64_t rowOff, int64_t rows, int64_t sliceIdx, int64_t p){
+    const int64_t planeOff = (sliceIdx*samples + p)*x*y;
+    switch(bits){
+        case 8:  flipTransposeStrip<uint8_t>(static_cast<uint8_t*>(out), buf, x, y, rows, rowOff, planeOff); break;
+        case 16: flipTransposeStrip<uint16_t>(static_cast<uint16_t*>(out), reinterpret_cast<const uint16_t*>(buf), x, y, rows, rowOff, planeOff); break;
+        case 32: flipTransposeStrip<uint32_t>(static_cast<uint32_t*>(out), reinterpret_cast<const uint32_t*>(buf), x, y, rows, rowOff, planeOff); break;
+        case 64: flipTransposeStrip<uint64_t>(static_cast<uint64_t*>(out), reinterpret_cast<const uint64_t*>(buf), x, y, rows, rowOff, planeOff); break;
+    }
+}
+
+template <typename T>
+static void interleavePlanes(T* out, const T* buf, uint64_t x, uint64_t rows, uint64_t samples, uint64_t planeStride){
+    for(uint64_t r = 0; r < rows; r++){
+        T* o = out + r*x*samples;
+        for(uint64_t p = 0; p < samples; p++){
+            const T* b = buf + p*planeStride + r*x;
+            for(uint64_t j = 0; j < x; j++) o[j*samples + p] = b[j];
+        }
+    }
+}
+
+// No-flip: interleave `rows` decoded rows of every color (color p's rows at
+// buf + p*planeBytes), starting at image row rowOff, into output slice sliceIdx.
+static void interleavePlanarRows(void* out, const uint8_t* buf, uint64_t x, uint64_t y, uint64_t bits, uint64_t samples,
+                                 uint64_t rowOff, uint64_t rows, uint64_t sliceIdx, uint64_t planeBytes){
+    const uint64_t first = (sliceIdx*y + rowOff)*x*samples;   // in samples
+    switch(bits){
+        case 8:  interleavePlanes<uint8_t>(static_cast<uint8_t*>(out) + first, buf, x, rows, samples, planeBytes); break;
+        case 16: interleavePlanes<uint16_t>(static_cast<uint16_t*>(out) + first, reinterpret_cast<const uint16_t*>(buf), x, rows, samples, planeBytes/2); break;
+        case 32: interleavePlanes<uint32_t>(static_cast<uint32_t*>(out) + first, reinterpret_cast<const uint32_t*>(buf), x, rows, samples, planeBytes/4); break;
+        case 64: interleavePlanes<uint64_t>(static_cast<uint64_t*>(out) + first, reinterpret_cast<const uint64_t*>(buf), x, rows, samples, planeBytes/8); break;
+    }
+}
+
+// Read strips [sBegin, sEnd) of every color of the current directory into
+// output slice sliceIdx, `step` strips at a time. buffer holds one block of
+// blockBytes (flip), or one per color, blockBytes apart (no-flip). raw reads
+// back-to-back uncompressed strips with one call (see readRawStrips). Returns
+// the strip that could not be read, or -1.
+static int64_t readPlanarStrips(TIFF* tif, uint8_t* buffer, uint64_t blockBytes, void* out,
+                                uint64_t x, uint64_t y, uint64_t bits, uint64_t samples, uint64_t stripSize,
+                                int64_t sBegin, int64_t sEnd, int64_t step, bool raw, int64_t sliceIdx, uint8_t flipXY){
+    const uint64_t rowBytes = x*(bits/8);
+    const int64_t stripsPerPlane = (int64_t)((y + stripSize - 1)/stripSize);
+    for(int64_t first = sBegin; first < sEnd; first += step){
+        const int64_t last = std::min<int64_t>(first + step, sEnd);
+        const int64_t rowOff = first*(int64_t)stripSize;
+        const int64_t rows = std::min<int64_t>((last - first)*(int64_t)stripSize, (int64_t)y - rowOff);
+        for(uint64_t p = 0; p < samples; p++){
+            const int64_t base = (int64_t)p*stripsPerPlane;
+            uint8_t* dst = buffer + (flipXY ? 0 : p*blockBytes);
+            if(!(raw && readRawStrips(tif, base + first, base + last, base, stripSize, y, rowBytes, bits, dst)))
+                for(int64_t i = first; i < last; i++)
+                    if(TIFFReadEncodedStrip(tif, (uint32_t)(base + i), dst + (i - first)*stripSize*rowBytes, stripSize*rowBytes) < 0)
+                        return base + i;
+            if(flipXY) flipPlanarRows(out, dst, (int64_t)x, (int64_t)y, (int64_t)bits, (int64_t)samples, rowOff, rows, sliceIdx, (int64_t)p);
+        }
+        if(!flipXY) interleavePlanarRows(out, buffer, x, y, bits, samples, (uint64_t)rowOff, (uint64_t)rows, (uint64_t)sliceIdx, blockBytes);
+    }
+    return -1;
+}
+
+// Place one decoded tile of color p: transposed into that color's plane
+// (flip), or spread over each pixel's samples (no-flip).
+template <typename T>
+static void placePlanarTileT(T* out, const T* buf, int64_t x, int64_t y, int64_t tileX0, int64_t tileY0,
+                             int64_t validW, int64_t validH, int64_t tw, int64_t sliceIdx, int64_t samples,
+                             int64_t p, uint8_t flipXY){
+    if(flipXY){
+        flipTransposeTile<T>(out, buf, y, tileX0, tileY0, validW, validH, tw, (sliceIdx*samples + p)*x*y);
+        return;
+    }
+    for(int64_t r = 0; r < validH; r++){
+        T* o = out + ((sliceIdx*y + tileY0 + r)*x + tileX0)*samples + p;
+        const T* b = buf + r*tw;
+        for(int64_t c = 0; c < validW; c++) o[c*samples] = b[c];
+    }
+}
+
+static void placePlanarTile(void* out, const uint8_t* buf, int64_t x, int64_t y, int64_t bits, int64_t tileX0, int64_t tileY0,
+                            int64_t validW, int64_t validH, int64_t tw, int64_t sliceIdx, int64_t samples, int64_t p, uint8_t flipXY){
+    switch(bits){
+        case 8:  placePlanarTileT<uint8_t>(static_cast<uint8_t*>(out), buf, x, y, tileX0, tileY0, validW, validH, tw, sliceIdx, samples, p, flipXY); break;
+        case 16: placePlanarTileT<uint16_t>(static_cast<uint16_t*>(out), reinterpret_cast<const uint16_t*>(buf), x, y, tileX0, tileY0, validW, validH, tw, sliceIdx, samples, p, flipXY); break;
+        case 32: placePlanarTileT<uint32_t>(static_cast<uint32_t*>(out), reinterpret_cast<const uint32_t*>(buf), x, y, tileX0, tileY0, validW, validH, tw, sliceIdx, samples, p, flipXY); break;
+        case 64: placePlanarTileT<uint64_t>(static_cast<uint64_t*>(out), reinterpret_cast<const uint64_t*>(buf), x, y, tileX0, tileY0, validW, validH, tw, sliceIdx, samples, p, flipXY); break;
+    }
+}
+
 // Decode tiles [tileStart, tileEnd) of the current directory into the output.
 // Shared by the 2D and 3D readers (they differ only in how tiles are split
-// across workers). Returns 1 and sets failedTile if a tile cannot be read.
+// across workers). For a planar file, tile t of every color is read. Returns 1
+// and sets failedTile if a tile cannot be read.
 static uint8_t readTilesInto(TIFF* tif, uint8_t* buffer, int64_t tileBufBytes,
                              void* out, int64_t x, int64_t y, int64_t bits,
-                             int64_t samples, int64_t tw, int64_t tl,
+                             int64_t samples, bool planar, int64_t tw, int64_t tl,
                              int64_t tilesAcross, int64_t tileStart, int64_t tileEnd,
                              int64_t sliceIdx, uint8_t flipXY, int64_t* failedTile) {
     const int64_t bytes = bits / 8;
+    const int64_t tilesPerPlane = tilesAcross * ((y + tl - 1) / tl);
     for (int64_t t = tileStart; t < tileEnd; t++) {
         const int64_t tileY0 = (t / tilesAcross) * tl;
         const int64_t tileX0 = (t % tilesAcross) * tw;
         int64_t validH = y - tileY0; if (validH > tl) validH = tl;
         int64_t validW = x - tileX0; if (validW > tw) validW = tw;
         if (validW <= 0 || validH <= 0) continue;
+
+        if (planar) {
+            for (int64_t p = 0; p < samples; p++) {
+                const int64_t tile = p * tilesPerPlane + t;
+                if (TIFFReadEncodedTile(tif, (uint32_t)tile, buffer, tileBufBytes) < 0) {
+                    *failedTile = tile;
+                    return 1;
+                }
+                placePlanarTile(out, buffer, x, y, bits, tileX0, tileY0, validW, validH, tw, sliceIdx, samples, p, flipXY);
+            }
+            continue;
+        }
 
         if (TIFFReadEncodedTile(tif, (uint32_t)t, buffer, tileBufBytes) < 0) {
             *failedTile = t;
@@ -310,6 +425,37 @@ static void placeScanline(void* out, const void* line, uint64_t x, uint64_t y, u
     }
 }
 
+// Place one decoded scanline of color p of a planar file (one sample per pixel).
+template <typename T>
+static void placePlanarScanlineT(T* out, const T* line, uint64_t x, uint64_t y, uint64_t samples, uint64_t p,
+                                 uint64_t row, uint64_t slice, uint8_t flipXY){
+    if(flipXY){
+        T* base = out + (slice*samples + p)*x*y + row;
+        for(uint64_t j = 0; j < x; j++) base[j*y] = line[j];
+        return;
+    }
+    T* base = out + (slice*y + row)*x*samples + p;
+    for(uint64_t j = 0; j < x; j++) base[j*samples] = line[j];
+}
+
+static void placePlanarScanline(void* out, const void* line, uint64_t x, uint64_t y, uint64_t samples, uint64_t p,
+                                uint64_t bits, uint64_t row, uint64_t slice, uint8_t flipXY){
+    switch(bits){
+        case 8:  placePlanarScanlineT(static_cast<uint8_t*>(out),  static_cast<const uint8_t*>(line),  x, y, samples, p, row, slice, flipXY); break;
+        case 16: placePlanarScanlineT(static_cast<uint16_t*>(out), static_cast<const uint16_t*>(line), x, y, samples, p, row, slice, flipXY); break;
+        case 32: placePlanarScanlineT(static_cast<uint32_t*>(out), static_cast<const uint32_t*>(line), x, y, samples, p, row, slice, flipXY); break;
+        case 64: placePlanarScanlineT(static_cast<uint64_t*>(out), static_cast<const uint64_t*>(line), x, y, samples, p, row, slice, flipXY); break;
+    }
+}
+
+// Colors stored as separate planes, each read on its own (1 if chunky).
+static uint16_t planesOf(TIFF* tif){
+    uint16_t spp = 1, planarConfig = PLANARCONFIG_CONTIG;
+    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_PLANARCONFIG, &planarConfig);
+    return (spp > 1 && planarConfig == PLANARCONFIG_SEPARATE) ? spp : 1;
+}
+
 static bool setDirectoryWithRetry(TIFF* tif, uint64_t dir){
     for(int attempt = 0; attempt < 3; attempt++)
         if(TIFFSetDirectory(tif, (tdir_t)dir)) return true;
@@ -345,6 +491,7 @@ uint8_t readTiffParallelBak(uint64_t x, uint64_t y, uint64_t z, const char* file
         }
         uint16_t spp = 1;
         TIFFGetFieldDefaulted(tif.get(), TIFFTAG_SAMPLESPERPIXEL, &spp);
+        const uint16_t planes = planesOf(tif.get());
         std::unique_ptr<uint8_t[]> line(new uint8_t[x*spp*bytes]);
         for(int64_t dir = first; dir < last && !err; dir++){
             if(!setDirectoryWithRetry(tif.get(), (uint64_t)dir)){
@@ -355,8 +502,9 @@ uint8_t readTiffParallelBak(uint64_t x, uint64_t y, uint64_t z, const char* file
                 }
                 break;
             }
+            for(uint16_t p = 0; p < planes && !err; p++)
             for(uint64_t i = 0; i < y; i++){
-                if(TIFFReadScanline(tif.get(), line.get(), (uint32_t)i, 0) < 0){
+                if(TIFFReadScanline(tif.get(), line.get(), (uint32_t)i, p) < 0){
                     #pragma omp critical
                     {
                         err = 1;
@@ -364,7 +512,8 @@ uint8_t readTiffParallelBak(uint64_t x, uint64_t y, uint64_t z, const char* file
                     }
                     break;
                 }
-                placeScanline(tiff, line.get(), x, y, spp, bits, i, (uint64_t)(dir - (int64_t)startSlice), flipXY);
+                if(planes > 1) placePlanarScanline(tiff, line.get(), x, y, spp, p, bits, i, (uint64_t)(dir - (int64_t)startSlice), flipXY);
+                else placeScanline(tiff, line.get(), x, y, spp, bits, i, (uint64_t)(dir - (int64_t)startSlice), flipXY);
             }
         }
     }
@@ -376,6 +525,10 @@ uint8_t readTiffParallelBak(uint64_t x, uint64_t y, uint64_t z, const char* file
 
 uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint8_t flipXY){
     uint64_t bytes = bits/8;
+    // More rows per strip than the image has (2^32 - 1, the TIFF default, is
+    // common) is one strip. The buffers below were sized from it, so a flip
+    // read of such a compressed image asked for terabytes and crashed.
+    stripSize = std::max<uint64_t>(1, std::min(stripSize, y));
     // At most one thread per slice, so a short stack does not open the file
     // once for every core.
     const int32_t team = (int32_t)std::max<uint64_t>(1, std::min<uint64_t>((uint64_t)omp_get_max_threads(), z));
@@ -417,6 +570,10 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
         if(tif) TIFFGetFieldDefaulted(tif.get(), TIFFTAG_SAMPLESPERPIXEL, &spp);
         const uint64_t samples = spp;
         const uint64_t xs = x * samples;
+        // Planar color stores each color as its own image (see readPlanarStrips),
+        // so a strip row holds one sample per pixel.
+        const bool planar = tif && planesOf(tif.get()) > 1;
+        const uint64_t stripRowBytes = (planar ? x : xs)*bytes;
 
         // Tiled TIFFs store sub-rectangles instead of full-width strips.
         const bool tiled = tif && TIFFIsTiled(tif.get());
@@ -442,21 +599,24 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
         }
 
         // One scratch buffer per thread, reused for every slice it reads. Tiles
-        // always decode into it; strips only on the flip path, since the no-flip
-        // path decodes each strip straight into the output. The flip path
-        // decodes runs of strips into it and transposes each run at once (see
-        // stripsPerTranspose). new[] (not vector or make_unique) keeps it
-        // RAII-owned without zero-filling before the read.
-        const int64_t nStrips = (int64_t)((y + stripSize - 1) / stripSize);
-        const int64_t run = (!tiled && flipXY) ? std::max<int64_t>(1, std::min<int64_t>(stripsPerTranspose(stripSize, xs*bytes), nStrips)) : 1;
+        // always decode into it; strips only on the flip path or when planar,
+        // since the no-flip path decodes each chunky strip straight into the
+        // output. The flip path decodes runs of strips into it and transposes
+        // each run at once (see stripsPerTranspose); a planar no-flip read keeps
+        // a run of every color in it to interleave. new[] (not vector or
+        // make_unique) keeps it RAII-owned without zero-filling before the read.
+        const bool buffered = flipXY || planar;
+        const int64_t nStrips = (int64_t)((y + stripSize - 1) / stripSize);   // per color when planar
+        const int64_t run = (!tiled && buffered) ? std::max<int64_t>(1, std::min<int64_t>(stripsPerTranspose(stripSize, stripRowBytes), nStrips)) : 1;
         // Uncompressed slices are read with one call per slice (no-flip) or per
-        // ~1 MB block (flip); see readRawStrips. Sized from the first directory.
-        const bool rawCandidate = tif && !tiled && rawStripsOK(tif.get(), stripSize, xs*bytes);
-        const int64_t rawRun = flipXY ? std::max<int64_t>(run, std::min<int64_t>(nStrips, (int64_t)std::max<uint64_t>(1, rawFlipBlockBytes / (stripSize*xs*bytes))))
-                                      : nStrips;
+        // ~1 MB block (flip, planar); see readRawStrips. Sized from the first directory.
+        const bool rawCandidate = tif && !tiled && rawStripsOK(tif.get(), stripSize, stripRowBytes);
+        const int64_t rawRun = buffered ? std::max<int64_t>(run, std::min<int64_t>(nStrips, (int64_t)std::max<uint64_t>(1, rawFlipBlockBytes / (stripSize*stripRowBytes))))
+                                        : nStrips;
+        const uint64_t blockBytes = (uint64_t)(rawCandidate ? rawRun : run)*stripSize*stripRowBytes;
         std::unique_ptr<uint8_t[]> buffer;
         if(tiled && tileBufBytes) buffer.reset(new uint8_t[tileBufBytes]);
-        else if(!tiled && flipXY) buffer.reset(new uint8_t[(rawCandidate ? rawRun : run)*xs*stripSize*bytes]);
+        else if(!tiled && buffered) buffer.reset(new uint8_t[(planar && !flipXY ? samples : 1)*blockBytes]);
 
         // Read one slice into its place in the output.
         auto readOne = [&](int64_t dir){
@@ -479,7 +639,7 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
             if(tiled){
                 int64_t failedTile = -1;
                 if(readTilesInto(tif.get(), buffer.get(), (int64_t)tileBufBytes, tiff,
-                                 (int64_t)x, (int64_t)y, (int64_t)bits, (int64_t)samples,
+                                 (int64_t)x, (int64_t)y, (int64_t)bits, (int64_t)samples, planar,
                                  (int64_t)tw, (int64_t)tl, (int64_t)tilesAcross,
                                  0, (int64_t)(tilesAcross*tilesDown),
                                  dir - (int64_t)startSlice, flipXY, &failedTile)){
@@ -493,14 +653,27 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
                 return;
             }
 
-            const bool raw = rawCandidate && rawStripsOK(tif.get(), stripSize, xs*bytes);
+            const bool raw = rawCandidate && rawStripsOK(tif.get(), stripSize, stripRowBytes);
             const int64_t step = raw ? rawRun : run;
+            if(planar){
+                const int64_t failedStrip = readPlanarStrips(tif.get(), buffer.get(), blockBytes, tiff, x, y, bits, samples, stripSize,
+                                                             0, nStrips, step, raw, dir - (int64_t)startSlice, flipXY);
+                if(failedStrip >= 0){
+                    #pragma omp critical
+                    {
+                        errBak = 1;
+                        err = 1;
+                        sprintf(errString,"Thread %d: Strip %ld cannot be read\n",w,(long)failedStrip);
+                    }
+                }
+                return;
+            }
             for(int64_t first = 0; first < nStrips; first += step)
             {
                 const int64_t last = std::min<int64_t>(first + step, nStrips);
                 uint8_t* blockDst = flipXY ? buffer.get()
                     : static_cast<uint8_t*>(tiff) + (((first*stripSize*xs)+((dir-startSlice)*(y*xs)))*bytes);
-                if(!(raw && readRawStrips(tif.get(), first, last, stripSize, y, xs*bytes, bits, blockDst)))
+                if(!(raw && readRawStrips(tif.get(), first, last, 0, stripSize, y, xs*bytes, bits, blockDst)))
                 for(int64_t i = first; i < last; i++){
                     // No-flip: decode the strip straight into the output array (no
                     // bounce buffer, no full-image memcpy). Flip: decode into the
@@ -683,9 +856,11 @@ uint8_t readTiffParallel2DBak(uint64_t x, uint64_t y, uint64_t z, const char* fi
         }
         uint16_t spp = 1;
         TIFFGetFieldDefaulted(tif.get(), TIFFTAG_SAMPLESPERPIXEL, &spp);
+        const uint16_t planes = planesOf(tif.get());
         std::unique_ptr<uint8_t[]> line(new uint8_t[x*spp*bytes]);
+        for(uint16_t p = 0; p < planes && !err; p++)
         for(uint64_t i = rowBegin; i < rowEnd; i++){
-            if(TIFFReadScanline(tif.get(), line.get(), (uint32_t)i, 0) < 0){
+            if(TIFFReadScanline(tif.get(), line.get(), (uint32_t)i, p) < 0){
                 #pragma omp critical
                 {
                     err = 1;
@@ -693,7 +868,8 @@ uint8_t readTiffParallel2DBak(uint64_t x, uint64_t y, uint64_t z, const char* fi
                 }
                 break;
             }
-            placeScanline(tiff, line.get(), x, y, spp, bits, i, 0, flipXY);
+            if(planes > 1) placePlanarScanline(tiff, line.get(), x, y, spp, p, bits, i, 0, flipXY);
+            else placeScanline(tiff, line.get(), x, y, spp, bits, i, 0, flipXY);
         }
     }
     if(err){
@@ -704,6 +880,8 @@ uint8_t readTiffParallel2DBak(uint64_t x, uint64_t y, uint64_t z, const char* fi
 
 
 uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint8_t flipXY){
+    // More rows per strip than the image has is one strip (see readTiffParallel).
+    stripSize = std::max<uint64_t>(1, std::min(stripSize, y));
     int32_t numWorkers = omp_get_max_threads();
     uint64_t stripsPerDir = (uint64_t)ceil((double)y/(double)stripSize);
     int32_t batchSize = (stripsPerDir-1)/numWorkers+1;
@@ -722,6 +900,11 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
     TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
     const uint64_t samples = spp;          // 1=grayscale, 3=RGB, 4=RGBA
     const uint64_t xs = x * samples;       // interleaved row width (xs==x when grayscale)
+    // Planar color: each color is its own image, one sample per pixel per row,
+    // read through the buffer in both layouts (see readPlanarStrips).
+    const bool planar = planesOf(tif) > 1;
+    const uint64_t stripRowBytes = (planar ? x : xs)*bytes;
+    const bool buffered = flipXY || planar;
 
     // Tiled TIFFs store sub-rectangles instead of full-width strips. A single 2D
     // image is one directory, so here the workers are split across tiles.
@@ -774,7 +957,7 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
         // buffer and transposes each run at once (see stripsPerTranspose).
         const int64_t sBegin = (int64_t)w*batchSize;
         const int64_t sEnd = std::min<int64_t>(sBegin + batchSize, (int64_t)stripsPerDir);
-        const int64_t run = (!tiled && flipXY) ? std::max<int64_t>(1, std::min<int64_t>(stripsPerTranspose(stripSize, xs*bytes), sEnd - sBegin)) : 1;
+        const int64_t run = (!tiled && buffered) ? std::max<int64_t>(1, std::min<int64_t>(stripsPerTranspose(stripSize, stripRowBytes), sEnd - sBegin)) : 1;
         // A fresh handle is already on directory 0, and TIFFSetDirectory would
         // read it again.
         uint8_t counter = 0;
@@ -790,14 +973,16 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
             }
         }
         // An uncompressed image reads this worker's strips with one call
-        // (no-flip) or per ~1 MB block (flip); see readRawStrips.
-        const bool raw = !tiled && rawStripsOK(tif, stripSize, xs*bytes);
+        // (no-flip) or per ~1 MB block (flip, planar); see readRawStrips.
+        const bool raw = !tiled && rawStripsOK(tif, stripSize, stripRowBytes);
         const int64_t step = !raw ? run
-            : flipXY ? std::max<int64_t>(run, std::min<int64_t>(sEnd - sBegin, (int64_t)std::max<uint64_t>(1, rawFlipBlockBytes / (stripSize*xs*bytes))))
-                     : std::max<int64_t>(1, sEnd - sBegin);
-        // Tiles always decode into the buffer; strips only on the flip path,
-        // since the no-flip path decodes each strip straight into the output.
-        void* buffer = (tiled || flipXY) ? malloc(tiled ? tileBufBytes : step*stripSize*xs*bytes) : NULL;
+            : buffered ? std::max<int64_t>(run, std::min<int64_t>(sEnd - sBegin, (int64_t)std::max<uint64_t>(1, rawFlipBlockBytes / (stripSize*stripRowBytes))))
+                       : std::max<int64_t>(1, sEnd - sBegin);
+        // Tiles always decode into the buffer; chunky strips only on the flip
+        // path, since the no-flip path decodes each strip straight into the
+        // output. A planar no-flip read keeps a block of every color.
+        const uint64_t blockBytes = (uint64_t)step*stripSize*stripRowBytes;
+        void* buffer = (tiled || buffered) ? malloc(tiled ? tileBufBytes : (planar && !flipXY ? samples : 1)*blockBytes) : NULL;
         if(tiled){
             int64_t tStart = (int64_t)w*tileBatch;
             int64_t tEnd = tStart + tileBatch;
@@ -805,7 +990,7 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
             int64_t failedTile = -1;
             if(!err && tStart < tEnd &&
                readTilesInto(tif, (uint8_t*)buffer, (int64_t)tileBufBytes, tiff,
-                             (int64_t)x, (int64_t)y, (int64_t)bits, (int64_t)samples,
+                             (int64_t)x, (int64_t)y, (int64_t)bits, (int64_t)samples, planar,
                              (int64_t)tw, (int64_t)tl, (int64_t)tilesAcross,
                              tStart, tEnd, 0, flipXY, &failedTile)){
                 #pragma omp critical
@@ -816,10 +1001,23 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
                 }
             }
         }
+        else if(planar){
+            const int64_t failedStrip = (!err && sBegin < sEnd)
+                ? readPlanarStrips(tif, static_cast<uint8_t*>(buffer), blockBytes, tiff, x, y, bits, samples, stripSize, sBegin, sEnd, step, raw, 0, flipXY)
+                : -1;
+            if(failedStrip >= 0){
+                #pragma omp critical
+                {
+                    errBak = 1;
+                    err = 1;
+                    sprintf(errString,"Thread %d: Strip %ld cannot be read\n",w,(long)failedStrip);
+                }
+            }
+        }
         else for(int64_t first = sBegin; first < sEnd && !err; first += step){
             const int64_t last = std::min<int64_t>(first + step, sEnd);
             uint8_t* blockDst = flipXY ? static_cast<uint8_t*>(buffer) : static_cast<uint8_t*>(tiff) + first*stripSize*xs*bytes;
-            if(!(raw && readRawStrips(tif, first, last, stripSize, y, xs*bytes, bits, blockDst)))
+            if(!(raw && readRawStrips(tif, first, last, 0, stripSize, y, xs*bytes, bits, blockDst)))
             for(int64_t i = first; i < last; i++){
                 // No-flip: decode the strip straight into the output, as the 3D
                 // path does. Flip: decode into the buffer and transpose below.
@@ -1075,29 +1273,25 @@ void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t fl
     z = getImageSizeZ(fileName);
 
 	TIFFGetField(tif, TIFFTAG_BITSPERSAMPLE, &bits);
-	uint64_t stripSize = 1;
-	TIFFGetField(tif, TIFFTAG_ROWSPERSTRIP, &stripSize);
-	uint16_t spp = 1, planar = 1;
+	// libtiff's own value, which is the TIFF default (2^32 - 1, one strip) when
+	// the tag is missing; the readers limit it to the image height.
+	uint32_t rowsPerStrip = 0;
+	TIFFGetFieldDefaulted(tif, TIFFTAG_ROWSPERSTRIP, &rowsPerStrip);
+	const uint64_t stripSize = rowsPerStrip;
+	uint16_t spp = 1;
 	TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
-	TIFFGetFieldDefaulted(tif, TIFFTAG_PLANARCONFIG, &planar);
 	uint64_t samples = spp;   // 1=grayscale, 3=RGB, 4=RGBA
+	const bool planar = planesOf(tif) > 1;   // chunky or planar color both read channel-last
 	const bool tiled = TIFFIsTiled(tif);
 	uint16_t compression = COMPRESSION_NONE;
 	TIFFGetFieldDefaulted(tif, TIFFTAG_COMPRESSION, &compression);
 	TIFFClose(tif);
 
-	// Planar (separate-plane) multi-sample TIFFs are not supported yet; reject
-	// clearly rather than silently mis-reading. Chunky RGB/RGBA are handled.
-	if(samples > 1 && planar == 2){
-		printf("Planar (PLANARCONFIG=2) RGB TIFFs are not supported by cpp-tiff\n");
-		return NULL;
-	}
-
 	// Check if image is an imagej image with imagej metadata. The ImageJ reader
 	// pulls the pixels off disk as one contiguous block, which is not how tiled
-	// data is laid out, so tiled files go through the normal readers instead.
+	// or planar data is laid out, so those go through the normal readers instead.
 	uint8_t imageJIm = 0;
-	if(!tiled && isImageJIm(fileName)){
+	if(!tiled && !planar && isImageJIm(fileName)){
 		imageJIm = 1;
 		uint64_t tempZ = imageJImGetZ(fileName);
 		if(tempZ) z = tempZ;
