@@ -30,7 +30,7 @@ The reader returns a zyx numpy array for the given tiff file (zyxc for RGB/RGBA 
 
 The writer takes an output filename and a zyx numpy array, or a zyxc array for RGB/RGBA (3 or 4 colors last). A single yxc color image needs rgb=True, since a 3D array is otherwise written as a stack of grayscale images
 
-By default, the writer uses lzw compression but you can also pass 'none' as the third argument
+By default, the writer uses lzw compression but you can also pass 'zstd' or 'none' as the third argument. Passing a tile size (a multiple of 16) writes square tiles instead of strips
 
 #### Read and Write a tiff file
 ````
@@ -38,6 +38,13 @@ import cpptiff
 im = cpptiff.read_tiff('filename.tif')
 # Do some processing here
 cpptiff.write_tiff('outputFilename.tif', im)
+````
+
+#### Write with zstd compression, or in tiles
+````
+import cpptiff
+cpptiff.write_tiff('outputFilename.tif', im, 'zstd')
+cpptiff.write_tiff('tiledFilename.tif', im, tile=256)
 ````
 
 #### Write an RGB or RGBA tiff file
@@ -76,13 +83,13 @@ im_shape = cpptiff.get_image_shape('filename.tif')
 The C++ library can be compiled using the CMakeLists.txt file
 
 ### Prerequisites
-1. Dependencies are included in the dependencies folder
+1. CMake downloads the dependencies (LibTIFF, zlib, libdeflate and zstd) when it configures the build, so the first configure needs internet access
 2. Currently the only officially supported compiler is gcc on Linux and Mac and MinGW on Windows but others may work
 
 ### Download and Install
 ````
-git clone https://github.com/abcucberkeley/cpp-zarr
-cd cpp-zarr
+git clone https://github.com/abcucberkeley/cpp-tiff
+cd cpp-tiff
 mkdir build
 cd build
 cmake ..
@@ -113,12 +120,20 @@ size = getImageSizeMex('path/to/file.tif');
 ````
 % (y, x, z), or (y, x, c, z) for RGB/RGBA
 im = parallelReadTiff('path/to/file.tif');
+% Read slices 1 through 10
+im = parallelReadTiff('path/to/file.tif',[1 10]);
 ````
 
 #### parallelWriteTiff - Write an array out as a Tiff image
 ````
 im = rand(100,100,100);
 parallelWriteTiff('path/to/file.tif',im);
+````
+
+The optional third to fifth arguments are the mode ('w' writes a new file, 'a' appends slices to an existing one), the compression ('lzw' by default, 'zstd' or 'none') and the tile size (0 by default for strips, or a multiple of 16 for square tiles)
+````
+parallelWriteTiff('path/to/file.tif',im,'w','zstd');
+parallelWriteTiff('path/to/tiled.tif',im,'w','lzw',256);
 ````
 
 RGB/RGBA data is (y, x, c, z) with 3 or 4 colors. A single (y, x, c) color image needs the sixth argument set to true, since a 3D array is otherwise written as a stack of grayscale images
