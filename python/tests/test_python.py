@@ -8,7 +8,7 @@ built+installed wheel, so it also verifies the wheel imports and bundles its
 native library. Exits non-zero on any failure.
 
 Only numpy is available here (see test-requires in pyproject.toml), so file
-layout is checked with the small TIFF tag reader below rather than tifffile.
+layout is checked with the small TIFF tag reader below.
 """
 import os
 import struct
@@ -136,10 +136,10 @@ def make(shape, dt, rng):
 def write_imagej_tiff(path, arr, byteorder="<"):
     """Minimal single-IFD ImageJ-format TIFF: one IFD describing slice 0, every
     slice's raw data contiguous after it, and an ImageJ description carrying
-    images=Z. This is the layout ImageJ's fast save (and tifffile's
-    imagej=True, truncate=True) produce, which cpp-tiff reads through its
-    ImageJ fast path -- the library's own writer cannot produce it, hence this
-    hand-rolled fixture writer. arr is (z, y, x) or (z, y, x, 3)."""
+    images=Z. This is the layout ImageJ's fast save produces, which cpp-tiff
+    reads through its ImageJ fast path -- the library's own writer cannot
+    produce it, hence this hand-rolled fixture writer. arr is (z, y, x) or
+    (z, y, x, 3)."""
     e = byteorder
     z, y, x = arr.shape[:3]
     spp = arr.shape[3] if arr.ndim == 4 else 1
@@ -300,7 +300,7 @@ def main():
 
     # 4. ImageJ-format files (single IFD + contiguous slices). Covers the ImageJ
     #    fast path: RGB scaling by samples, z-range start offset, and byte-order
-    #    dependent swapping (real ImageJ writes big-endian, tifffile little-endian).
+    #    dependent swapping (ImageJ writes big-endian, other programs little-endian).
     yy, xx = np.meshgrid(np.arange(24), np.arange(40), indexing="ij")
     ij_rgb = np.zeros((5, 24, 40, 3), np.uint8)
     for k in range(5):
@@ -320,8 +320,8 @@ def main():
         os.remove(path)
 
     # 5. RGB and RGBA writes: (z, y, x, c) stacks, and single (y, x, c) images
-    #    with rgb=True. They read back as written, with the tags tifffile uses:
-    #    RGB, chunky, and unassociated alpha for RGBA.
+    #    with rgb=True. They read back as written, with the tags RGB, chunky,
+    #    and unassociated alpha for RGBA.
     for dt in (np.uint8, np.uint16, np.int16, np.float32, np.float64):
         name = np.dtype(dt).name
         for spp in (3, 4):
@@ -450,6 +450,81 @@ def main():
     except RuntimeError:
         pass
     os.remove(blocker)
+
+    # 8. num_threads, reads into out=, read_tiff_batch, and reads and writes from
+    #    several Python threads at once (the GIL is released while they run).
+    vol = make((5, 24, 40), np.uint16, rng)
+    rgbv = make((3, 24, 40, 3), np.uint8, rng)
+    paths = []
+    for k, (arr, comp) in enumerate(((vol, "lzw"), (vol, "none"), (rgbv, "zstd"), (vol[0], "lzw"))):
+        path = os.path.join(tmp, f"par{k}.tif")
+        cpptiff.write_tiff(path, arr, comp)
+        paths.append((path, arr))
+    for path, arr in paths:
+        name = os.path.basename(path)
+        for nt in (1, 2, 3):
+            check(np.array_equal(cpptiff.read_tiff(path, num_threads=nt), arr), f"num_threads={nt}: {name}")
+        out = np.empty_like(arr)
+        back = cpptiff.read_tiff(path, out=out)
+        check(back is out and np.array_equal(out, arr), f"out=: {name}")
+    p0 = paths[0][0]
+    o1 = np.empty((24, 40), np.uint16)
+    cpptiff.read_tiff(p0, 2, out=o1)
+    check(np.array_equal(o1, vol[2]), "out=: one slice, (y, x)")
+    o2 = np.empty((1, 24, 40), np.uint16)
+    cpptiff.read_tiff(p0, [2, 3], out=o2)
+    check(np.array_equal(o2[0], vol[2]), "out=: one slice, (1, y, x)")
+    o3 = np.empty((2, 24, 40), np.uint16)
+    cpptiff.read_tiff(p0, [1, 3], out=o3)
+    check(np.array_equal(o3, vol[1:3]), "out=: z-range")
+    readonly = np.empty((5, 24, 40), np.uint16)
+    readonly.flags.writeable = False
+    for label, bad in (("data type", np.empty((5, 24, 40), np.int16)),
+                       ("shape", np.empty((5, 40, 24), np.uint16)),
+                       ("layout", np.empty((5, 24, 40), np.uint16, order="F")),
+                       ("kind of object", [0] * 10),
+                       ("writeability", readonly)):
+        try:
+            cpptiff.read_tiff(p0, out=bad)
+            check(False, f"out= with the wrong {label} did not raise")
+        except Exception:
+            pass
+    for bad in (0, -1, 1.5, True):
+        try:
+            cpptiff.read_tiff(p0, num_threads=bad)
+            check(False, f"num_threads={bad!r} did not raise")
+        except Exception:
+            pass
+    reqs = [paths[0][0], (paths[1][0], [1, 4]), (paths[2][0], None),
+            (paths[3][0], None, np.empty((24, 40), np.uint16))]
+    got = cpptiff.read_tiff_batch(reqs * 3, num_threads=4)
+    want = [vol, vol[1:4], rgbv, vol[0]] * 3
+    check(len(got) == len(want) and all(np.array_equal(g, w) for g, w in zip(got, want)), "read_tiff_batch: results")
+    check(cpptiff.read_tiff_batch([]) == [], "read_tiff_batch: empty batch")
+    try:
+        cpptiff.read_tiff_batch([p0, os.path.join(tmp, "missing.tif")])
+        check(False, "read_tiff_batch: a missing file did not raise")
+    except Exception:
+        pass
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(4) as ex:
+        res = list(ex.map(lambda i: cpptiff.read_tiff(paths[i % 4][0], num_threads=2), range(32)))
+    check(all(np.array_equal(r, paths[i % 4][1]) for i, r in enumerate(res)), "reads from several threads")
+
+    def write_one(i):
+        path = os.path.join(tmp, f"thr{i}.tif")
+        cpptiff.write_tiff(path, vol, "lzw", num_threads=2)
+        return path
+    with ThreadPoolExecutor(4) as ex:
+        written = list(ex.map(write_one, range(8)))
+    with open(p0, "rb") as fh:
+        ref = fh.read()
+    for path in written:
+        with open(path, "rb") as fh:
+            check(fh.read() == ref, f"writes from several threads: {os.path.basename(path)} differs")
+        os.remove(path)
+    for path, _ in paths:
+        os.remove(path)
 
     if _failures:
         for f in _failures[:20]:

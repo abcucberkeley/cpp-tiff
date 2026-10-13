@@ -656,9 +656,14 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
             parts = best;
         }
     }
-    // At most one thread per slice (or piece), so a short stack does not open
-    // the file once for every core.
+    // At most one thread per slice (or piece) reads, so a short stack does not
+    // open the file once for every core. The team is still every thread, the
+    // others only waiting at the end: libgomp ends the threads a smaller team
+    // leaves out and starts them again for the next larger one, which made a
+    // loop reading 4- and 12-slice stacks in turn 1.2-1.3x as slow on 24 and 48
+    // cores.
     const int32_t team = (int32_t)std::max<uint64_t>(1, std::min<uint64_t>(threads, z*parts));
+    const int32_t pool = (int32_t)std::max<uint64_t>(threads, (uint64_t)team);
 
     uint8_t errBak = 0;
     std::atomic<uint8_t> err{0};
@@ -673,12 +678,13 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
     bool uncompressedStack = false;   // set by one thread below, read by all
 #endif
     // Each thread opens the file once and reads whichever slices it is handed.
-    #pragma omp parallel num_threads(team)
+    #pragma omp parallel num_threads(pool)
     {
         const int32_t w = omp_get_thread_num();
+        const bool reader = w < team;
         uint8_t outCounter = 0;
-        TiffPtr tif(openReaderTiff(fileName));   // RAII: TIFFClose on every exit path
-        while(!tif){
+        TiffPtr tif(reader ? openReaderTiff(fileName) : nullptr);   // RAII: TIFFClose on every exit path
+        while(reader && !tif){
             tif.reset(openReaderTiff(fileName));
             if(outCounter == 3){
                 #pragma omp critical
@@ -746,8 +752,8 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
                                         : nStrips;
         const uint64_t blockBytes = (uint64_t)(rawCandidate ? rawRun : run)*stripSize*stripRowBytes;
         std::unique_ptr<uint8_t[]> buffer;
-        if(tiled && tileBufBytes) buffer.reset(new uint8_t[tileBufBytes]);
-        else if(!tiled && buffered) buffer.reset(new uint8_t[bufferPlanes*blockBytes]);
+        if(reader && tiled && tileBufBytes) buffer.reset(new uint8_t[tileBufBytes]);
+        else if(reader && !tiled && buffered) buffer.reset(new uint8_t[bufferPlanes*blockBytes]);
 
         // Strips (per color when planar) or tiles in a slice; readPart takes a
         // range of them.
@@ -756,7 +762,16 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
         // Read strips (or tiles) [uBegin, uEnd) of one slice into their place
         // in the output.
         auto readPart = [&](int64_t dir, int64_t uBegin, int64_t uEnd){
-            if(err || !tif) return;
+            if(err) return;
+            // (only readers are handed slices; one whose open failed set err)
+            if(!tif){
+                #pragma omp critical
+                {
+                    err = 1;
+                    sprintf(errString,"Thread %d: handed a slice without a file handle\n",w);
+                }
+                return;
+            }
 
             // A fresh handle is already on directory 0, and TIFFSetDirectory
             // would read it again.
@@ -881,14 +896,22 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
         // are of different slices rather than all faulting in the same pages.
         if(parts > 1){
             const int64_t items = (int64_t)(z*parts), perSlice = (int64_t)parts, slices = (int64_t)z;
-#ifdef __linux__
-            #pragma omp for schedule(dynamic, 1)
-#else
-            #pragma omp for schedule(static)
-#endif
-            for(int64_t k = 0; k < items; k++){
+            auto readItem = [&](int64_t k){
                 const int64_t piece = k / slices;
                 readPart((int64_t)startSlice + k % slices, units*piece/perSlice, units*(piece + 1)/perSlice);
+            };
+            // Fewer pieces than threads: one each, to the readers.
+            if(team < pool){
+                #pragma omp for schedule(static, 1)
+                for(int64_t k = 0; k < items; k++) readItem(k);
+            }
+            else{
+#ifdef __linux__
+                #pragma omp for schedule(dynamic, 1)
+#else
+                #pragma omp for schedule(static)
+#endif
+                for(int64_t k = 0; k < items; k++) readItem(k);
             }
         }
         else{
@@ -951,6 +974,8 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
             else
 #endif
             {
+                // (contiguous blocks; with no more slices than threads, slice k
+                // goes to thread k, a reader)
                 #pragma omp for schedule(static)
                 for(int64_t dir = (int64_t)startSlice; dir < (int64_t)(startSlice+z); dir++) readOne(dir);
             }
@@ -987,7 +1012,9 @@ uint8_t readTiffParallel2DBak(uint64_t x, uint64_t y, uint64_t z, const char* fi
     int32_t w;
     std::atomic<uint8_t> err{0};
     char errString[10000];
-    #pragma omp parallel for num_threads(numWorkers)
+    // Every thread of the calling thread's team, one worker each (see
+    // readTiffParallel2D).
+    #pragma omp parallel for num_threads(omp_get_max_threads()) schedule(static, 1)
     for(w = 0; w < numWorkers; w++){
         if(err) continue;
         const uint64_t rowBegin = std::min<uint64_t>((uint64_t)w*stripsPerWorker*rowsPerStrip, y);
@@ -1085,13 +1112,16 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
     }
     const int32_t tileBatch = tiled ? (int32_t)((numTiles-1)/numWorkers+1) : 0;
 
-    // Only start as many workers as there are strips or tiles to read. A
-    // small image has just a few, and every extra worker opened the file
-    // and selected its directory for nothing.
+    // Only as many workers as there are strips or tiles to read: a small image
+    // has just a few, and every extra worker opened the file and selected its
+    // directory for nothing. The team is still every thread (one worker each,
+    // the rest wait at the end): libgomp ends the threads a smaller team leaves
+    // out and starts them again for the next larger one, which made a loop
+    // reading two image sizes in turn twice as slow on 48 cores.
     const uint64_t workItems = tiled ? numTiles : stripsPerDir;
     const uint64_t perWorker = tiled ? (uint64_t)tileBatch : (uint64_t)batchSize;
     const int32_t activeWorkers = (int32_t)std::max<uint64_t>(1, std::min<uint64_t>((uint64_t)numWorkers, (workItems + perWorker - 1) / perWorker));
-    #pragma omp parallel for num_threads(activeWorkers)
+    #pragma omp parallel for num_threads(numWorkers) schedule(static, 1)
     for(w = 0; w < activeWorkers; w++){
 
         uint8_t outCounter = 0;
@@ -1291,7 +1321,7 @@ uint8_t readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* f
 
     // The raw fread below bypasses libtiff, so swap bytes only when the file's
     // byte order differs from the host's (ImageJ itself writes big-endian, but
-    // e.g. tifffile writes ImageJ-format files little-endian by default).
+    // other programs write ImageJ-format files little-endian).
     const int needSwap = TIFFIsByteSwapped(tif);
 
     TIFFClose(tif);
@@ -1419,41 +1449,20 @@ uint8_t readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* f
 
 
 // tiff pointer guaranteed to be NULL or the correct size array for the tiff file
-void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t flipXY, const std::vector<uint64_t> &zRange = {})
+void* readTiffParallelInfo(const char* fileName, const TiffInfo &info, void* tiff, uint8_t flipXY, const std::vector<uint64_t> &zRange)
 {
 	TIFFSetWarningHandler(DummyHandler);
-	TIFF* tif = TIFFOpen(fileName, "r");
-	if(!tif) return NULL;
-
-	uint64_t x = 1,y = 1,z = 1,bits = 1, startSlice = 0;
-	TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &x);
-	TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &y);
-    z = getImageSizeZ(fileName);
-
-	TIFFGetField(tif, TIFFTAG_BITSPERSAMPLE, &bits);
+	uint64_t x = info.x, y = info.y, z = info.z, bits = info.bits, startSlice = 0;
 	// libtiff's own value, which is the TIFF default (2^32 - 1, one strip) when
 	// the tag is missing; the readers limit it to the image height.
-	uint32_t rowsPerStrip = 0;
-	TIFFGetFieldDefaulted(tif, TIFFTAG_ROWSPERSTRIP, &rowsPerStrip);
-	const uint64_t stripSize = rowsPerStrip;
-	uint16_t spp = 1;
-	TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
-	uint64_t samples = spp;   // 1=grayscale, 3=RGB, 4=RGBA
-	const bool planar = planesOf(tif) > 1;   // chunky or planar color both read channel-last
-	const bool tiled = TIFFIsTiled(tif);
-	uint16_t compression = COMPRESSION_NONE;
-	TIFFGetFieldDefaulted(tif, TIFFTAG_COMPRESSION, &compression);
-	TIFFClose(tif);
-
-	// Check if image is an imagej image with imagej metadata. The ImageJ reader
-	// pulls the pixels off disk as one contiguous block, which is not how tiled
-	// or planar data is laid out, so those go through the normal readers instead.
-	uint8_t imageJIm = 0;
-	if(!tiled && !planar && isImageJIm(fileName)){
-		imageJIm = 1;
-		uint64_t tempZ = imageJImGetZ(fileName);
-		if(tempZ) z = tempZ;
-	}
+	const uint64_t stripSize = info.stripSize;
+	const uint64_t samples = info.samples;   // 1=grayscale, 3=RGB, 4=RGBA (chunky or planar, both read channel-last)
+	const bool tiled = info.tiled;
+	const uint16_t compression = info.compression;
+	// ImageJ images with ImageJ metadata: the ImageJ reader pulls the pixels off
+	// disk as one contiguous block, which is not how tiled or planar data is
+	// laid out, so those go through the normal readers instead.
+	const uint8_t imageJIm = info.imageJ;
 
     if(zRange.size()){
         if(zRange.size() == 2){
@@ -1502,6 +1511,15 @@ void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t fl
 		return NULL;
 	}
 	return tiff;
+}
+
+// One open and one walk of the directories for everything the read needs (it
+// was three opens and a walk here).
+void* readTiffParallelWrapperHelper(const char* fileName, void* tiff, uint8_t flipXY, const std::vector<uint64_t> &zRange = {})
+{
+	TiffInfo info;
+	if(getTiffInfo(fileName, info)) return NULL;
+	return readTiffParallelInfo(fileName, info, tiff, flipXY, zRange);
 }
 
 void* readTiffParallelWrapper(const char* fileName, const std::vector<uint64_t> &zRange)

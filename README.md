@@ -78,6 +78,23 @@ import cpptiff
 im_shape = cpptiff.get_image_shape('filename.tif')
 ````
 
+#### Read many files at once
+read_tiff_batch reads a list of files (or slice ranges of them) with the reads overlapping, which is much faster than reading them one after another when each file is small. It returns the arrays in the order of the requests
+````
+import cpptiff
+ims = cpptiff.read_tiff_batch(['a.tif', ('b.tif', [0, 2])])
+````
+
+#### Threads and reading into an existing array
+By default every call uses all CPUs (or OMP_NUM_THREADS). num_threads sets the threads of one call, and since reads and writes release the GIL, calls from several Python threads run at once. out reads into an existing array (of the shape read_tiff returns and the file's data type) instead of a new one
+````
+import numpy as np
+import cpptiff
+im = cpptiff.read_tiff('filename.tif', num_threads=4)
+cpptiff.read_tiff('filename.tif', out=im)
+cpptiff.write_tiff('outputFilename.tif', im, num_threads=4)
+````
+
 ## CMake
 
 The C++ library can be compiled using the CMakeLists.txt file

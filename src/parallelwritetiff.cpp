@@ -268,13 +268,12 @@ bool produceChunk(const WriteJob& j, uint64_t s, uint64_t c, Chunk* chunks, uint
 // File I/O for libtiff that batches writes (Linux and macOS). libtiff writes
 // each strip with a seek and a write, and each directory with about ten small
 // seeks, reads and writes (it reads the previous directory back to link the
-// new one to it): about 25 calls per slice of an uncompressed stack, where
-// tifffile writes the whole stack in a few. Here writes are queued in file
-// order and sent with pwritev (writev elsewhere): small ones are copied, large
-// ones from the caller's own array (stable) are queued by address, and large
-// ones from buffers that are about to be reused are sent at once together with
-// the queue. Seeks, and reads of queued data or of the small writes sent last,
-// are answered from memory. Uncompressed writes of 500-slice stacks became
+// new one to it): about 25 calls per slice of an uncompressed stack. Here
+// writes are queued in file order and sent with pwritev (writev elsewhere):
+// small ones are copied, large ones from the caller's own array (stable) are
+// queued by address, and large ones from buffers that are about to be reused
+// are sent at once together with the queue. Seeks, and reads of queued data or
+// of the small writes sent last, are answered from memory. Uncompressed writes of 500-slice stacks became
 // 1-4% faster to RAM and local disk, with identical files.
 class BatchedFile {
 public:
@@ -546,8 +545,9 @@ uint8_t writeSlices(const WriteJob& j, const char* fileName, const char* mode, C
         }
         else TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, (uint32_t)j.stripSize);
         TIFFSetField(tif, TIFFTAG_COMPRESSION, j.compression);
-        // Color is RGB with each pixel's samples together (chunky). RGBA's
-        // fourth sample is straight (unassociated) alpha, as tifffile writes it.
+        // Color is RGB with each pixel's samples together (chunky). RGBA arrays
+        // are normally not premultiplied, so the fourth sample is straight
+        // (unassociated) alpha.
         TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, j.samples > 1 ? PHOTOMETRIC_RGB : PHOTOMETRIC_MINISBLACK);
         TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
         TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, (uint16_t)j.samples);

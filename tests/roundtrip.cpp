@@ -906,6 +906,62 @@ int main(int argc, char** argv){
         omp_set_num_threads(prevThreads);
     }
 
+    // ---- Metadata in one pass: getTiffInfo must give the values the
+    // per-value helpers give (each opening the file), for strips, tiles, chunky
+    // and planar color, ImageJ stacks in both byte orders and a deep stack.
+    {
+        struct MD { const char* name; bool imageJ; uint64_t x, y, z, spp, bits; uint16_t fmt, comp; uint32_t rps, tile; bool planar, be; };
+        const MD mds[] = {
+            {"md-strips", false, 40, 30,   6, 1, 16, 1, COMPRESSION_LZW,            7,  0, false, false},
+            {"md-tiles",  false, 40, 30,   5, 1, 32, 3, COMPRESSION_ZSTD,           0, 16, false, false},
+            {"md-planar", false, 40, 30,   3, 3,  8, 1, COMPRESSION_ADOBE_DEFLATE,  9,  0, true,  false},
+            {"md-rgba",   false, 40, 30,   4, 4,  8, 1, COMPRESSION_NONE,          30,  0, false, true},
+            {"md-signed", false, 40, 30,   1, 1, 16, 2, COMPRESSION_NONE,          30,  0, false, false},
+            {"md-deep",   false,  8,  8, 300, 1, 16, 1, COMPRESSION_NONE,           8,  0, false, false},
+            {"md-ij-le",  true,  40, 30,   6, 1, 16, 1, COMPRESSION_NONE,           0,  0, false, false},
+            {"md-ij-be",  true,  40, 30,   4, 3,  8, 1, COMPRESSION_NONE,           0,  0, false, true},
+        };
+        for(const MD& c : mds){
+            total++;
+            const std::string path = dir + "/" + c.name + ".tif";
+            std::vector<uint8_t> src(c.x*c.y*c.z*c.spp*(c.bits/8));
+            for(size_t i = 0; i < src.size(); i++) src[i] = (uint8_t)(i*131 + 7);
+            step(c.name, "metadata", "write fixture");
+            const bool made = c.imageJ ? writeImageJTiff(path, src.data(), c.x, c.y, c.z, c.spp, c.bits, c.be)
+                                       : writeLibtiff(path, src.data(), c.x, c.y, c.z, c.spp, c.bits, c.fmt, c.comp, c.rps, c.tile, c.planar, c.be);
+            TiffInfo info;
+            bool ok = made && !getTiffInfo(path.c_str(), info);
+            step(c.name, "metadata", "compare with the helpers");
+            uint64_t* dims = ok ? getImageSize(path.c_str()) : NULL;
+            TIFF* tif = ok ? TIFFOpen(path.c_str(), "r") : NULL;
+            ok = ok && dims && tif;
+            if(ok){
+                uint32_t rps = 0;
+                uint16_t comp = COMPRESSION_NONE, pc = PLANARCONFIG_CONTIG;
+                TIFFGetFieldDefaulted(tif, TIFFTAG_ROWSPERSTRIP, &rps);
+                TIFFGetFieldDefaulted(tif, TIFFTAG_COMPRESSION, &comp);
+                TIFFGetFieldDefaulted(tif, TIFFTAG_PLANARCONFIG, &pc);
+                const bool tiled = TIFFIsTiled(tif);
+                const uint64_t spp = getSamplesPerPixel(path.c_str());
+                const bool planar = spp > 1 && pc == PLANARCONFIG_SEPARATE;
+                const bool ij = !tiled && !planar && isImageJIm(path.c_str());
+                const uint64_t ijImages = imageJImGetZ(path.c_str());
+                ok = info.x == dims[1] && info.y == dims[0] && info.directories == dims[2]
+                  && info.z == (ij && ijImages ? ijImages : dims[2]) && info.z == c.z
+                  && info.bits == getDataType(path.c_str()) && info.samples == spp
+                  && info.sampleFormat == getSampleFormat(path.c_str())
+                  && info.stripSize == rps && info.compression == comp
+                  && info.tiled == tiled && info.planar == planar
+                  && info.imageJ == ij && info.imageJ == c.imageJ && info.imageJImages == ijImages;
+            }
+            if(tif) TIFFClose(tif);
+            free(dims);
+            std::remove(path.c_str());
+            if(ok) std::printf("PASS  %-16s metadata in one pass\n", c.name);
+            else { std::printf("FAIL  %-16s metadata in one pass  (differs from the helpers)\n", c.name); failures++; }
+        }
+    }
+
     // ---- Pieces of slices. A compressed stack of large slices with fewer than
     // 8 slices per thread is read in pieces of whole strips (or tiles) handed
     // out to the threads; every piece must land in its place, for strips,
@@ -956,8 +1012,8 @@ int main(int argc, char** argv){
     // ---- Color writes: RGB (3 samples) and RGBA (4), each pixel's samples
     // together (chunky). Row-major (z, y, x, c) and MATLAB-layout (y, x, c, z)
     // input must give the same file, as must one thread, and the file must read
-    // back in both layouts. The tags are the ones tifffile writes: RGB, chunky,
-    // and unassociated alpha for RGBA.
+    // back in both layouts. The tags are RGB, chunky, and unassociated alpha
+    // for RGBA.
     {
         struct CW { const char* name; uint64_t x, y, z, spp, bits; uint16_t fmt; const char* comp; uint64_t strip, tile; };
         const CW cws[] = {

@@ -116,7 +116,7 @@ function test_matlab(mexDir)
 
     % 5. ImageJ-format files (single IFD + contiguous slices): RGB sample
     %    scaling, z-range start offset, and byte-order handling in the ImageJ
-    %    fast path. Real ImageJ writes big-endian; tifffile writes little.
+    %    fast path. ImageJ writes big-endian; other programs write little-endian.
     ijcases = { ...
         'ij_rgb',    makeData([24 40 3 5], 'uint8'),  'l'; ...
         'ij_g16_le', makeData([24 40 4],   'uint16'), 'l'; ...
@@ -271,7 +271,7 @@ function writeImageJTiff(f, arr, byteorder)
 %   library's writer cannot produce this layout, so the test writes it by
 %   hand, mirroring the fixtures in tests/roundtrip.cpp and
 %   python/tests/test_python.py. arr is (y,x,z) or (y,x,c,z); byteorder is
-%   'l' (little endian, like tifffile) or 'b' (big endian, like ImageJ).
+%   'l' (little endian) or 'b' (big endian, as ImageJ writes).
     if ndims(arr) == 4
         [y, x, spp, z] = size(arr); perm = [3 2 1 4];   % file order: c, x, y, z
     else

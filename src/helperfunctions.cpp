@@ -6,6 +6,7 @@
 #ifdef _WIN32
 #include <algorithm>
 #endif
+#include <omp.h>
 #include "tiffio.h"
 #include "helperfunctions.h"
 #ifdef __linux__
@@ -143,12 +144,10 @@ uint64_t imageJImGetZ(const char* fileName){
     return 0;
 }
 
-uint32_t getImageSizeZ(const char* fileName){
-    TIFFSetWarningHandler(DummyHandler);
-    TIFF* tif = openForDirectoryWalk(fileName);
-    if(!tif){ printf("File \"%s\" cannot be opened\n",fileName); return 0; }
-
-    uint32_t s = 0, m = 0, t = 1, z = 1;
+// The number of directories, found by stepping ahead 8x at a time and then
+// bisecting; the handle starts on directory 0.
+static uint32_t countDirectories(TIFF* tif){
+    uint32_t s = 0, m = 0, t = 1;
     while(TIFFSetDirectory(tif,t)){
         s = t;
         t *= 8;
@@ -168,9 +167,63 @@ uint32_t getImageSizeZ(const char* fileName){
             else t = m;
         }
     }
-    z = s+1;
+    return s+1;
+}
+
+uint32_t getImageSizeZ(const char* fileName){
+    TIFFSetWarningHandler(DummyHandler);
+    TIFF* tif = openForDirectoryWalk(fileName);
+    if(!tif){ printf("File \"%s\" cannot be opened\n",fileName); return 0; }
+    const uint32_t z = countDirectories(tif);
     TIFFClose(tif);
     return z;
+}
+
+uint8_t getTiffInfo(const char* fileName, TiffInfo &info){
+    TIFFSetWarningHandler(DummyHandler);
+    TIFF* tif = openForDirectoryWalk(fileName);
+    if(!tif) return 1;
+    info = TiffInfo();
+    uint32_t x = 1, y = 1, rowsPerStrip = 0;
+    uint16_t bits = 1, spp = 1, planarConfig = PLANARCONFIG_CONTIG, sampleFormat = SAMPLEFORMAT_UINT, compression = COMPRESSION_NONE;
+    TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &x);
+    TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &y);
+    TIFFGetField(tif, TIFFTAG_BITSPERSAMPLE, &bits);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_ROWSPERSTRIP, &rowsPerStrip);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_PLANARCONFIG, &planarConfig);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLEFORMAT, &sampleFormat);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_COMPRESSION, &compression);
+    info.x = x; info.y = y; info.bits = bits; info.samples = spp;
+    info.sampleFormat = sampleFormat; info.stripSize = rowsPerStrip; info.compression = compression;
+    info.planar = spp > 1 && planarConfig == PLANARCONFIG_SEPARATE;
+    info.tiled = TIFFIsTiled(tif);
+    // The description belongs to directory 0, which the walk below frees, so
+    // it is parsed first.
+    bool imageJDescription = false;
+    char* desc = NULL;
+    if(TIFFGetField(tif, TIFFTAG_IMAGEDESCRIPTION, &desc) && desc && strstr(desc, "ImageJ")){
+        imageJDescription = true;
+        const char* images = strstr(desc, "images=");
+        if(images){
+            char* end;
+            info.imageJImages = strtol(images+7, &end, 10);
+        }
+    }
+    info.directories = countDirectories(tif);
+    TIFFClose(tif);
+    info.z = info.directories;
+    info.imageJ = imageJDescription && info.directories == 1 && compression == COMPRESSION_NONE && !info.tiled && !info.planar;
+    if(info.imageJ && info.imageJImages) info.z = info.imageJImages;
+    return 0;
+}
+
+int callThreads(){
+    return omp_get_max_threads();
+}
+
+void setCallThreads(int n){
+    if(n > 0) omp_set_num_threads(n);
 }
 
 uint64_t* getImageSize(const char* fileName){
