@@ -14,7 +14,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
 
 project(
   cpp-tiff
-  VERSION 1.7.0
+  VERSION 1.7.1
   LANGUAGES CXX)
 
 # Set the RPATH to $ORIGIN when installing if applicable
