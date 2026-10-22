@@ -203,10 +203,12 @@ static bool writeReversedStripsTiff(const std::string& path, const uint8_t* data
 // Files the library's writer cannot produce, written by the libtiff built into
 // it: planar color (PLANARCONFIG=2: every strip or tile of the first color,
 // then of the next, one sample per pixel), any libtiff codec, any RowsPerStrip
-// (rps) or tile size, big-endian. data is chunky (z, y, x, c) in host order.
+// (rps) or tile size, big-endian, a predictor, the other bit order (fillOrder).
+// data is chunky (z, y, x, c) in host order.
 static bool writeLibtiff(const std::string& path, const uint8_t* data, uint64_t x, uint64_t y, uint64_t z,
                          uint64_t spp, uint64_t bits, uint16_t fmt, uint16_t comp, uint32_t rps, uint32_t tile,
-                         bool planar, bool bigEndian = false){
+                         bool planar, bool bigEndian = false, uint16_t predictor = PREDICTOR_NONE,
+                         uint16_t fillOrder = FILLORDER_MSB2LSB){
     TIFF* tif = TIFFOpen(path.c_str(), bigEndian ? "wb" : "wl");
     if(!tif) return false;
     const uint64_t es = bits/8, planes = planar ? spp : 1, px = planar ? es : spp*es;   // px: bytes per pixel of one plane
@@ -225,6 +227,8 @@ static bool writeLibtiff(const std::string& path, const uint8_t* data, uint64_t 
         }
         TIFFSetField(tif, TIFFTAG_PLANARCONFIG, planar ? PLANARCONFIG_SEPARATE : PLANARCONFIG_CONTIG);
         TIFFSetField(tif, TIFFTAG_COMPRESSION, comp);
+        if(predictor != PREDICTOR_NONE) TIFFSetField(tif, TIFFTAG_PREDICTOR, predictor);
+        if(fillOrder != FILLORDER_MSB2LSB) TIFFSetField(tif, TIFFTAG_FILLORDER, fillOrder);
         if(tile){ TIFFSetField(tif, TIFFTAG_TILEWIDTH, tile); TIFFSetField(tif, TIFFTAG_TILELENGTH, tile); }
         else TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, rps);
         const uint8_t* slice = data + k*x*y*spp*es;
@@ -1264,6 +1268,100 @@ int main(int argc, char** argv){
         }
         std::signal(SIGXFSZ, oldHandler);
 #endif
+    }
+
+    // ---- LZW. The library decodes LZW itself unless a file needs something
+    // only libtiff does (a predictor, the other bit order, big-endian samples),
+    // so libtiff-written files of each kind are read back in both layouts. And
+    // what the library writes must decode with libtiff alone. The data repeats
+    // with some noise (long strings, full tables) and ends with a random slice
+    // (codes longer than the bytes they stand for).
+    {
+        std::mt19937 lrng(8642u);
+        auto lzwData = [&](uint64_t bytes, uint64_t es, uint64_t slice, uint64_t bits){
+            std::vector<uint8_t> v(bytes);
+            for(uint64_t i = 0; i < bytes; i++)
+                v[i] = (bytes > slice && i >= bytes - slice) ? (uint8_t)lrng() : (uint8_t)(((i/es) % 97)/3 + (lrng() & 3));
+            if(bits == 32) for(uint64_t i = 0; i < bytes; i += 4) v[i + 3] &= 0x3F;   // keep floats finite
+            return v;
+        };
+        struct LZ { const char* name; uint64_t x, y, z, spp, bits; uint16_t fmt; uint32_t rps, tile; bool planar, be; uint16_t predictor, fillOrder; };
+        const LZ lzs[] = {
+            {"lzw-strips",     301, 203, 3, 1, 16, 1, 37,          0, false, false, PREDICTOR_NONE,          FILLORDER_MSB2LSB},
+            {"lzw-one-strip",  301, 203, 2, 1,  8, 1, 0xFFFFFFFFu, 0, false, false, PREDICTOR_NONE,          FILLORDER_MSB2LSB},
+            {"lzw-tiles",      301, 203, 2, 1, 16, 1, 0,          64, false, false, PREDICTOR_NONE,          FILLORDER_MSB2LSB},
+            {"lzw-planar",     301, 203, 2, 3,  8, 1, 50,          0, true,  false, PREDICTOR_NONE,          FILLORDER_MSB2LSB},
+            {"lzw-predictor",  301, 203, 3, 1, 16, 1, 37,          0, false, false, PREDICTOR_HORIZONTAL,    FILLORDER_MSB2LSB},
+            {"lzw-float-pred", 301, 203, 2, 1, 32, 3, 37,          0, false, false, PREDICTOR_FLOATINGPOINT, FILLORDER_MSB2LSB},
+            {"lzw-lsb2msb",    301, 203, 3, 1, 16, 1, 37,          0, false, false, PREDICTOR_NONE,          FILLORDER_LSB2MSB},
+            {"lzw-big-endian", 301, 203, 3, 1, 16, 1, 37,          0, false, true,  PREDICTOR_NONE,          FILLORDER_MSB2LSB},
+        };
+        for(const LZ& c : lzs){
+            total++;
+            const uint64_t es = c.bits/8, slice = c.x*c.y*c.spp*es;
+            const std::vector<uint8_t> src = lzwData(slice*c.z, es, slice, c.bits);
+            const std::string path = dir + "/" + c.name + ".tif";
+            step(c.name, "lzw", "write fixture with libtiff");
+            bool ok = writeLibtiff(path, src.data(), c.x, c.y, c.z, c.spp, c.bits, c.fmt, COMPRESSION_LZW, c.rps, c.tile,
+                                   c.planar, c.be, c.predictor, c.fillOrder);
+            step(c.name, "lzw", "read with the library, both layouts");
+            void* nf = ok ? readTiffParallelWrapperNoXYFlip(path.c_str(), {}) : nullptr;
+            void* fl = ok ? readTiffParallelWrapper(path.c_str(), {}) : nullptr;
+            const std::vector<uint8_t> wantFlip = flipped(src.data(), c.x, c.y, c.z, c.spp, es);
+            ok = nf && fl && std::memcmp(nf, src.data(), src.size()) == 0 && std::memcmp(fl, wantFlip.data(), wantFlip.size()) == 0;
+            free(nf); free(fl);
+            std::remove(path.c_str());
+            if(ok) std::printf("PASS  %-16s lzw read\n", c.name);
+            else { std::printf("FAIL  %-16s lzw read  (read back wrong)\n", c.name); failures++; }
+        }
+        struct LW { const char* name; uint64_t x, y, z, spp, bits; uint16_t fmt; uint64_t tile; };
+        const LW lws[] = {
+            {"lzw-lib-u16",   1000, 700, 3, 1, 16, 1,   0},
+            {"lzw-lib-u8",     777, 333, 2, 1,  8, 1,   0},
+            {"lzw-lib-f32",    512, 300, 2, 1, 32, 3,   0},
+            {"lzw-lib-rgb",    300, 200, 2, 3,  8, 1,   0},
+            {"lzw-lib-tiles",  600, 500, 2, 1, 16, 1, 128},
+        };
+        for(const LW& c : lws){
+            total++;
+            const uint64_t es = c.bits/8, px = c.spp*es, slice = c.x*c.y*px;
+            const std::vector<uint8_t> src = lzwData(slice*c.z, es, slice, c.bits);
+            const std::string path = dir + "/" + c.name + ".tif";
+            step(c.name, "lzw", "write with the library");
+            bool ok = !writeTiffParallelWrapper(c.x, c.y, c.z, path.c_str(), src.data(), c.bits, 0, 0, "w", false, "lzw", c.fmt, c.tile, c.spp);
+            step(c.name, "lzw", "decode with libtiff");
+            TIFF* tif = ok ? TIFFOpen(path.c_str(), "r") : NULL;
+            ok = tif != NULL;
+            std::vector<uint8_t> buf;
+            for(uint64_t k = 0; ok && k < c.z; k++){
+                ok = TIFFSetDirectory(tif, (tdir_t)k);
+                const uint8_t* want = src.data() + k*slice;
+                if(ok && c.tile){
+                    buf.resize((size_t)TIFFTileSize(tif));
+                    for(uint64_t ty = 0; ok && ty < c.y; ty += c.tile)
+                        for(uint64_t tx = 0; ok && tx < c.x; tx += c.tile){
+                            ok = TIFFReadEncodedTile(tif, TIFFComputeTile(tif, (uint32_t)tx, (uint32_t)ty, 0, 0), buf.data(), (tmsize_t)buf.size()) >= 0;
+                            const uint64_t w = std::min<uint64_t>(c.tile, c.x - tx);
+                            for(uint64_t r = 0; ok && r < c.tile && ty + r < c.y; r++)
+                                ok = std::memcmp(&buf[r*c.tile*px], want + ((ty + r)*c.x + tx)*px, w*px) == 0;
+                        }
+                }
+                else if(ok){
+                    buf.resize((size_t)TIFFStripSize(tif));
+                    uint64_t at = 0;
+                    for(uint32_t st = 0; ok && st < TIFFNumberOfStrips(tif); st++){
+                        const tmsize_t n = TIFFReadEncodedStrip(tif, st, buf.data(), (tmsize_t)buf.size());
+                        ok = n > 0 && at + (uint64_t)n <= slice && std::memcmp(buf.data(), want + at, (size_t)n) == 0;
+                        at += ok ? (uint64_t)n : 0;
+                    }
+                    ok = ok && at == slice;
+                }
+            }
+            if(tif) TIFFClose(tif);
+            std::remove(path.c_str());
+            if(ok) std::printf("PASS  %-16s lzw decoded by libtiff\n", c.name);
+            else { std::printf("FAIL  %-16s lzw decoded by libtiff  (differs from what was written)\n", c.name); failures++; }
+        }
     }
 
     // ---- Unreadable and damaged files: report failure, never crash.

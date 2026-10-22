@@ -113,7 +113,7 @@ add_dependencies(tiff libzstd_static)
 
 set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
-add_library(cppTiff_shared SHARED ${SRC_DIR}/helperfunctions.cpp  ${SRC_DIR}/lzwencode.cpp ${SRC_DIR}/parallelreadtiff.cpp ${SRC_DIR}/parallelwritetiff.cpp)
+add_library(cppTiff_shared SHARED ${SRC_DIR}/helperfunctions.cpp  ${SRC_DIR}/lzwencode.cpp ${SRC_DIR}/lzwdecode.cpp ${SRC_DIR}/parallelreadtiff.cpp ${SRC_DIR}/parallelwritetiff.cpp)
 set_target_properties(cppTiff_shared PROPERTIES OUTPUT_NAME cppTiff)
 add_dependencies(cppTiff_shared zlibstatic)
 add_dependencies(cppTiff_shared libdeflate_static)
