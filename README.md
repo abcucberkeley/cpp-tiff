@@ -161,6 +161,14 @@ rgbImage = zeros(512,512,3,'uint8');
 parallelWriteTiff('path/to/rgbImage.tif',rgbImage,'w','lzw',0,true);
 ````
 
+#### Threads
+On Linux the mex files run on MATLAB's own threads, so maxNumCompThreads sets how many they use and OMP_NUM_THREADS has no effect. On Mac and Windows it is the other way around: they use every CPU unless OMP_NUM_THREADS is set before MATLAB starts, and maxNumCompThreads has no effect
+````
+% Linux: read with 8 threads
+maxNumCompThreads(8);
+im = parallelReadTiff('path/to/file.tif');
+````
+
 ## Reference
 
 Please cite our software if you find it useful in your work:
