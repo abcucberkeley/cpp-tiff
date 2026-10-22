@@ -144,6 +144,16 @@ target_link_libraries(cppTiff_shared PRIVATE
     OpenMP::OpenMP_CXX
 )
 
+# Bind the library's own calls to its static libtiff, zstd, zlib and libdeflate.
+# Otherwise on Linux, once the host has loaded another libtiff into its global
+# scope (MATLAB does when Tiff or imread runs), that libtiff's functions and
+# codec table are used instead, and zstd reads fail or crash. The symbols stay
+# exported for programs that call libtiff through this library. macOS and
+# Windows already bind a library's calls to its own definitions.
+if(UNIX AND NOT APPLE)
+    target_link_options(cppTiff_shared PRIVATE "-Wl,-Bsymbolic")
+endif()
+
 install(TARGETS cppTiff_shared
         PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_WRITE GROUP_EXECUTE WORLD_READ WORLD_WRITE WORLD_EXECUTE
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
