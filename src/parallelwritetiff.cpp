@@ -21,8 +21,10 @@
 #include <unistd.h>
 #endif
 #ifdef __linux__
+#include <linux/magic.h>
 #include <sched.h>
 #include <sys/syscall.h>
+#include <sys/vfs.h>
 #endif
 #include "tiffio.h"
 #include "lzwencode.h"
@@ -284,6 +286,16 @@ public:
         struct stat st;
         if(fd_ < 0 || fstat(fd_, &st) != 0) return false;
         base_ = end_ = (uint64_t)st.st_size;
+#ifdef __linux__
+        // NFS sends what was written to the server at close, so a write would
+        // compress everything first and then wait for the whole transfer.
+        // Starting to send each part once it is written overlaps the two. Not
+        // on local disks: nothing waits for them at close, and starting their
+        // writeback early could make the write wait for the disk instead.
+        struct statfs fs;
+        writebackStep_ = (fstatfs(fd_, &fs) == 0 && fs.f_type == NFS_SUPER_MAGIC) ? kWritebackStep : 0;
+        writebackFrom_ = base_;
+#endif
         return true;
     }
     bool failed() const { return failed_; }
@@ -380,6 +392,8 @@ private:
     // copied into small_ (or, once sent, sent_) at offset at.
     struct Seg { uint64_t off, len; const uint8_t* ext; uint64_t at; };
     static const uint64_t kLarge = (uint64_t)64 << 10, kBatchBytes = (uint64_t)64 << 20;
+    // How much is written before its sending is started, on NFS
+    static const uint64_t kWritebackStep = (uint64_t)16 << 20;
     static const size_t kMaxSegs = 512;
 
     const Seg& segFor(uint64_t p) const {
@@ -456,6 +470,13 @@ private:
         if(extra) end_ += extra->len;
         base_ = end_;
         queued_ = 0;
+#ifdef __linux__
+        if(writebackStep_ && base_ - writebackFrom_ >= writebackStep_){
+            // Only starts sending; a failure is still reported at close.
+            sync_file_range(fd_, (off64_t)writebackFrom_, (off64_t)(base_ - writebackFrom_), SYNC_FILE_RANGE_WRITE);
+            writebackFrom_ = base_;
+        }
+#endif
         return true;
     }
 
@@ -468,6 +489,7 @@ private:
     int fd_ = -1;
     bool stable_, failed_ = false;
     uint64_t pos_ = 0, base_ = 0, end_ = 0, queued_ = 0;   // file [base_, end_) is queued
+    uint64_t writebackStep_ = 0, writebackFrom_ = 0;   // sending was started for the file before writebackFrom_
     std::vector<Seg> segs_, sentSegs_;
     std::vector<uint8_t> small_, sent_;
 };
