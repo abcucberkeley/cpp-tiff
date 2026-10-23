@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <utility>
 #include <vector>
 #include <thread>
 #include <omp.h>
@@ -21,10 +22,9 @@
 #include <unistd.h>
 #endif
 #ifdef __linux__
-#include <linux/magic.h>
 #include <sched.h>
 #include <sys/syscall.h>
-#include <sys/vfs.h>
+#include <sys/sysmacros.h>
 #endif
 #include "tiffio.h"
 #include "lzwencode.h"
@@ -277,6 +277,36 @@ bool produceChunk(const WriteJob& j, uint64_t s, uint64_t c, Chunk* chunks, uint
 // are sent at once together with the queue. Seeks, and reads of queued data or
 // of the small writes sent last, are answered from memory. Uncompressed writes of 500-slice stacks became
 // 1-4% faster to RAM and local disk, with identical files.
+#ifdef __linux__
+// Whether the filesystem holding device dev is NFS, from /proc/self/mountinfo
+// (read once per filesystem) rather than fstatfs: on NFS fstatfs asks the
+// server (0.07-0.4 ms on the cluster's NFS, 1.3 ms over SSHFS), which every
+// compressed file written would pay.
+static bool onNfs(dev_t dev){
+    static std::mutex m;
+    static std::vector<std::pair<dev_t, bool> > known;
+    std::lock_guard<std::mutex> g(m);
+    for(const auto& k : known) if(k.first == dev) return k.second;
+    bool nfs = false;
+    if(FILE* f = fopen("/proc/self/mountinfo", "r")){
+        char line[4096], type[64];
+        unsigned maj, mnr;
+        while(fgets(line, sizeof line, f)){
+            // "id parent major:minor root mountpoint options [optional...] - fstype source ..."
+            const char* sep = strstr(line, " - ");
+            if(!sep || sscanf(line, "%*s %*s %u:%u", &maj, &mnr) != 2 || sscanf(sep + 3, "%63s", type) != 1) continue;
+            if(makedev(maj, mnr) == dev){
+                nfs = !strcmp(type, "nfs") || !strcmp(type, "nfs4");
+                break;
+            }
+        }
+        fclose(f);
+    }
+    known.push_back(std::make_pair(dev, nfs));
+    return nfs;
+}
+#endif
+
 class BatchedFile {
 public:
     // compressed: the data comes from compressing, so on NFS its sending is
@@ -296,8 +326,7 @@ public:
         // writeback early could make the write wait for the disk instead. Not
         // for uncompressed data either: it is written as fast as it is copied,
         // so there is nothing to overlap, and on VAST it was 5% slower.
-        struct statfs fs;
-        writebackStep_ = (compressed_ && fstatfs(fd_, &fs) == 0 && fs.f_type == NFS_SUPER_MAGIC) ? kWritebackStep : 0;
+        writebackStep_ = (compressed_ && onNfs(st.st_dev)) ? kWritebackStep : 0;
         writebackFrom_ = base_;
 #endif
         return true;
