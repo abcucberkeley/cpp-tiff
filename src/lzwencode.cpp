@@ -93,8 +93,11 @@ cl_hash(hash_t* enc_hashtab)
 }
 
 // libtiff's encoder, with its 9001-entry hash table (144 KB) as the string
-// table. Used until a 2 MB direct table pays for itself (see lzwEncode).
-static uint64_t encodeWithHash(uint8_t* unCompr, uint8_t* compr, tmsize_t cc){
+// table. Used for short strips, and until a 2 MB direct table pays for itself
+// (see lzwEncode). Neither encoder is inlined: inlined into lzwEncode, how
+// GCC 13 compiled their loops depended on the code around them (6-10% either
+// way).
+__attribute__((noinline)) static uint64_t encodeWithHash(uint8_t* unCompr, uint8_t* compr, tmsize_t cc){
     hash_t* enc_hashtab = (hash_t*)_TIFFmalloc(HSIZE*sizeof (hash_t));
     if(!enc_hashtab) return 0;
     uint8_t* bp = unCompr;
@@ -261,6 +264,7 @@ TablePool pool;
 // (about 40 ms of work), and made one at a time while the other threads go on
 // with the hash table.
 const uint64_t kEarnBytes = (uint64_t)4 << 20;
+const tmsize_t kTableMinStrip = (tmsize_t)128 << 10;
 std::atomic<uint64_t> hashEncoded(0), tablesMade(0);
 std::atomic<bool> making(false);
 
@@ -298,7 +302,7 @@ void returnTable(LzwTable* t){
 
 // libtiff's encoder with a direct table instead of its hash table; the
 // table is left empty.
-static uint64_t encodeWithTable(LzwTable* table, uint8_t* unCompr, uint8_t* compr, tmsize_t cc){
+__attribute__((noinline)) static uint64_t encodeWithTable(LzwTable* table, uint8_t* unCompr, uint8_t* compr, tmsize_t cc){
     uint16_t* child = table->child;
     uint32_t* added = table->added;
     int nAdded = 0;
@@ -415,6 +419,10 @@ static uint64_t encodeWithTable(LzwTable* table, uint8_t* unCompr, uint8_t* comp
 // widths and clear codes, so the same bytes, whichever string table finds
 // them). Returns the bytes written to compr, or 0 if no table could be had.
 uint64_t lzwEncode(uint8_t* unCompr, uint8_t* compr, tmsize_t cc){
+    // A short strip starts with a cold table: on a 24-core Skylake node, many
+    // small files written with every core took 1.1x as long with the tables
+    // (23 of them, 46 MB, crowding the caches) as with the hash table.
+    if(cc < kTableMinStrip) return encodeWithHash(unCompr, compr, cc);
     LzwTable* table = takeTable();
     if(!table){
         hashEncoded.fetch_add((uint64_t)cc, std::memory_order_relaxed);
