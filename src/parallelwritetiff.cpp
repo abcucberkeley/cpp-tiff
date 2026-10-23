@@ -279,7 +279,9 @@ bool produceChunk(const WriteJob& j, uint64_t s, uint64_t c, Chunk* chunks, uint
 // 1-4% faster to RAM and local disk, with identical files.
 class BatchedFile {
 public:
-    explicit BatchedFile(bool stable) : stable_(stable) {}
+    // compressed: the data comes from compressing, so on NFS its sending is
+    // started early (see open).
+    BatchedFile(bool stable, bool compressed) : stable_(stable), compressed_(compressed) {}
     ~BatchedFile(){ if(fd_ >= 0) ::close(fd_); }
     bool open(const char* fileName, bool append){
         fd_ = ::open(fileName, O_RDWR | O_CREAT | (append ? 0 : O_TRUNC), 0666);
@@ -291,9 +293,11 @@ public:
         // compress everything first and then wait for the whole transfer.
         // Starting to send each part once it is written overlaps the two. Not
         // on local disks: nothing waits for them at close, and starting their
-        // writeback early could make the write wait for the disk instead.
+        // writeback early could make the write wait for the disk instead. Not
+        // for uncompressed data either: it is written as fast as it is copied,
+        // so there is nothing to overlap, and on VAST it was 5% slower.
         struct statfs fs;
-        writebackStep_ = (fstatfs(fd_, &fs) == 0 && fs.f_type == NFS_SUPER_MAGIC) ? kWritebackStep : 0;
+        writebackStep_ = (compressed_ && fstatfs(fd_, &fs) == 0 && fs.f_type == NFS_SUPER_MAGIC) ? kWritebackStep : 0;
         writebackFrom_ = base_;
 #endif
         return true;
@@ -487,7 +491,7 @@ private:
         16;
 #endif
     int fd_ = -1;
-    bool stable_, failed_ = false;
+    bool stable_, compressed_, failed_ = false;
     uint64_t pos_ = 0, base_ = 0, end_ = 0, queued_ = 0;   // file [base_, end_) is queued
     uint64_t writebackStep_ = 0, writebackFrom_ = 0;   // sending was started for the file before writebackFrom_
     std::vector<Seg> segs_, sentSegs_;
@@ -541,7 +545,7 @@ uint8_t writeSlices(const WriteJob& j, const char* fileName, const char* mode, C
 #ifndef _WIN32
     // Uncompressed row-major strips come straight from the caller's array,
     // which outlives the write, so they can wait in the queue.
-    BatchedFile io(j.direct());
+    BatchedFile io(j.direct(), j.compression != COMPRESSION_NONE);
     if(io.open(fileName, append))
         tif = TIFFClientOpen(fileName, append ? "a8" : "w8", (thandle_t)&io, bfRead, bfWrite, bfSeek, bfClose, bfSize, bfMap, bfUnmap);
 #else
