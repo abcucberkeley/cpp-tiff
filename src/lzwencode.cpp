@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <assert.h>
+#include <atomic>
 #include <mutex>
 #include <vector>
 #include "tiffio.h"
@@ -57,6 +58,173 @@ typedef size_t WordType;
     outcount += nbits;					\
     }
 
+#define HSIZE           9001L           /* 91% occupancy */
+#define HSHIFT          (13-8)
+
+typedef uint16_t hcode_t;			/* codes fit in 16 bits */
+typedef struct {
+    long	hash;
+    hcode_t	code;
+} hash_t;
+
+/*
+ * Reset encoding hash table.
+ */
+static void
+cl_hash(hash_t* enc_hashtab)
+{
+    hash_t *hp = &enc_hashtab[HSIZE-1];
+    long i = HSIZE-8;
+
+    do {
+        i -= 8;
+        hp[-7].hash = -1;
+        hp[-6].hash = -1;
+        hp[-5].hash = -1;
+        hp[-4].hash = -1;
+        hp[-3].hash = -1;
+        hp[-2].hash = -1;
+        hp[-1].hash = -1;
+        hp[ 0].hash = -1;
+        hp -= 8;
+    } while (i >= 0);
+    for (i += 8; i > 0; i--, hp--)
+        hp->hash = -1;
+}
+
+// libtiff's encoder, with its 9001-entry hash table (144 KB) as the string
+// table. Used until a 2 MB direct table pays for itself (see lzwEncode).
+static uint64_t encodeWithHash(uint8_t* unCompr, uint8_t* compr, tmsize_t cc){
+    hash_t* enc_hashtab = (hash_t*)_TIFFmalloc(HSIZE*sizeof (hash_t));
+    if(!enc_hashtab) return 0;
+    uint8_t* bp = unCompr;
+    long fcode;
+    hash_t *hp;
+    int h, c;
+    hcode_t ent;
+    long disp;
+    tmsize_t incount = 0, outcount = 0, checkpoint = CHECK_GAP, enc_ratio = 0;
+    WordType nextdata = 0;
+    long nextbits = 0;
+    int free_ent = CODE_FIRST, maxcode = MAXCODE(BITS_MIN), nbits = BITS_MIN;
+    uint8_t* op = compr;
+
+    cl_hash(enc_hashtab);
+    ent = (hcode_t) -1;
+    if (cc > 0) {
+        PutNextCode(op, CODE_CLEAR);
+        ent = *bp++; cc--; incount++;
+    }
+    while (cc > 0) {
+        c = *bp++; cc--; incount++;
+        fcode = ((long)c << BITS_MAX) + ent;
+        h = (c << HSHIFT) ^ ent;	/* xor hashing */
+        #ifdef _WINDOWS
+        /*
+        * Check hash index for an overflow.
+        */
+        if (h >= HSIZE)
+            h -= HSIZE;
+        #endif
+        hp = &enc_hashtab[h];
+        if (hp->hash == fcode) {
+            ent = hp->code;
+            continue;
+        }
+        if (hp->hash >= 0) {
+            /*
+            * Primary hash failed, check secondary hash.
+            */
+            disp = HSIZE - h;
+            if (h == 0)
+                disp = 1;
+            do {
+                /*
+                 * Avoid pointer arithmetic because of
+                 * wraparound problems with segments.
+                 */
+                if ((h -= disp) < 0)
+                    h += HSIZE;
+                hp = &enc_hashtab[h];
+                if (hp->hash == fcode) {
+                    ent = hp->code;
+                    goto hit;
+                }
+            } while (hp->hash >= 0);
+        }
+        /*
+         * New entry, emit code and add to table.
+         */
+        PutNextCode(op, ent);
+        ent = (hcode_t)c;
+        hp->code = (hcode_t)(free_ent++);
+        hp->hash = fcode;
+        if (free_ent == CODE_MAX-1) {
+            /* table is full, emit clear code and reset */
+            cl_hash(enc_hashtab);
+            enc_ratio = 0;
+            incount = 0;
+            outcount = 0;
+            free_ent = CODE_FIRST;
+            PutNextCode(op, CODE_CLEAR);
+            nbits = BITS_MIN;
+            maxcode = MAXCODE(BITS_MIN);
+        } else {
+            /*
+             * If the next entry is going to be too big for
+             * the code size, then increase it, if possible.
+             */
+            if (free_ent > maxcode) {
+                nbits++;
+                assert(nbits <= BITS_MAX);
+                maxcode = (int) MAXCODE(nbits);
+            } else if (incount >= checkpoint) {
+                tmsize_t rat;
+                /*
+                 * Check compression ratio and, if things seem
+                 * to be slipping, clear the hash table and
+                 * reset state.  The compression ratio is a
+                 * 24+8-bit fractional number.
+                 */
+                checkpoint = incount+CHECK_GAP;
+                CALCRATIO(sp, rat);
+                if (rat <= enc_ratio) {
+                    cl_hash(enc_hashtab);
+                    enc_ratio = 0;
+                    incount = 0;
+                    outcount = 0;
+                    free_ent = CODE_FIRST;
+                    PutNextCode(op, CODE_CLEAR);
+                    nbits = BITS_MIN;
+                    maxcode = MAXCODE(BITS_MIN);
+                } else
+                    enc_ratio = rat;
+            }
+        }
+hit:
+        ;
+    }
+    if (ent != (hcode_t) -1) {
+        PutNextCode(op, ent);
+        free_ent++;
+        if (free_ent == CODE_MAX-1) {
+            /* table is full, emit clear code and reset */
+            PutNextCode(op, CODE_CLEAR);
+            nbits = BITS_MIN;
+        } else if (free_ent > maxcode) {
+            nbits++;
+            assert(nbits <= BITS_MAX);
+        }
+    }
+    PutNextCode(op, CODE_EOI);
+    /* Explicit 0xff masking to make icc -check=conversions happy */
+    if (nextbits > 0)
+        *op++ = (unsigned char)((nextdata << (8-nextbits))&0xff);
+    (void)outcount;
+    _TIFFfree(enc_hashtab);
+    return (uint64_t)(op - compr);
+}
+
 namespace {
 
 // The string table. child[c << 12 | ent] is the code of string ent followed by
@@ -74,7 +242,7 @@ struct LzwTable {
 };
 
 // Tables kept between encodes, so a strip does not allocate and fault in 2 MB.
-// There are as many as the most strips ever encoded at once.
+// There are as many as the most strips ever encoded at once with them.
 struct TablePool {
     std::mutex m;
     std::vector<LzwTable*> tables;
@@ -84,6 +252,20 @@ struct TablePool {
 };
 TablePool pool;
 
+// A new table costs its first touch: faulting in its 2 MB took about a
+// millisecond, and threads doing it at once wait on each other (8 tables 5 ms,
+// 47 tables 18 ms). Made for every thread at once, that made the first LZW
+// writes of a process slower than with libtiff's hash table (2048x2048 images
+// 1.4-1.7x, 553 MB stacks with 48 threads 1.1x). So tables are earned, a new
+// one only after the process has encoded another 4 MB with the hash table
+// (about 40 ms of work), and made one at a time while the other threads go on
+// with the hash table.
+const uint64_t kEarnBytes = (uint64_t)4 << 20;
+std::atomic<uint64_t> hashEncoded(0), tablesMade(0);
+std::atomic<bool> making(false);
+
+// A kept table, or a new one if the process has earned it and no other thread
+// is making one, or NULL.
 LzwTable* takeTable(){
     {
         std::lock_guard<std::mutex> g(pool.m);
@@ -93,7 +275,17 @@ LzwTable* takeTable(){
             return t;
         }
     }
-    return (LzwTable*)calloc(1, sizeof(LzwTable));
+    uint64_t made = tablesMade.load(std::memory_order_relaxed);
+    bool idle = false;
+    if(made >= hashEncoded.load(std::memory_order_relaxed)/kEarnBytes || !making.compare_exchange_strong(idle, true)) return NULL;
+    LzwTable* t = NULL;
+    if(tablesMade.compare_exchange_strong(made, made + 1)){
+        t = (LzwTable*)calloc(1, sizeof(LzwTable));
+        // Fault it all in now, not during the encode, so the next table waits
+        if(t) for(size_t i = 0; i < sizeof(LzwTable); i += 4096) reinterpret_cast<volatile uint8_t*>(t)[i] = 0;
+    }
+    making.store(false);
+    return t;
 }
 
 void returnTable(LzwTable* t){
@@ -101,14 +293,12 @@ void returnTable(LzwTable* t){
     pool.tables.push_back(t);
 }
 
+
 }
 
-// Encodes len bytes as one LZW strip (libtiff's encoder: the same codes, code
-// widths and clear codes, so the same bytes). Returns the bytes written to
-// compr, or 0 if the string table could not be allocated.
-uint64_t lzwEncode(uint8_t* unCompr, uint8_t* compr, tmsize_t cc){
-    LzwTable* table = takeTable();
-    if(!table) return 0;
+// libtiff's encoder with a direct table instead of its hash table; the
+// table is left empty.
+static uint64_t encodeWithTable(LzwTable* table, uint8_t* unCompr, uint8_t* compr, tmsize_t cc){
     uint16_t* child = table->child;
     uint32_t* added = table->added;
     int nAdded = 0;
@@ -186,7 +376,6 @@ uint64_t lzwEncode(uint8_t* unCompr, uint8_t* compr, tmsize_t cc){
     }
     RESET_TABLE
 #undef RESET_TABLE
-    returnTable(table);
 
     if (ent != -1) {
         // Flush the final pending code.
@@ -220,4 +409,18 @@ uint64_t lzwEncode(uint8_t* unCompr, uint8_t* compr, tmsize_t cc){
     // a byte or two of the uninitialized buffer past the last code, so the same
     // data did not always produce the same file.
     return (uint64_t)(op - compr);
+}
+
+// Encodes len bytes as one LZW strip (libtiff's encoder: the same codes, code
+// widths and clear codes, so the same bytes, whichever string table finds
+// them). Returns the bytes written to compr, or 0 if no table could be had.
+uint64_t lzwEncode(uint8_t* unCompr, uint8_t* compr, tmsize_t cc){
+    LzwTable* table = takeTable();
+    if(!table){
+        hashEncoded.fetch_add((uint64_t)cc, std::memory_order_relaxed);
+        return encodeWithHash(unCompr, compr, cc);
+    }
+    const uint64_t n = encodeWithTable(table, unCompr, compr, cc);
+    returnTable(table);
+    return n;
 }
