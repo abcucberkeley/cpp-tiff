@@ -139,7 +139,6 @@ target_link_libraries(cppTiff_shared PRIVATE
     ${zlib_BINARY_DIR}/${ZLIB_STATIC_NAME}
     ${libdeflate_BINARY_DIR}/libdeflate.a
     ${zstd_BINARY_DIR}/lib/libzstd.a
-    -static-libgcc
     -static-libstdc++
     OpenMP::OpenMP_CXX
 )
@@ -150,8 +149,15 @@ target_link_libraries(cppTiff_shared PRIVATE
 # codec table are used instead, and zstd reads fail or crash. The symbols stay
 # exported for programs that call libtiff through this library. macOS and
 # Windows already bind a library's calls to its own definitions.
+# On Linux the library unwinds exceptions with the system's libgcc_s rather
+# than a static copy of its own: with -Bsymbolic, an exception thrown inside it
+# (std::async failing at a thread limit, or running out of memory) was unwound
+# by that private copy, and a caller catching it with its own C++ runtime
+# (Python, a C++ program) aborted instead.
 if(UNIX AND NOT APPLE)
     target_link_options(cppTiff_shared PRIVATE "-Wl,-Bsymbolic")
+else()
+    target_link_libraries(cppTiff_shared PRIVATE -static-libgcc)
 endif()
 
 install(TARGETS cppTiff_shared
