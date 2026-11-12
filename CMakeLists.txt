@@ -199,7 +199,9 @@ endif()
 # between them aborted without a message; and on macOS the loader merges the exported weak definitions of one name
 # across every image a process loads, so that template code of the runtime could run another image's copy on that
 # copy's state. The libtiff and zstd APIs, whose headers are installed, stay exported. (cpp-zarr has the same
-# option, off by default there for programs built against its exported runtime.) The patterns are mangled names:
+# option, off by default there for programs built against its exported runtime.) A build that gives this target a
+# version script of its own turns the option off: GNU ld takes one anonymous version script ("anonymous version tag
+# cannot be combined with other version tags"). The patterns are mangled names:
 # std's, its short forms (Sa, Sb, Ss, Si, So, Sd), its typeinfo, vtables, guards and thunks, __gnu_cxx's,
 # __cxxabiv1's, the typeinfo of built-in types, operator new and delete, and the C++ ABI's C functions.
 option(CPPTIFF_PRIVATE_RUNTIME "Keep the library's static C++ runtime private (Linux and macOS)" ON)
