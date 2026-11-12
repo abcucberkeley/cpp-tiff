@@ -1537,7 +1537,7 @@ void* readTiffParallelInfo(const char* fileName, const TiffInfo &info, void* tif
     if(zRange.size()){
         const uint64_t end = zRange.size() == 2 ? zRange[1] : zRange[0] + 1;
         if(zRange.size() > 2 || zRange[0] >= end || end > info.z){
-            if(zRange.size() > 2) printf("Error: a slice range is one slice or [start, end), not %zu numbers\n", zRange.size());
+            if(zRange.size() > 2) printf("Error: a slice range is one slice or [start, end), not %llu numbers\n", (unsigned long long)zRange.size());
             else printf("Error: slices [%llu, %llu) are not in \"%s\", which has %llu\n", (unsigned long long)zRange[0],
                         (unsigned long long)end, fileName, (unsigned long long)info.z);
             return NULL;

@@ -115,6 +115,13 @@ set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 add_library(cppTiff_shared SHARED ${SRC_DIR}/helperfunctions.cpp  ${SRC_DIR}/lzwencode.cpp ${SRC_DIR}/lzwdecode.cpp ${SRC_DIR}/parallelreadtiff.cpp ${SRC_DIR}/parallelwritetiff.cpp)
 set_target_properties(cppTiff_shared PROPERTIES OUTPUT_NAME cppTiff)
+# Every function of the library starts on a 64-byte boundary, so its speed
+# depends on its own code only. Without it, the LZW codecs ran 2-6% faster or
+# slower on Skylake and Ice Lake nodes when changes to other functions moved
+# them within their cache lines (the 1.7.3 code was the same in both builds).
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    target_compile_options(cppTiff_shared PRIVATE -falign-functions=64)
+endif()
 add_dependencies(cppTiff_shared zlibstatic)
 add_dependencies(cppTiff_shared libdeflate_static)
 add_dependencies(cppTiff_shared libzstd_static)
