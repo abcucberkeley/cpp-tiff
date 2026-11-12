@@ -89,6 +89,15 @@ function test_matlab(mexDir)
             sub = parallelReadTiff(f, [a b]);
             assert(isequal(sub, vol(:,:,a:b)), 'zrange tile%d: [%d %d]', tile, a, b);
         end
+        % Any numeric class, as a row or a column
+        assert(isequal(parallelReadTiff(f, int32([2 3])), vol(:,:,2:3)), 'zrange tile%d: int32 range', tile);
+        assert(isequal(parallelReadTiff(f, uint8([5; 6])), vol(:,:,5:6)), 'zrange tile%d: uint8 column range', tile);
+        % Reversed, starting at 0, past the end, not whole numbers, or not two:
+        % refused (a reversed range was read as no slices and crashed the reader)
+        bad = {[3 2], [5 2], [0 2], [1 7], [6 7], [1.5 2], [2 NaN], [1 Inf], [1 2 3], 3, 'ab'};
+        for r = 1:numel(bad)
+            assert(throws(@() parallelReadTiff(f, bad{r})), 'zrange tile%d: range %s was read', tile, mat2str(bad{r}));
+        end
         delete(f);
     end
 
@@ -103,6 +112,23 @@ function test_matlab(mexDir)
         end
         assert(isequal(parallelReadTiff(f), ragged), 'ragged tile%d: data mismatch', tile);
         delete(f);
+    end
+
+    % Compression names in any case; unknown ones are refused, and no file is
+    % left (they were written as LZW, and so were 'ZSTD' and 'NONE')
+    vol = makeData([40 50 3], 'uint16');
+    for c = {'lzw', 'zstd', 'none'}
+        ref = fullfile(tmp, ['cn_' c{1} '.tif']);
+        parallelWriteTiff(ref, vol, 'w', c{1});
+        f = fullfile(tmp, 'cn_upper.tif');
+        parallelWriteTiff(f, vol, 'w', upper(c{1}));
+        assert(isequal(bytesOf(ref), bytesOf(f)), 'compression %s: the upper-case name wrote another file', c{1});
+        delete(f); delete(ref);
+    end
+    for c = {'jpeg', 'deflate', 'lzw2'}
+        f = fullfile(tmp, 'cn_bad.tif');
+        assert(throws(@() parallelWriteTiff(f, vol, 'w', c{1})), 'compression %s was accepted', c{1});
+        assert(~isfile(f), 'compression %s left a file', c{1});
     end
 
     % 4. An invalid tile size must be rejected rather than silently accepted.
@@ -368,6 +394,13 @@ function writePlanarTiff(f, data, compression, tile)
     end
 end
 
+
+function b = bytesOf(f)
+%BYTESOF The bytes of file f.
+    fid = fopen(f, 'r');
+    b = fread(fid, Inf, '*uint8');
+    fclose(fid);
+end
 
 function tf = throws(fn)
 %THROWS True if calling fn raises an error.

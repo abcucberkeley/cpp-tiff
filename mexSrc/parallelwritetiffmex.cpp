@@ -1,3 +1,4 @@
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -51,6 +52,10 @@ void mexFunction(int nlhs, mxArray *plhs[],
             mexCallMATLAB(1, mCharA, 1, mString, "char");
             compression = mxArrayToString(mCharA[0]);
         }
+        // In any case. Other names were written as LZW without an error.
+        for(char& ch : compression) ch = (char)tolower((unsigned char)ch);
+        if(compression != "lzw" && compression != "zstd" && compression != "none" && !compression.empty())
+            mexErrMsgIdAndTxt("tiff:inputError","The compression must be 'lzw', 'zstd' or 'none'");
     }
 
     // Optional fifth argument: tile size (0/omitted = striped, the default).

@@ -1364,6 +1364,89 @@ int main(int argc, char** argv){
         }
     }
 
+    // ---- Arguments the writer and the readers take, and refuse. Compression
+    // names are read in any case ("ZSTD" and "NONE" were written as LZW, like
+    // any unknown name, which now fails); an image without pixels or slices
+    // fails, leaving no file (Python's writer had written one slice from the
+    // memory past an empty array); and slices past the end fail with an error of
+    // their own, not each reader thread's "failed to open".
+    {
+        const uint64_t ax = 40, ay = 30, az = 4;
+        std::vector<uint16_t> av(ax*ay*az);
+        for(uint64_t i = 0; i < av.size(); i++) av[i] = (uint16_t)(i*40503u >> 3);
+        struct CN { const char* name; uint64_t tag; };
+        const CN cns[] = {{"ZSTD", COMPRESSION_ZSTD}, {"Lzw", COMPRESSION_LZW}, {"NONE", COMPRESSION_NONE}, {"", COMPRESSION_NONE}};
+        for(const CN& c : cns){
+            total++;
+            const std::string path = dir + "/compression_name.tif";
+            step("comp-name", c.name, "write with the name in another case");
+            bool ok = !writeTiffParallelWrapper(ax, ay, az, path.c_str(), av.data(), 16, 0, 0, "w", false, std::string(c.name), 1, 0);
+            uint64_t tag = 0;
+            ok = ok && firstTag(readFileBytes(path), 259, &tag) && tag == c.tag;
+            void* back = ok ? readTiffParallelWrapperNoXYFlip(path.c_str(), {}) : nullptr;
+            ok = back && std::memcmp(back, av.data(), av.size()*2) == 0;
+            free(back);
+            std::remove(path.c_str());
+            if(ok) std::printf("PASS  %-14s compression \"%s\"\n", "comp-name", c.name);
+            else { std::printf("FAIL  %-14s compression \"%s\"  (tag %llu)\n", "comp-name", c.name, (unsigned long long)tag); failures++; }
+        }
+        struct RF { const char* name; uint64_t x, y, z, start; const char* comp; bool single; };
+        const RF rfs[] = {
+            {"comp-jpeg",    ax, ay, az, 0,  "jpeg", false},
+            {"comp-lzw2",    ax, ay, az, 0,  "lzw2", false},
+            {"comp-single",  ax, ay, az, 0,  "zip",  true},    // the one-thread writer
+            {"empty-x",       0, ay, az, 0,  "lzw",  false},
+            {"empty-y",      ax,  0, az, 0,  "none", false},
+            {"empty-z",      ax, ay,  0, 0,  "zstd", false},
+            {"empty-start",  ax, ay, az, az, "lzw",  false},
+            {"empty-single", ax,  0, az, 0,  "lzw",  true},
+        };
+        for(const RF& c : rfs){
+            total++;
+            const std::string path = dir + "/" + c.name + ".tif";
+            std::remove(path.c_str());
+            step(c.name, "refused writes", "a write that must fail");
+            const bool failed = c.single
+                ? writeTiffSingle(c.x, c.y, c.z, path.c_str(), av.data(), nullptr, 16, c.start, 0, "w", false, std::string(c.comp)) != 0
+                : writeTiffParallelWrapper(c.x, c.y, c.z, path.c_str(), av.data(), 16, c.start, 0, "w", false, std::string(c.comp), 1, 0) != 0;
+            FILE* f = std::fopen(path.c_str(), "rb");
+            const bool noFile = !f;
+            if(f) std::fclose(f);
+            std::remove(path.c_str());
+            if(failed && noFile) std::printf("PASS  %-14s refused write\n", c.name);
+            else { std::printf("FAIL  %-14s refused write  (failed=%d, file left=%d)\n", c.name, (int)failed, (int)!noFile); failures++; }
+        }
+        // Slice ranges: the last slice, the last two and every slice read, in
+        // both layouts; one past the end, an empty or reversed range, and three
+        // numbers fail.
+        const std::string path = dir + "/slice_ranges.tif";
+        const bool made = !writeTiffParallelWrapper(ax, ay, az, path.c_str(), av.data(), 16, 0, 0, "w", false, "lzw", 1, 0);
+        const std::vector<uint8_t> avBytes(reinterpret_cast<const uint8_t*>(av.data()), reinterpret_cast<const uint8_t*>(av.data() + av.size()));
+        struct RG { std::vector<uint64_t> range; bool good; };
+        const RG rgs[] = {{{az - 1}, true}, {{az - 2, az}, true}, {{0, az}, true}, {{az}, false}, {{0, az + 1}, false},
+                          {{az - 1, az + 1}, false}, {{2, 2}, false}, {{3, 1}, false}, {{0, 1, 2}, false}};
+        for(const RG& r : rgs){
+            total++;
+            std::string text;
+            for(size_t k = 0; k < r.range.size(); k++) text += (k ? "," : "") + std::to_string(r.range[k]);
+            step("slice-range", text.c_str(), r.good ? "a range that reads" : "a range that must fail");
+            void* nf = made ? readTiffParallelWrapperNoXYFlip(path.c_str(), r.range) : nullptr;
+            void* fl = made ? readTiffParallelWrapper(path.c_str(), r.range) : nullptr;
+            bool ok = made;
+            if(r.good){
+                const uint64_t first = r.range[0], count = r.range.size() == 2 ? r.range[1] - r.range[0] : 1, slice = ax*ay*2;
+                const std::vector<uint8_t> wantFlip = flipped(avBytes.data() + first*slice, ax, ay, count, 1, 2);
+                ok = ok && nf && fl && std::memcmp(nf, avBytes.data() + first*slice, count*slice) == 0
+                        && std::memcmp(fl, wantFlip.data(), wantFlip.size()) == 0;
+            }
+            else ok = ok && !nf && !fl;
+            free(nf); free(fl);
+            if(ok) std::printf("PASS  %-14s slices {%s}\n", "slice-range", text.c_str());
+            else { std::printf("FAIL  %-14s slices {%s}  (%s)\n", "slice-range", text.c_str(), r.good ? "read back wrong" : "did not fail"); failures++; }
+        }
+        std::remove(path.c_str());
+    }
+
     // ---- Unreadable and damaged files: report failure, never crash.
     {
         const std::string missing = dir + "/does_not_exist.tif";

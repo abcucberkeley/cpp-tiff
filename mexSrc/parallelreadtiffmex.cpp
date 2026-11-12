@@ -1,3 +1,4 @@
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include "mex.h"
@@ -62,17 +63,22 @@ void mexFunction(int nlhs, mxArray *plhs[],
         z = info.z;
     }
     else{
-        if(mxGetN(prhs[1]) != 2){
-            mexErrMsgIdAndTxt("tiff:inputError","Input range is not 2");
+        // [first last], 1-based and inclusive: two whole numbers of any numeric
+        // class. In unsigned arithmetic a reversed range like [3 2] got through as
+        // no slices, which crashed the reader, and [0 2] and [5 2] wrapped around
+        // the check; other classes than double were read as a double's bytes.
+        if(!mxIsNumeric(prhs[1]) || mxIsComplex(prhs[1]) || mxGetNumberOfElements(prhs[1]) != 2)
+            mexErrMsgIdAndTxt("tiff:inputError","The range must be two numbers, [first last]");
+        mxArray* range = NULL;
+        mxArray* given = const_cast<mxArray*>(prhs[1]);
+        mexCallMATLAB(1, &range, 1, &given, "double");
+        const double first = mxGetPr(range)[0], last = mxGetPr(range)[1];
+        mxDestroyArray(range);
+        if(first != std::floor(first) || last != std::floor(last) || first < 1 || last < first || last > (double)info.z){
+            mexErrMsgIdAndTxt("tiff:rangeOutOfBound","Range is out of bounds");
         }
-        else{
-            startSlice = (uint64_t)*(mxGetPr(prhs[1]))-1;
-            z = (uint64_t)*((mxGetPr(prhs[1])+1))-startSlice;
-            const uint64_t maxSize = imageJIm ? info.imageJImages : info.directories;
-            if (startSlice < 0 || startSlice+z > maxSize){
-                mexErrMsgIdAndTxt("tiff:rangeOutOfBound","Range is out of bounds");
-            }
-        }
+        startSlice = (uint64_t)first - 1;
+        z = (uint64_t)last - startSlice;
     }
 
     // libtiff's own value: the TIFF default (2^32 - 1, one strip) when the tag

@@ -1215,7 +1215,7 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
         // read it again.
         uint8_t counter = 0;
         while(TIFFCurrentDirectory(tif) != (tdir_t)startSlice && !TIFFSetDirectory(tif, startSlice) && counter<3){
-            printf("Thread %d: File \"%s\" Directory \"%d\" failed to open. Try %d\n",w,fileName,0,counter+1);
+            printf("Thread %d: File \"%s\" Directory \"%llu\" failed to open. Try %d\n",w,fileName,(unsigned long long)startSlice,counter+1);
             counter++;
             if(counter == 3){
                 #pragma omp critical
@@ -1531,15 +1531,19 @@ void* readTiffParallelInfo(const char* fileName, const TiffInfo &info, void* tif
 	// laid out, so those go through the normal readers instead.
 	const uint8_t imageJIm = info.imageJ;
 
+    // One slice ({s}) or the slices [start, end). Slices past the end used to
+    // reach the readers, which failed to find their directories and printed
+    // that for each thread.
     if(zRange.size()){
-        if(zRange.size() == 2){
-            startSlice = zRange[0];
-            z = zRange[1] - zRange[0];   // number of slices to read
+        const uint64_t end = zRange.size() == 2 ? zRange[1] : zRange[0] + 1;
+        if(zRange.size() > 2 || zRange[0] >= end || end > info.z){
+            if(zRange.size() > 2) printf("Error: a slice range is one slice or [start, end), not %zu numbers\n", zRange.size());
+            else printf("Error: slices [%llu, %llu) are not in \"%s\", which has %llu\n", (unsigned long long)zRange[0],
+                        (unsigned long long)end, fileName, (unsigned long long)info.z);
+            return NULL;
         }
-        else{
-            startSlice = zRange[0];
-            z = 1;                        // single slice
-        }
+        startSlice = zRange[0];
+        z = end - zRange[0];
     }
 
 

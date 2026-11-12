@@ -1,3 +1,4 @@
+#include <cctype>
 #include <cstdint>
 #include <cmath>
 #include <cstdio>
@@ -838,6 +839,22 @@ uint64_t autoStripRows(uint64_t x, uint64_t y, uint64_t nSlices, uint64_t pixelB
 uint8_t makeJob(WriteJob& j, uint64_t x, uint64_t y, uint64_t z, const void* data, uint64_t bits, uint64_t startSlice,
                 uint64_t stripSize, bool transpose, const std::string& compression, uint16_t sampleFormat, uint64_t tileSize,
                 uint64_t samples){
+    // A TIFF image has at least one pixel. An empty one was written from
+    // whatever memory followed the data: the Python writer turned z = 0 into
+    // one slice.
+    if(!x || !y || z <= startSlice){
+        printf("Error: there is nothing to write (%llu x %llu pixels, %llu slices)\n", (unsigned long long)x,
+               (unsigned long long)y, (unsigned long long)(z > startSlice ? z - startSlice : 0));
+        return 1;
+    }
+    // The compression, by name in any case: "lzw", "zstd", or "none" ("" too).
+    // Other names were written as LZW without a word, and "ZSTD" and "NONE" too.
+    std::string name(compression);
+    for(char& ch : name) ch = (char)std::tolower((unsigned char)ch);
+    if(name != "lzw" && name != "zstd" && name != "none" && !name.empty()){
+        printf("Error: unknown compression \"%s\" (use lzw, zstd or none)\n", compression.c_str());
+        return 1;
+    }
     if(bits != 8 && bits != 16 && bits != 32 && bits != 64){
         printf("Error: %llu-bit samples are not supported\n", (unsigned long long)bits);
         return 1;
@@ -860,8 +877,7 @@ uint8_t makeJob(WriteJob& j, uint64_t x, uint64_t y, uint64_t z, const void* dat
     j.chunksPerSlice = tileSize ? j.tilesAcross*j.tilesDown : (y + stripSize - 1)/stripSize;
     j.data = (const uint8_t*)data;
     j.transpose = transpose;
-    j.compression = compression == "zstd" ? COMPRESSION_ZSTD
-                  : (compression != "none" && !compression.empty()) ? COMPRESSION_LZW : COMPRESSION_NONE;
+    j.compression = name == "zstd" ? COMPRESSION_ZSTD : name == "lzw" ? COMPRESSION_LZW : COMPRESSION_NONE;
     j.sampleFormat = sampleFormat;
     return 0;
 }
