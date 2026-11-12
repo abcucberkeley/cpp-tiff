@@ -911,11 +911,12 @@ uint8_t writeTiffParallelHelper(const char* fileName, const void* tiffOld, uint6
 {
 	// Check if folder exists, if not then make it (recursive if needed)
 	char* folderName = strdup(fileName);
-	char *lastSlash = NULL;
+	char *lastSlash = strrchr(folderName, '/');
     #ifdef _WIN32
-    lastSlash = strrchr(folderName, '\\');
-    #else
-    lastSlash = strrchr(folderName, '/');
+    // Either separator, whichever comes last: a path named with / found no
+    // folder, so that a write into a folder that did not exist yet failed
+    char* lastBackslash = strrchr(folderName, '\\');
+    if(lastBackslash && (!lastSlash || lastBackslash > lastSlash)) lastSlash = lastBackslash;
     #endif
 	if(lastSlash){
 		*lastSlash = '\0';
