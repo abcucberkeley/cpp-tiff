@@ -18,6 +18,8 @@
 #include <omp.h>
 #ifndef _WIN32
 #include <csignal>
+#include <pwd.h>
+#include <unistd.h>
 #include <sys/resource.h>
 #endif
 
@@ -1362,6 +1364,94 @@ int main(int argc, char** argv){
             if(ok) std::printf("PASS  %-16s lzw decoded by libtiff\n", c.name);
             else { std::printf("FAIL  %-16s lzw decoded by libtiff  (differs from what was written)\n", c.name); failures++; }
         }
+    }
+
+    // ---- A leading ~ or ~name is that home folder, and nothing else in a path
+    // is expanded (expandTilde, which the MATLAB mex files call on Linux and
+    // macOS): the wordexp it used expanded any path with a ~ anywhere as a shell
+    // word, so it cut the path at spaces, crashed on parentheses, substituted
+    // variables and ran commands in $(...) and backquotes. Folders of such names
+    // work with the library itself, which expands nothing.
+    {
+        const std::string ran = dir + "/tilde_ran";
+        std::remove(ran.c_str());
+#ifndef _WIN32
+        const char* h0 = getenv("HOME");
+        const std::string home0 = h0 ? h0 : "";
+        const bool hadHome = h0 != nullptr;
+        auto expect = [&](const std::string& in, const std::string& want){
+            total++;
+            step("tilde", "expandTilde", in.c_str());
+            const std::string got = expandTilde(in);
+            if(got == want) std::printf("PASS  %-14s \"%s\"\n", "tilde", in.c_str());
+            else { std::printf("FAIL  %-14s \"%s\" gave \"%s\", not \"%s\"\n", "tilde", in.c_str(), got.c_str(), want.c_str()); failures++; }
+        };
+        // (a user's home folder from the user database, the current user's for nullptr, without trailing slashes)
+        auto userHome = [](const char* name, std::string& home, std::string& user){
+            std::vector<char> buf(1 << 16);
+            struct passwd pw, *found = nullptr;
+            const int err = name ? getpwnam_r(name, &pw, buf.data(), buf.size(), &found)
+                                 : getpwuid_r(getuid(), &pw, buf.data(), buf.size(), &found);
+            if(err || !found || !found->pw_dir) return false;
+            home = found->pw_dir;
+            user = found->pw_name ? found->pw_name : "";
+            while(!home.empty() && home.back() == '/') home.pop_back();
+            return true;
+        };
+        setenv("HOME", "/h/one", 1);
+        expect("~", "/h/one");
+        expect("~/", "/h/one/");
+        expect("~/a b (c)/x~y $HOME `id`.tif", "/h/one/a b (c)/x~y $HOME `id`.tif");
+        const std::vector<std::string> kept = {"/data/run~2 (copy)/a.tif", "til~de (x)/a.tif", "a/~/b", "x~y", "", "$HOME/~",
+            "~nosuchuser_cpptiff_rt/x", "~ /x", "a~b/$(touch " + ran + ")", "a~b/`touch " + ran + "`", "~$(touch " + ran + ")"};
+        for(const std::string& kp : kept) expect(kp, kp);
+        setenv("HOME", "/h/two//", 1);
+        expect("~/x", "/h/two/x");
+        expect("~", "/h/two");
+        setenv("HOME", "/", 1);
+        expect("~", "/");
+        expect("~/x", "/x");
+        // (~name is that user's home folder whatever HOME is; without HOME, ~ is the current user's)
+        std::string uh, un;
+        if(userHome("root", uh, un)){
+            expect("~root", uh.empty() ? std::string("/") : uh);
+            expect("~root/x y", uh + "/x y");
+        }
+        unsetenv("HOME");
+        if(userHome(nullptr, uh, un)){
+            expect("~/x", uh + "/x");
+            if(!un.empty()) expect("~" + un + "/x", uh + "/x");
+        }
+        if(hadHome) setenv("HOME", home0.c_str(), 1);
+        else unsetenv("HOME");
+#endif
+        // Folders of such names, written and read through the library
+        const uint64_t tx = 40, ty = 24, tz = 3;
+        std::vector<uint16_t> tv(tx*ty*tz);
+        for(uint64_t i = 0; i < tv.size(); i++) tv[i] = (uint16_t)(i*977u + 13u);
+        std::vector<std::string> names = {"til~de (x)", "run~2 copy", "a~b $HOME `id`", "~c"};
+#ifndef _WIN32
+        names.push_back("a~b $(touch " + ran + ")");
+        names.push_back("x~y `touch " + ran + "`");
+#endif
+        for(const std::string& nm : names){
+            total++;
+            const std::string path = dir + "/" + nm + "/a.tif";
+            step("tilde-dir", nm.c_str(), "write and read in a folder of such a name");
+            bool ok = !writeTiffParallelHelper(path.c_str(), tv.data(), 16, "w", tx, ty, tz, 0, false, "lzw", 1, 0);
+            TiffInfo ti;
+            ok = ok && !getTiffInfo(path.c_str(), ti) && ti.z == tz;
+            void* back = ok ? readTiffParallelWrapperNoXYFlip(path.c_str(), {}) : nullptr;
+            ok = back && std::memcmp(back, tv.data(), tv.size()*2) == 0;
+            free(back);
+            std::remove(path.c_str());
+            if(ok) std::printf("PASS  %-14s \"%s\"\n", "tilde-dir", nm.c_str());
+            else { std::printf("FAIL  %-14s \"%s\"\n", "tilde-dir", nm.c_str()); failures++; }
+        }
+        total++;
+        FILE* rf = std::fopen(ran.c_str(), "rb");
+        if(!rf) std::printf("PASS  %-14s no command in a path ran\n", "tilde");
+        else { std::fclose(rf); std::printf("FAIL  %-14s a command in a path ran\n", "tilde"); failures++; }
     }
 
     // ---- Arguments the writer and the readers take, and refuse. Compression

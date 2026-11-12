@@ -693,6 +693,15 @@ def main():
     check(np.array_equal(cpptiff.read_tiff(path, (5,)), v6[5]), "z_range (5,)")
     check(np.array_equal(cpptiff.read_tiff(path, []), v6), "z_range [] (every slice, as before)")
 
+    # Folders whose names hold a ~, spaces, parentheses, $ and backquotes are
+    # used as named (the library expands nothing)
+    for nm in ("til~de (x)", "run~2 copy", "a~b $HOME `id`", "~c"):
+        p_ = os.path.join(tmp, nm, "a.tif")
+        cpptiff.write_tiff(p_, v6)
+        check(os.path.isfile(p_) and np.array_equal(cpptiff.read_tiff(p_), v6)
+              and cpptiff.get_image_shape(p_) == v6.shape, f"folder named {nm!r}")
+        os.remove(p_)
+
     # Path-like and bytes names
     import pathlib
     pp = pathlib.Path(path)

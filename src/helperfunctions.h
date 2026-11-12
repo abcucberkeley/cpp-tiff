@@ -2,9 +2,11 @@
 #define CPPTIFF_HELPERFUNCTIONS_H
 #include <cstdint>
 #include <stdarg.h>
+#include <string>
 
 #ifndef _WIN32
-char* expandTilde(char* path);
+// The path with a leading ~ or ~name expanded to that home folder; any other path unchanged
+std::string expandTilde(const std::string &path);
 #endif
 
 void mkdirRecursive(const char *dir);

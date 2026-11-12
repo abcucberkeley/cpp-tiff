@@ -1,6 +1,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include "mex.h"
 #include "tiffio.h"
 #include "../src/helperfunctions.h"
@@ -36,7 +37,9 @@ void mexFunction(int nlhs, mxArray *plhs[],
 
     // Handle the tilde character in filenames on Linux/Mac
     #ifndef _WIN32
-    if(strchr(fileName,'~')) fileName = expandTilde(fileName);
+    // A leading ~ or ~name is that home folder; nothing else in the path is expanded
+    std::string expandedName = expandTilde(fileName);
+    fileName = &expandedName[0];
     #endif
 
     uint8_t flipXY = 1;

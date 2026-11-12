@@ -139,6 +139,8 @@ make install
 
 ### Usage
 
+On Linux and macOS a path that starts with ~ or ~name is in that home folder, as a shell expands it; nothing else in a path is expanded: spaces, parentheses, $ and a ~ further on are kept as they are
+
 #### getImageSizeMex - Get the dimensions of a Tiff image
 ````
 % [y x z], or [y x z c] for RGB/RGBA

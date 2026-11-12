@@ -285,6 +285,42 @@ function test_matlab(mexDir)
     end
     fprintf('PASS  damaged files\n');
 
+    % 9. On Linux and macOS a leading ~ or ~name is that home folder, and
+    %    nothing else in a path is expanded: a path with a ~ anywhere was
+    %    expanded as a shell word, which cut it at spaces, crashed MATLAB on
+    %    parentheses, and ran commands in $(...) and backquotes.
+    vol = makeData([24 40 3], 'uint16');
+    ran = fullfile(tmp, 'tilde_ran');
+    names = {'til~de (x)', 'run~2 copy', 'a~b $HOME `id`', '~c'};
+    if isunix
+        names = [names, {['a~b $(touch ' ran ')'], ['x~y `touch ' ran '`']}];
+    end
+    for k = 1:numel(names)
+        f = fullfile(tmp, names{k}, 'a.tif');
+        parallelWriteTiff(f, vol);
+        assert(isfile(f), 'tilde: "%s" was not written where it names', names{k});
+        assert(isequal(parallelReadTiff(f), vol), 'tilde: "%s" read back wrong', names{k});
+        assert(isequal(getImageSizeMex(f), size(vol)), 'tilde: "%s" size', names{k});
+        delete(f);
+        nchecked = nchecked + 1;
+    end
+    assert(~isfile(ran), 'tilde: a command in a path ran');
+    if isunix
+        % ~/... is in $HOME
+        home0 = getenv('HOME');
+        home1 = fullfile(tmp, 'home');
+        mkdir(home1);
+        setenv('HOME', home1);
+        restoreHome = onCleanup(@() setenv('HOME', home0));
+        parallelWriteTiff('~/sub dir/b.tif', vol);
+        assert(isfile(fullfile(home1, 'sub dir', 'b.tif')), 'tilde: ~/ was not $HOME');
+        assert(isequal(parallelReadTiff('~/sub dir/b.tif'), vol), 'tilde: read from ~/');
+        assert(isequal(getImageSizeMex('~/sub dir/b.tif'), size(vol)), 'tilde: size from ~/');
+        clear restoreHome
+        nchecked = nchecked + 1;
+    end
+    fprintf('PASS  tilde paths\n');
+
     fprintf('MATLAB tests PASSED (%d round trips)\n', nchecked);
 end
 
