@@ -7,6 +7,7 @@
 #include <omp.h>
 #include "tiffio.h"
 #include "helperfunctions.h"
+#include "pathutil.h"
 #ifdef __linux__
 #include <fcntl.h>
 #endif
@@ -51,14 +52,7 @@ std::string expandTilde(const std::string &path){
 #endif
 
 bool folderExists(const std::string &folderName){
-    struct stat info;
-
-    if(stat(folderName.c_str(), &info) != 0)
-        return false;
-    else if(info.st_mode & S_IFDIR)
-        return true;
-    else
-        return false;
+    return folderExistsPath(folderName.c_str());
 }
 
 // Recursively make a directory
@@ -80,21 +74,13 @@ void mkdirRecursive(const char *dir) {
         if(dirPath[i] == '/'){
             dirPath[i] = '\0';
 
-            #ifdef _WIN32
-            mkdir(dirPath.c_str());
-            #else
-            mkdir(dirPath.c_str(), 0777);
-            #endif
+            mkdirPath(dirPath.c_str());
 
             dirPath[i] = '/';
         }
     }
 
-    #ifdef _WIN32
-    mkdir(dirPath.c_str());
-    #else
-    mkdir(dirPath.c_str(), 0777);
-    #endif
+    mkdirPath(dirPath.c_str());
 }
 
 void DummyHandler(const char* module, const char* fmt, va_list ap)
@@ -115,20 +101,20 @@ void DummyHandler(const char* module, const char* fmt, va_list ap)
 // mmap open. Only the count uses this; the readers keep their mmap handles.
 static TIFF* openForDirectoryWalk(const char* fileName){
 #ifdef __linux__
-    TIFF* tif = TIFFOpen(fileName, "rm");
+    TIFF* tif = tiffOpenPath(fileName, "rm");
     if(!tif) return NULL;
   #ifdef POSIX_FADV_RANDOM
     posix_fadvise(TIFFFileno(tif), 0, 0, POSIX_FADV_RANDOM);
   #endif
     return tif;
 #else
-    return TIFFOpen(fileName, "r");
+    return tiffOpenPath(fileName, "r");
 #endif
 }
 
 // The check for if it is an ImageJ image needs to be improved in the future
 uint8_t isImageJIm(const char* fileName){
-    TIFF* tif = TIFFOpen(fileName, "r");
+    TIFF* tif = tiffOpenPath(fileName, "r");
     if(!tif) return 0;
     char* tiffDesc = NULL;
     if(TIFFGetField(tif, TIFFTAG_IMAGEDESCRIPTION, &tiffDesc)){
@@ -150,7 +136,7 @@ uint8_t isImageJIm(const char* fileName){
 }
 
 uint64_t imageJImGetZ(const char* fileName){
-    TIFF* tif = TIFFOpen(fileName, "r");
+    TIFF* tif = tiffOpenPath(fileName, "r");
     if(!tif) return 0;
     char* tiffDesc = NULL;
     if(TIFFGetField(tif, TIFFTAG_IMAGEDESCRIPTION, &tiffDesc)){
@@ -256,7 +242,7 @@ void setCallThreads(int n){
 
 uint64_t* getImageSize(const char* fileName){
     TIFFSetWarningHandler(DummyHandler);
-    TIFF* tif = TIFFOpen(fileName, "r");
+    TIFF* tif = tiffOpenPath(fileName, "r");
     if(!tif){ printf("File \"%s\" cannot be opened\n",fileName); return NULL; }
 
     uint64_t x = 1,y = 1,z = 1;
@@ -275,7 +261,7 @@ uint64_t* getImageSize(const char* fileName){
 // Returns number of bits the tiff file is.
 uint64_t getDataType(const char* fileName){
     TIFFSetWarningHandler(DummyHandler);
-    TIFF* tif = TIFFOpen(fileName, "r");
+    TIFF* tif = tiffOpenPath(fileName, "r");
     if(!tif){ printf("File \"%s\" cannot be opened\n",fileName); return 0; }
 
     uint64_t bits = 1;
@@ -289,7 +275,7 @@ uint64_t getDataType(const char* fileName){
 // Uses the defaulted getter so files that omit the tag report 1.
 uint64_t getSamplesPerPixel(const char* fileName){
     TIFFSetWarningHandler(DummyHandler);
-    TIFF* tif = TIFFOpen(fileName, "r");
+    TIFF* tif = tiffOpenPath(fileName, "r");
     if(!tif){ printf("File \"%s\" cannot be opened",fileName); return 1; }
 
     uint16_t spp = 1;
@@ -303,7 +289,7 @@ uint64_t getSamplesPerPixel(const char* fileName){
 // Uses the defaulted getter so files that omit the tag report unsigned int.
 uint64_t getSampleFormat(const char* fileName){
     TIFFSetWarningHandler(DummyHandler);
-    TIFF* tif = TIFFOpen(fileName, "r");
+    TIFF* tif = tiffOpenPath(fileName, "r");
     if(!tif){ printf("File \"%s\" cannot be opened",fileName); return 1; }
 
     uint16_t sf = SAMPLEFORMAT_UINT;

@@ -702,6 +702,19 @@ def main():
               and cpptiff.get_image_shape(p_) == v6.shape, f"folder named {nm!r}")
         os.remove(p_)
 
+    # Folders named in other scripts (paths are UTF-8; on Windows the library
+    # opened them in the ANSI code page): written where named, as Python sees
+    # them, and read, one slice, the shape, and in a batch
+    for nm in ("caf\u00e9 \u00b5m", "\u65e5\u672c"):
+        p_ = os.path.join(tmp, nm, "a.tif")
+        cpptiff.write_tiff(p_, v6, "zstd")
+        check(os.path.isfile(p_), f"folder named {nm!r}: not written where named")
+        check(np.array_equal(cpptiff.read_tiff(p_), v6) and np.array_equal(cpptiff.read_tiff(p_, 2), v6[2])
+              and cpptiff.get_image_shape(p_) == v6.shape, f"folder named {nm!r}: read")
+        got = cpptiff.read_tiff_batch([p_, os.fsencode(p_)])
+        check(all(np.array_equal(g, v6) for g in got), f"folder named {nm!r}: batch, str and bytes")
+        os.remove(p_)
+
     # Path-like and bytes names
     import pathlib
     pp = pathlib.Path(path)

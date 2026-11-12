@@ -10,6 +10,7 @@
 #include "tiffio.h"
 #include "../src/helperfunctions.h"
 #include "lzwdecode.h"
+#include "pathutil.h"
 
 // RAII for libtiff handles: TIFFClose runs on every exit path, so the worker
 // functions don't carry a naked TIFF* with a manual close. (C++11: no make_unique.)
@@ -525,9 +526,9 @@ static uint8_t readTilesInto(TIFF* tif, uint8_t* buffer, int64_t tileBufBytes,
 // measured no difference and Windows is unmeasured, so they keep the mapping.
 static TIFF* openReaderTiff(const char* fileName){
 #ifdef __linux__
-    return TIFFOpen(fileName, "rm");
+    return tiffOpenPath(fileName, "rm");
 #else
-    return TIFFOpen(fileName, "r");
+    return tiffOpenPath(fileName, "r");
 #endif
 }
 
@@ -1141,7 +1142,7 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
     std::atomic<uint8_t> err{0};
     uint8_t errBak = 0;
     char errString[10000];
-    TIFF* tif = TIFFOpen(fileName, "r");
+    TIFF* tif = tiffOpenPath(fileName, "r");
     if(!tif){
         printf("File \"%s\" cannot be opened\n",fileName);
         return 1;
@@ -1356,13 +1357,13 @@ static int seekFile(FILE* fp, uint64_t offset){
 // Reading images saved by ImageJ
 uint8_t readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint8_t flipXY){
     std::atomic<uint8_t> err{0};
-    FILE *fp = fopen(fileName, "rb");
+    FILE *fp = fopenPath(fileName, "rb");
     if(!fp){ 
 		printf("File \"%s\" cannot be opened from Disk\n",fileName);
 		err = 1;
 		return err;
 	}
-    TIFF* tif = TIFFOpen(fileName, "r");
+    TIFF* tif = tiffOpenPath(fileName, "r");
     if(!tif){
 		printf("File \"%s\" cannot be opened\n",fileName);
 		fclose(fp);

@@ -31,6 +31,7 @@
 #include "lzwencode.h"
 #include "helperfunctions.h"
 #include "parallelwritetiff.h"
+#include "pathutil.h"
 
 // zstd one-shot encode; symbols come from the libzstd statically linked into libtiff
 extern "C" {
@@ -587,7 +588,7 @@ uint8_t writeSlices(const WriteJob& j, const char* fileName, const char* mode, C
     if(io.open(fileName, append))
         tif = TIFFClientOpen(fileName, append ? "a8" : "w8", (thandle_t)&io, bfRead, bfWrite, bfSeek, bfClose, bfSize, bfMap, bfUnmap);
 #else
-    tif = TIFFOpen(fileName, append ? "a8" : "w8");
+    tif = tiffOpenPath(fileName, append ? "a8" : "w8");
 #endif
     if(!tif){
         printf("Error: File \"%s\" cannot be opened\n",fileName);
@@ -920,13 +921,7 @@ uint8_t writeTiffParallelHelper(const char* fileName, const void* tiffOld, uint6
     #endif
 	if(lastSlash){
 		*lastSlash = '\0';
-		FILE* f = fopen(folderName,"r");
-		if(f){
-			fclose(f);
-		}
-		else{
-			mkdirRecursive(folderName);
-		}
+		mkdirRecursive(folderName);   // (which does nothing when the folder exists)
 	}
 	free(folderName);
 

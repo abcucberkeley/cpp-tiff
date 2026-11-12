@@ -321,6 +321,21 @@ function test_matlab(mexDir)
     end
     fprintf('PASS  tilde paths\n');
 
+    % 10. Folders named in other scripts: paths are UTF-8 (on Windows the files
+    %     were opened in the ANSI code page): written where named, as MATLAB
+    %     sees them, and read whole and by range, and their size.
+    for nm = {['caf' char(233) ' ' char(181) 'm'], char([26085 26412])}
+        f = fullfile(tmp, nm{1}, 'a.tif');
+        parallelWriteTiff(f, vol, 'w', 'zstd');
+        assert(isfile(f), 'utf8: "%s" was not written where named', nm{1});
+        assert(isequal(parallelReadTiff(f), vol), 'utf8: "%s" read back wrong', nm{1});
+        assert(isequal(parallelReadTiff(f, [2 3]), vol(:,:,2:3)), 'utf8: "%s" range', nm{1});
+        assert(isequal(getImageSizeMex(f), size(vol)), 'utf8: "%s" size', nm{1});
+        delete(f);
+        nchecked = nchecked + 1;
+    end
+    fprintf('PASS  paths in other scripts\n');
+
     fprintf('MATLAB tests PASSED (%d round trips)\n', nchecked);
 end
 

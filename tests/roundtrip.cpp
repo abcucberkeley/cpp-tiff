@@ -27,6 +27,22 @@
 #include "parallelwritetiff.h"
 #include "helperfunctions.h"
 #include "tiffio.h"
+#ifdef _WIN32
+#include <codecvt>
+#include <locale>
+#endif
+
+// The test's own files, by UTF-8 path, as the library takes paths: on Windows through the wide-character API
+// (converted here, independently of the library), so that a file the library wrote under a name in another
+// script is found only where that name says
+static FILE* openUtf8(const std::string& path, const char* mode){
+#ifdef _WIN32
+    std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> utf16;
+    return _wfopen(utf16.from_bytes(path).c_str(), utf16.from_bytes(mode).c_str());
+#else
+    return std::fopen(path.c_str(), mode);
+#endif
+}
 
 struct Case { const char* name; uint64_t bits; uint16_t sampleFormat; };
 
@@ -99,7 +115,7 @@ static bool writeImageJTiff(const std::string& path, const uint8_t* data,
         for(uint64_t i = 0; i < nElems; i++)
             for(int b = (int)es - 1; b >= 0; b--) v.push_back(data[i*es + b]);
     }
-    FILE* f = std::fopen(path.c_str(), "wb");
+    FILE* f = openUtf8(path, "wb");
     if(!f) return false;
     const size_t w = std::fwrite(v.data(), 1, v.size(), f);
     std::fclose(f);
@@ -1452,6 +1468,44 @@ int main(int argc, char** argv){
         FILE* rf = std::fopen(ran.c_str(), "rb");
         if(!rf) std::printf("PASS  %-14s no command in a path ran\n", "tilde");
         else { std::fclose(rf); std::printf("FAIL  %-14s a command in a path ran\n", "tilde"); failures++; }
+    }
+
+    // ---- Paths are UTF-8 on every platform: on Windows the library opens them with
+    // the wide-character API (its narrow functions read a path in the ANSI code
+    // page, so that a folder named with an accented or a CJK letter could not be
+    // opened or written to). A stack, one slice of it, its size, and an ImageJ
+    // stack, in folders named "café µm" and "日本", the file found where its name says.
+    {
+        const uint64_t ux = 40, uy = 24, uz = 3;
+        std::vector<uint16_t> uv(ux*uy*uz);
+        for(uint64_t i = 0; i < uv.size(); i++) uv[i] = (uint16_t)(i*2654435761u >> 5);
+        const char* folders[] = {"caf\xc3\xa9 \xc2\xb5m", "\xe6\x97\xa5\xe6\x9c\xac"};
+        for(const char* folder : folders){
+            const std::string base = dir + "/" + folder;
+            const std::string stack = base + "/stack.tif", ij = base + "/imagej.tif";
+            total++;
+            step("utf8-path", folder, "write, find and read a file in a folder named in another script");
+            bool ok = !writeTiffParallelHelper(stack.c_str(), uv.data(), 16, "w", ux, uy, uz, 0, false, "lzw", 1, 0);
+            FILE* f = ok ? openUtf8(stack, "rb") : nullptr;
+            const bool found = f != nullptr;
+            if(f) std::fclose(f);
+            TiffInfo ti;
+            ok = ok && found && !getTiffInfo(stack.c_str(), ti) && ti.z == uz && ti.x == ux && ti.y == uy;
+            void* all = ok ? readTiffParallelWrapperNoXYFlip(stack.c_str(), {}) : nullptr;
+            void* one = ok ? readTiffParallelWrapperNoXYFlip(stack.c_str(), {1}) : nullptr;
+            ok = all && one && std::memcmp(all, uv.data(), uv.size()*2) == 0 && std::memcmp(one, uv.data() + ux*uy, ux*uy*2) == 0;
+            free(all); free(one);
+            uint64_t* dims = ok ? getImageSize(stack.c_str()) : nullptr;
+            ok = dims && dims[0] == uy && dims[1] == ux && dims[2] == uz;
+            free(dims);
+            // (the ImageJ reader opens the file itself)
+            ok = ok && writeImageJTiff(ij, reinterpret_cast<const uint8_t*>(uv.data()), ux, uy, uz, 1, 16, false);
+            void* ijBack = ok ? readTiffParallelWrapperNoXYFlip(ij.c_str(), {}) : nullptr;
+            ok = ijBack && std::memcmp(ijBack, uv.data(), uv.size()*2) == 0;
+            free(ijBack);
+            if(ok) std::printf("PASS  %-14s %s\n", "utf8-path", folder);
+            else { std::printf("FAIL  %-14s %s  (written and found where named: %d)\n", "utf8-path", folder, (int)found); failures++; }
+        }
     }
 
     // ---- Arguments the writer and the readers take, and refuse. Compression

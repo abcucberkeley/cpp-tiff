@@ -24,7 +24,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     char* fileName = NULL;
     if(!mxIsClass(prhs[0], "string")){
         if(!mxIsChar(prhs[0])) mexErrMsgIdAndTxt("tiff:inputError","The first argument must be a string");
-        fileName = mxArrayToString(prhs[0]);
+        fileName = mxArrayToUTF8String(prhs[0]);   // (paths are UTF-8 on every platform)
     }
     else{ 
         mxArray* mString[1];
@@ -33,7 +33,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
         // Convert string to char array
         mString[0] = mxDuplicateArray(prhs[0]);
         mexCallMATLAB(1, mCharA, 1, mString, "char");
-        fileName = mxArrayToString(mCharA[0]);
+        fileName = mxArrayToUTF8String(mCharA[0]);
     }
     if(mxIsEmpty(prhs[1])) mexErrMsgIdAndTxt("tiff:inputError","All input data axes must be of at least size 1");
 
@@ -97,13 +97,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
     #endif
     if(lastSlash){
         *lastSlash = '\0';
-        FILE* f = fopen(folderName,"r");
-        if(f){
-            fclose(f);
-        }
-        else{
-            mkdirRecursive(folderName);
-        }
+        mkdirRecursive(folderName);   // (which does nothing when the folder exists)
     }
     free(folderName);
 
