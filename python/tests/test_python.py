@@ -526,6 +526,194 @@ def main():
     for path, _ in paths:
         os.remove(path)
 
+    # 9. order='F', MATLAB's (y, x[, c], z) layout: reads fill it as they decode,
+    #    and F-contiguous data is written as it is, to the same file as the
+    #    (z, y, x) array. Then what was taken wrongly before: float16, empty and
+    #    big-endian data, compression names, slice ranges past the end, ImageJ
+    #    stack shapes, path-like names, and tuple, NumPy and range slice ranges.
+    def fortran(a, color):
+        # the array read_tiff(order='F') returns for read_tiff's (z, y, x[, c])
+        return np.asfortranarray(a if a.ndim == (3 if color else 2) else np.moveaxis(a, 0, -1))
+
+    def same_file(p, q):
+        with open(p, "rb") as fp, open(q, "rb") as fq:
+            return fp.read() == fq.read()
+
+    def raises(kind, f, what):
+        try:
+            f()
+        except kind:
+            return True
+        except Exception as e:
+            check(False, f"{what}: raised {type(e).__name__} ({e}), not {kind.__name__}")
+            return False
+        check(False, f"{what}: did not raise {kind.__name__}")
+        return False
+
+    from cpptiff.cpptiff import pybind11_write_tiff
+    fcases = [("gray", make((5, 24, 40), np.uint16, rng), False, "lzw", 0),
+              ("gray-tiled", make((4, 40, 50), np.int32, rng), False, "zstd", 16),
+              ("2d", make((24, 40), np.float32, rng), False, "none", 0),
+              ("thin", make((30, 6, 9), np.uint8, rng), False, "lzw", 0),
+              ("rgb", make((3, 24, 40, 3), np.uint8, rng), True, "lzw", 0),
+              ("rgba-image", make((24, 40, 4), np.uint16, rng), True, "zstd", 0),
+              ("f16", make((3, 24, 40), np.float16, rng), False, "lzw", 0)]
+    for name, a, color, comp, tile in fcases:
+        tag = f"order='F' {name}"
+        f = fortran(a, color)
+        pc = os.path.join(tmp, f"oc_{name}.tif")
+        pf = os.path.join(tmp, f"of_{name}.tif")
+        cpptiff.write_tiff(pc, a, comp, tile, rgb=color)
+        cpptiff.write_tiff(pf, f, comp, tile, rgb=color, order="F")
+        check(same_file(pc, pf), f"{tag}: write_tiff(order='F') wrote a different file")
+        # Not F-contiguous (y, x, z) data is copied first, to the same file
+        pf2 = os.path.join(tmp, f"of2_{name}.tif")
+        cpptiff.write_tiff(pf2, np.ascontiguousarray(f), comp, tile, rgb=color, order="F")
+        check(same_file(pc, pf2), f"{tag}: C-contiguous (y, x, z) data wrote a different file")
+        back = cpptiff.read_tiff(pc, order="F")
+        check(back.dtype == a.dtype and back.shape == f.shape and back.flags["F_CONTIGUOUS"]
+              and np.array_equal(back, f), f"{tag}: read {back.shape} F={back.flags['F_CONTIGUOUS']}")
+        stack = a.ndim == (4 if color else 3)
+        want_shape = f.shape if stack else f.shape + (1,)
+        check(cpptiff.get_image_shape(pc, order="F") == want_shape,
+              f"{tag}: get_image_shape {cpptiff.get_image_shape(pc, order='F')}")
+        out = np.empty(f.shape, a.dtype, order="F")
+        check(cpptiff.read_tiff(pc, out=out, order="F") is out and np.array_equal(out, f), f"{tag}: out=")
+        if stack and a.shape[0] > 2:
+            check(np.array_equal(cpptiff.read_tiff(pc, [1, 3], order="F"), fortran(a[1:3], color)), f"{tag}: [1, 3)")
+            one = cpptiff.read_tiff(pc, 2, order="F")
+            check(one.flags["F_CONTIGUOUS"] and np.array_equal(one, np.asfortranarray(a[2])), f"{tag}: slice 2")
+            for shape in (a[2].shape, a[2].shape + (1,)):
+                o = np.empty(shape, a.dtype, order="F")
+                cpptiff.read_tiff(pc, 2, out=o, order="F")
+                check(np.array_equal(o.reshape(a[2].shape, order="F"), a[2]), f"{tag}: slice 2 into out of {shape}")
+            # An out in the other layout is refused, with the order that fits it named
+            raises(ValueError, lambda: cpptiff.read_tiff(pc, out=np.empty(a.shape, a.dtype), order="F"),
+                   f"{tag}: a C-contiguous (z, y, x) out with order='F'")
+            raises(ValueError, lambda: cpptiff.read_tiff(pc, out=np.empty(f.shape, a.dtype, order="F")),
+                   f"{tag}: an F-contiguous (y, x, z) out with order='C'")
+            raises(ValueError, lambda: cpptiff.read_tiff(pc, out=np.empty(f.shape, a.dtype), order="F"),
+                   f"{tag}: a C-contiguous (y, x, z) out with order='F'")
+        got = cpptiff.read_tiff_batch([pc, (pf, None, np.empty(f.shape, a.dtype, order="F"))], num_threads=2, order="F")
+        check(all(g.flags["F_CONTIGUOUS"] and np.array_equal(g, f) for g in got), f"{tag}: read_tiff_batch")
+        for path in (pc, pf, pf2):
+            os.remove(path)
+
+    # MATLAB's layout through the reader's other paths: an ImageJ stack, planar color
+    path = os.path.join(tmp, "of_imagej.tif")
+    write_imagej_tiff(path, ij_g16)
+    check(np.array_equal(cpptiff.read_tiff(path, order="F"), fortran(ij_g16, False)), "order='F' ImageJ stack")
+    check(np.array_equal(cpptiff.read_tiff(path, [1, 3], order="F"), fortran(ij_g16[1:3], False)), "order='F' ImageJ [1, 3)")
+    # An ImageJ stack is one directory, but read_tiff reads its slices: the shape says so
+    check(cpptiff.get_image_shape(path) == ij_g16.shape, f"ImageJ stack shape {cpptiff.get_image_shape(path)}")
+    check(cpptiff.get_image_shape(path, order="F") == fortran(ij_g16, False).shape, "ImageJ stack shape, order='F'")
+    os.remove(path)
+    pl = make((4, 24, 40, 3), np.uint16, rng)
+    path = os.path.join(tmp, "of_planar.tif")
+    write_planar_tiff(path, pl, 7, 8)
+    check(np.array_equal(cpptiff.read_tiff(path, order="F"), fortran(pl, True)), "order='F' planar color")
+    os.remove(path)
+
+    # The extension's own write entry still takes MATLAB's memory as the port
+    # uses it, and refuses memory laid out otherwise (it reads it directly)
+    g = fcases[0][1]
+    pc, pd = os.path.join(tmp, "entry_c.tif"), os.path.join(tmp, "entry_direct.tif")
+    cpptiff.write_tiff(pc, g)
+    pybind11_write_tiff(pd, fortran(g, False).transpose(1, 0, 2), True, "lzw", 0, 0)
+    check(same_file(pc, pd), "pybind11_write_tiff with MATLAB's memory wrote a different file")
+    raises(ValueError, lambda: pybind11_write_tiff(pd, np.ascontiguousarray(g.transpose(2, 1, 0)), True, "lzw", 0, 0),
+           "pybind11_write_tiff with memory in another layout")
+    for path in (pc, pd):
+        os.remove(path)
+
+    # float16: written as 16-bit floats, read back as float16 (it came back uint16)
+    h = np.array([[[0.5, -2.25, 65504.0], [np.inf, -0.0, 1e-4]]], np.float16)
+    path = os.path.join(tmp, "f16.tif")
+    for comp in COMPRESSIONS:
+        cpptiff.write_tiff(path, h, comp)
+        back = cpptiff.read_tiff(path)
+        check(back.dtype == np.float16 and np.array_equal(back, h[0]), f"float16 {comp}: {back.dtype}")
+        check(first_tag(path, 339) == 3 and first_tag(path, 258) == 16, f"float16 {comp}: tags")
+    os.remove(path)
+
+    # Empty arrays: refused, and nothing written (they were written as one slice
+    # read from past the end of the data)
+    path = os.path.join(tmp, "empty.tif")
+    for shape, kw in (((0, 4, 5), {}), ((3, 0, 5), {}), ((3, 4, 0), {}), ((0, 5), {}),
+                      ((0, 4, 5, 3), {}), ((4, 5, 0), {"order": "F"}), ((4, 0), {"order": "F"})):
+        raises(ValueError, lambda: cpptiff.write_tiff(path, np.zeros(shape, np.uint16), **kw), f"empty {shape} {kw}")
+        check(not os.path.exists(path), f"empty {shape} {kw}: a file was written")
+
+    # Data in the other byte order: converted (it was written unswapped)
+    for dt in (">u2", ">i4", ">f4", ">f8"):
+        a = make((3, 24, 40), np.dtype(dt).newbyteorder("="), rng)
+        pn, pb, pbf = (os.path.join(tmp, f"bo_{k}.tif") for k in ("native", "big", "big_f"))
+        cpptiff.write_tiff(pn, a)
+        cpptiff.write_tiff(pb, a.astype(dt))
+        cpptiff.write_tiff(pbf, fortran(a, False).astype(dt), order="F")
+        check(same_file(pn, pb) and same_file(pn, pbf), f"byte order {dt}: different files")
+        check(np.array_equal(cpptiff.read_tiff(pb), a), f"byte order {dt}: values")
+        for p_ in (pn, pb, pbf):
+            os.remove(p_)
+
+    # Compression names in any case (None is 'none'); others refused, no file left
+    a = fcases[0][1]
+    ref = {}
+    for comp in ("lzw", "zstd", "none"):
+        ref[comp] = os.path.join(tmp, f"cn_{comp}.tif")
+        cpptiff.write_tiff(ref[comp], a, comp)
+    path = os.path.join(tmp, "cn.tif")
+    for given, comp in (("ZSTD", "zstd"), ("Zstd", "zstd"), ("LZW", "lzw"), ("None", "none"),
+                        ("NONE", "none"), (None, "none"), ("", "none")):
+        cpptiff.write_tiff(path, a, given)
+        check(same_file(path, ref[comp]), f"compression {given!r}: not the {comp} file")
+        os.remove(path)
+    for given in ("jpeg", "deflate", "lzw ", 5):
+        raises(ValueError, lambda: cpptiff.write_tiff(path, a, given), f"compression {given!r}")
+        check(not os.path.exists(path), f"compression {given!r}: a file was written")
+    for p_ in ref.values():
+        os.remove(p_)
+
+    # Slice ranges: past the end, empty, reversed, negative, too long, not whole
+    # numbers. (Past the end they failed as damaged files, with the readers'
+    # errors printed.) Tuples, NumPy arrays and ranges work like lists.
+    v6 = make((6, 5, 7), np.uint16, rng)
+    path = os.path.join(tmp, "zr6.tif")
+    cpptiff.write_tiff(path, v6)
+    for zr in ([0, 7], 6, [6, 7], [5, 9]):
+        raises(IndexError, lambda: cpptiff.read_tiff(path, zr), f"z_range {zr!r} past the end")
+        raises(IndexError, lambda: cpptiff.read_tiff(path, zr, order="F"), f"z_range {zr!r} past the end, order='F'")
+    for zr in ([3, 3], [4, 2], [-1, 2], -1, [1, 2, 3], range(3, 3), range(0, 6, 2)):
+        raises(ValueError, lambda: cpptiff.read_tiff(path, zr), f"z_range {zr!r}")
+    for zr in ([1.0, 2.0], 1.5, "ab", True, [0, True], {"a": 1}):
+        raises(TypeError, lambda: cpptiff.read_tiff(path, zr), f"z_range {zr!r}")
+    for zr in ((1, 3), np.array([1, 3]), [np.int64(1), np.uint8(3)], range(1, 3)):
+        check(np.array_equal(cpptiff.read_tiff(path, zr), v6[1:3]), f"z_range {zr!r}")
+    check(np.array_equal(cpptiff.read_tiff(path, np.int64(5)), v6[5]), "z_range np.int64(5)")
+    check(np.array_equal(cpptiff.read_tiff(path, (5,)), v6[5]), "z_range (5,)")
+    check(np.array_equal(cpptiff.read_tiff(path, []), v6), "z_range [] (every slice, as before)")
+
+    # Path-like and bytes names
+    import pathlib
+    pp = pathlib.Path(path)
+    check(np.array_equal(cpptiff.read_tiff(pp), v6) and cpptiff.get_image_shape(pp) == v6.shape, "pathlib.Path read")
+    check(np.array_equal(cpptiff.read_tiff(os.fsencode(path)), v6), "bytes name read")
+    pw = pathlib.Path(tmp) / "pathlib_written.tif"
+    cpptiff.write_tiff(pw, v6)
+    check(same_file(path, pw), "pathlib.Path write")
+    got = cpptiff.read_tiff_batch([pp, (pw, (1, 3))])
+    check(np.array_equal(got[0], v6) and np.array_equal(got[1], v6[1:3]), "pathlib.Path batch")
+    raises(TypeError, lambda: cpptiff.read_tiff(5), "file_name=5")
+    for bad in ("c", "A", "K", "f"):
+        raises(ValueError, lambda: cpptiff.read_tiff(path, order=bad), f"read_tiff order={bad!r}")
+        raises(ValueError, lambda: cpptiff.write_tiff(pw, v6, order=bad), f"write_tiff order={bad!r}")
+        raises(ValueError, lambda: cpptiff.get_image_shape(path, order=bad), f"get_image_shape order={bad!r}")
+        raises(ValueError, lambda: cpptiff.read_tiff_batch([path], order=bad), f"read_tiff_batch order={bad!r}")
+    for bad in (np.zeros((2, 3, 4), np.bool_), np.zeros((2, 3, 4), np.complex64)):
+        raises(TypeError, lambda: cpptiff.write_tiff(pw, bad), f"write_tiff {bad.dtype}")
+    os.remove(path)
+    os.remove(pw)
+
     if _failures:
         for f in _failures[:20]:
             print("FAIL:", f)

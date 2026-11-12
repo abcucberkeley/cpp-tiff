@@ -30,7 +30,9 @@ The reader returns a zyx numpy array for the given tiff file (zyxc for RGB/RGBA 
 
 The writer takes an output filename and a zyx numpy array, or a zyxc array for RGB/RGBA (3 or 4 colors last). A single yxc color image needs rgb=True, since a 3D array is otherwise written as a stack of grayscale images
 
-By default, the writer uses lzw compression but you can also pass 'zstd' or 'none' as the third argument. Passing a tile size (a multiple of 16) writes square tiles instead of strips
+By default, the writer uses lzw compression but you can also pass 'zstd' or 'none' (in any case) as the third argument. Passing a tile size (a multiple of 16) writes square tiles instead of strips
+
+File names can be strings or path objects such as pathlib.Path
 
 #### Read and Write a tiff file
 ````
@@ -66,13 +68,23 @@ im = cpptiff.read_tiff('filename.tif', 0)
 ````
 
 #### Read a specified slice range of a tiff file
+The range is [start, end): 0-based, with the end excluded, as a list, tuple, range or NumPy array
 ````
 import cpptiff
 # Read the first two slices
 im = cpptiff.read_tiff('filename.tif', [0, 2])
 ````
 
+#### Read and write MATLAB's (y, x, z) layout
+order='F' reads into the column-major (y, x, z) array MATLAB's parallelReadTiff returns ((y, x, c, z) for RGB/RGBA), filled in that layout as the file is read, with no copy. write_tiff with order='F' takes that layout, and writes the same file as for the (z, y, x) array, without a copy when the array is Fortran-ordered
+````
+import cpptiff
+im = cpptiff.read_tiff('filename.tif', order='F')   # (y, x, z), Fortran-ordered
+cpptiff.write_tiff('outputFilename.tif', im, order='F')
+````
+
 #### Get the shape of a tiff file without reading the image
+The shape is (z, y, x) or (z, y, x, c), or with order='F' (y, x, z) or (y, x, c, z)
 ````
 import cpptiff
 im_shape = cpptiff.get_image_shape('filename.tif')
@@ -86,7 +98,7 @@ ims = cpptiff.read_tiff_batch(['a.tif', ('b.tif', [0, 2])])
 ````
 
 #### Threads and reading into an existing array
-By default every call uses all CPUs (or OMP_NUM_THREADS). num_threads sets the threads of one call, and since reads and writes release the GIL, calls from several Python threads run at once. out reads into an existing array (of the shape read_tiff returns and the file's data type) instead of a new one
+By default every call uses all CPUs (or OMP_NUM_THREADS). num_threads sets the threads of one call, and since reads and writes release the GIL, calls from several Python threads run at once. out reads into an existing array (of the shape read_tiff returns and the file's data type, C-ordered, or Fortran-ordered with order='F') instead of a new one
 ````
 import numpy as np
 import cpptiff
