@@ -17,8 +17,32 @@ project(
   VERSION 1.7.3
   LANGUAGES CXX)
 
-# Set the RPATH to $ORIGIN when installing if applicable
+# Set the RPATH to $ORIGIN when installing if applicable, and only that: entries the toolchain itself adds when
+# linking (a Spack-built GCC adds its own lib64) are left out of installed libraries (CMake 3.16 and later), which
+# find the GCC runtime next to them, as the release folders ship it, or as the system has it (libcppTiff needs
+# nothing newer than GCC 4.5's libgomp)
 set(CMAKE_INSTALL_RPATH $ORIGIN)
+set(CMAKE_INSTALL_REMOVE_ENVIRONMENT_RPATH TRUE)
+
+# No absolute path of the machine that builds it in the library: __FILE__ (libtiff's tif_dir.c uses it) and debug
+# information name the source files relative to the source and build folders, and to dependencies' sources given
+# with FETCHCONTENT_SOURCE_DIR_* (for every target, the dependencies' too, so set before they are added). With GCC
+# the last option that matches wins, so the more specific folders come later.
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-ffile-prefix-map=${CMAKE_SOURCE_DIR}=." CPPTIFF_HAS_FILE_PREFIX_MAP)
+if(CPPTIFF_HAS_FILE_PREFIX_MAP)
+    set(CPPTIFF_PREFIX_MAPS "${CMAKE_SOURCE_DIR}=." "${CMAKE_BINARY_DIR}=.")
+    foreach(dep TIFF ZLIB ZSTD LIBDEFLATE)
+        if(FETCHCONTENT_SOURCE_DIR_${dep})
+            get_filename_component(depDir "${FETCHCONTENT_SOURCE_DIR_${dep}}" ABSOLUTE)
+            string(TOLOWER ${dep} depName)
+            list(APPEND CPPTIFF_PREFIX_MAPS "${depDir}=./_deps/${depName}-src")
+        endif()
+    endforeach()
+    foreach(map ${CPPTIFF_PREFIX_MAPS})
+        add_compile_options("-ffile-prefix-map=${map}")
+    endforeach()
+endif()
 
 # OpenMP is Required
 find_package(OpenMP REQUIRED)
