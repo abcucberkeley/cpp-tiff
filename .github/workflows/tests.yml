@@ -64,18 +64,20 @@ jobs:
       - name: C++ tests
         run: ctest --test-dir build --output-on-failure
 
-      # Compiles the extension straight against the library built above, then
-      # runs the same test file cibuildwheel runs against the release wheels.
+      # Compiles the extension straight against the library built above, linked
+      # as setup.py links the wheels' (its static C++ runtime kept private to it,
+      # and on macOS only its entry point exported), then runs the same test file
+      # cibuildwheel runs against the release wheels.
       - name: Python tests
         run: |
           EXT=$(python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
           case "$RUNNER_OS" in
             Linux)
               python -m pip install numpy pybind11
-              FLAGS="-fPIC $(python -m pybind11 --includes) -Wl,-rpath,$PWD/install/lib" ;;
+              FLAGS="-fPIC $(python -m pybind11 --includes) -Wl,-rpath,$PWD/install/lib -static-libstdc++ -Wl,--exclude-libs,ALL" ;;
             macOS)
               python -m pip install numpy pybind11
-              FLAGS="-fPIC $(python -m pybind11 --includes) -isysroot $(xcrun --show-sdk-path) -undefined dynamic_lookup -Wl,-rpath,$PWD/install/lib" ;;
+              FLAGS="-fPIC $(python -m pybind11 --includes) -isysroot $(xcrun --show-sdk-path) -undefined dynamic_lookup -Wl,-rpath,$PWD/install/lib -static-libstdc++ -Wl,-exported_symbol,_PyInit_cpptiff" ;;
             Windows)
               PYINC=$(python -c "import sysconfig; print(sysconfig.get_path('include'))")
               PYVER=$(python -c "import sysconfig; print(sysconfig.get_config_var('LDVERSION'))")

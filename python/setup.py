@@ -59,7 +59,12 @@ ext_modules = [
         library_dirs=['build/install/lib64','build/install/lib'],
         libraries=['cppTiff'],
         sources=["cpptiff.cpp"],
-        extra_link_args=['-static-libstdc++']
+        # The module's static C++ runtime stays private to it. On macOS the module exports its entry point alone:
+        # the loader merges the exported weak definitions of one name across every image a process loads, so that
+        # next to another GCC-built Python module (cpp-zarr's 1.7.3 wheel), whichever of the two was loaded second
+        # ran the other's copy of pybind11's std::call_once code, on the other's runtime, and its first write crashed
+        extra_link_args=['-static-libstdc++'] + (['-Wl,--exclude-libs,ALL'] if system == "Linux" else
+                                                 ['-Wl,-exported_symbol,_PyInit_cpptiff'] if system == "Darwin" else [])
     ),
 ]
 
