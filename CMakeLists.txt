@@ -191,6 +191,42 @@ else()
     target_link_libraries(cppTiff_shared PRIVATE -static-libgcc)
 endif()
 
+# CPPTIFF_PRIVATE_RUNTIME (Linux and macOS, on by default): the library's static C++ runtime is kept out of its
+# exports, the runtime's own archives and the runtime's templates the library's sources instantiate. Exported,
+# programs and Python modules with a C++ runtime of their own bound some of its symbols to the library's copy
+# (1.7.3's macOS wheel's module bound 39, std::current_exception among them, while it kept 268 of its own): two
+# runtimes in one process, each with its own exception and locale state, and stream and locale calls that crossed
+# between them aborted without a message; and on macOS the loader merges the exported weak definitions of one name
+# across every image a process loads, so that template code of the runtime could run another image's copy on that
+# copy's state. The libtiff and zstd APIs, whose headers are installed, stay exported. (cpp-zarr has the same
+# option, off by default there for programs built against its exported runtime.) The patterns are mangled names:
+# std's, its short forms (Sa, Sb, Ss, Si, So, Sd), its typeinfo, vtables, guards and thunks, __gnu_cxx's,
+# __cxxabiv1's, the typeinfo of built-in types, operator new and delete, and the C++ ABI's C functions.
+option(CPPTIFF_PRIVATE_RUNTIME "Keep the library's static C++ runtime private (Linux and macOS)" ON)
+set(CPPTIFF_RUNTIME_SYMBOLS
+    "_ZNSt*" "_ZNKSt*" "_ZSt*" "_ZTISt*" "_ZTSSt*" "_ZTVSt*" "_ZTTSt*" "_ZGVZNSt*" "_ZGVNSt*" "_ZGVZNKSt*"
+    "_ZTINSt*" "_ZTSNSt*" "_ZTVNSt*" "_ZTTNSt*" "_ZTHSt*" "_ZTWSt*" "_ZTHNSt*" "_ZTWNSt*"
+    "_ZNSa*" "_ZNKSa*" "_ZNSb*" "_ZNKSb*" "_ZNSs*" "_ZNKSs*" "_ZNSi*" "_ZNKSi*" "_ZNSo*" "_ZNKSo*" "_ZNSd*" "_ZNKSd*"
+    "_ZTISa*" "_ZTISb*" "_ZTISs*" "_ZTISi*" "_ZTISo*" "_ZTISd*" "_ZTSSa*" "_ZTSSb*" "_ZTSSs*" "_ZTSSi*" "_ZTSSo*" "_ZTSSd*"
+    "_ZTVSa*" "_ZTVSb*" "_ZTVSs*" "_ZTVSi*" "_ZTVSo*" "_ZTVSd*" "_ZTTSi*" "_ZTTSo*" "_ZTTSd*"
+    "_ZThn*St*" "_ZTv*St*" "_ZTch*St*"
+    "_ZN9__gnu_cxx*" "_ZNK9__gnu_cxx*" "_ZTIN9__gnu_cxx*" "_ZTSN9__gnu_cxx*" "_ZTVN9__gnu_cxx*" "_ZGVZN9__gnu_cxx*"
+    "_ZN10__cxxabiv1*" "_ZNK10__cxxabiv1*" "_ZTIN10__cxxabiv1*" "_ZTSN10__cxxabiv1*" "_ZTVN10__cxxabiv1*"
+    "_ZTI?" "_ZTS?" "_ZTIP?" "_ZTSP?" "_ZTIPK?" "_ZTSPK?" "_ZTID?" "_ZTSD?" "_ZTIPD?" "_ZTSPD?" "_ZTIPKD?" "_ZTSPKD?"
+    "_ZZNSt*" "_ZZNKSt*" "__cxa_*" "__gxx_personality*" "__dynamic_cast" "_Znw*" "_Zna*" "_Zdl*" "_Zda*")
+if(CPPTIFF_PRIVATE_RUNTIME AND UNIX AND NOT APPLE)
+    string(REPLACE ";" ";\n    " CPPTIFF_RUNTIME_LOCAL "${CPPTIFF_RUNTIME_SYMBOLS}")
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/cpptiff_private_runtime.map" "{\n  local:\n    ${CPPTIFF_RUNTIME_LOCAL};\n};\n")
+    target_link_options(cppTiff_shared PRIVATE "LINKER:--exclude-libs,libstdc++.a:libsupc++.a:libgcc.a:libgcc_eh.a"
+                                               "LINKER:--version-script,${CMAKE_CURRENT_BINARY_DIR}/cpptiff_private_runtime.map")
+elseif(CPPTIFF_PRIVATE_RUNTIME AND APPLE)
+    # (Mach-O names start with one more _)
+    list(TRANSFORM CPPTIFF_RUNTIME_SYMBOLS PREPEND "_" OUTPUT_VARIABLE CPPTIFF_RUNTIME_MACHO)
+    string(REPLACE ";" "\n" CPPTIFF_RUNTIME_TEXT "${CPPTIFF_RUNTIME_MACHO}")
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/cpptiff_private_runtime.txt" "${CPPTIFF_RUNTIME_TEXT}\n")
+    target_link_options(cppTiff_shared PRIVATE "LINKER:-unexported_symbols_list,${CMAKE_CURRENT_BINARY_DIR}/cpptiff_private_runtime.txt")
+endif()
+
 install(TARGETS cppTiff_shared
         PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_WRITE GROUP_EXECUTE WORLD_READ WORLD_WRITE WORLD_EXECUTE
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

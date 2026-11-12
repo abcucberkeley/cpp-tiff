@@ -72,6 +72,17 @@ jobs:
           esac
           bash .github/scripts/check_build_paths.sh "$PWD" "$LIB" "$PWD/build"
 
+      # The installed library exports none of its static C++ runtime, and still the libtiff and zstd
+      # APIs (see the script)
+      - name: No C++ runtime in the library's exports
+        if: runner.os != 'Windows'
+        run: |
+          case "$RUNNER_OS" in
+            macOS) LIB=install/lib/libcppTiff.dylib ;;
+            *)     LIB=install/lib/libcppTiff.so ;;
+          esac
+          bash .github/scripts/check_exports.sh "$LIB"
+
       - name: C++ tests
         run: ctest --test-dir build --output-on-failure
 
@@ -97,6 +108,9 @@ jobs:
           esac
           "${CXX:-g++}" -O2 -std=c++17 -shared python/cpptiff.cpp -o "python/cpptiff/cpptiff$EXT" \
             -Iinstall/include -Linstall/lib -lcppTiff $FLAGS
+          if [ "$RUNNER_OS" = macOS ]; then
+            bash .github/scripts/check_exports.sh install/lib/libcppTiff.dylib "python/cpptiff/cpptiff$EXT"
+          fi
           PYTHONPATH=python python python/tests/test_python.py
 
   matlab:
