@@ -12,6 +12,7 @@
 #include "lzwdecode.h"
 #include "pathutil.h"
 #include "tiffdirs.h"
+#include "stripdecode.h"
 
 // RAII for libtiff handles: TIFFClose runs on every exit path, so the worker
 // functions don't carry a naked TIFF* with a manual close. (C++11: no make_unique.)
@@ -235,6 +236,14 @@ static tmsize_t readEncodedTile(TIFF* tif, uint32_t tile, void* buf, tmsize_t si
 // tile. validW/validH bound every copy to the part inside the image.
 
 // Copy one decoded tile into the row-major (no-flip) output, row by row.
+tmsize_t decodeStrip(TIFF* tif, uint32_t strip, void* buf, tmsize_t size, std::vector<uint8_t>& raw){
+    return readEncodedStrip(tif, strip, buf, size, raw);
+}
+
+tmsize_t decodeTile(TIFF* tif, uint32_t tile, void* buf, tmsize_t size, std::vector<uint8_t>& raw){
+    return readEncodedTile(tif, tile, buf, size, raw);
+}
+
 static inline void copyTileNoFlip(uint8_t* out, const uint8_t* buf, int64_t x,
                                   int64_t tileX0, int64_t tileY0,
                                   int64_t validW, int64_t validH,

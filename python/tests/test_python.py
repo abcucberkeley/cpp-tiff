@@ -768,6 +768,77 @@ def main():
     os.remove(path)
     os.remove(pw)
 
+    # GPU reads, where an NVIDIA GPU, nvCOMP and CuPy are (copied back as they are
+    # laid out: a C-contiguous copy of an F-ordered CuPy array compiles a kernel,
+    # which needs CUDA's headers): what the CPU reads, for
+    # every codec the writer writes, every data type, color, both orders, slice
+    # ranges and single slices, as new CuPy arrays (gpu=True) and into CuPy arrays
+    # and PyTorch CUDA tensors (out=), in a batch, ImageJ stacks in both byte
+    # orders and planar color; outs of the wrong type or shape refused
+    gpu_ok, gpu_why = cpptiff.gpu_available()
+    try:
+        import cupy
+    except ImportError:
+        cupy = None
+        gpu_why = gpu_why or "no CuPy"
+    if gpu_ok and cupy is not None:
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                torch = None
+        except ImportError:
+            torch = None
+        rng_g = np.random.default_rng(7)
+        gpu_files = []
+        for comp in ("lzw", "zstd", "none"):
+            for dt in (np.uint8, np.uint16, np.int16, np.float32, np.float64):
+                for shape in ((5, 37, 50), (3, 20, 30, 3)):
+                    a = (rng_g.random(shape)*200).astype(dt)
+                    p_ = os.path.join(tmp, f"gpu_{comp}_{np.dtype(dt).name}_{len(shape)}.tif")
+                    cpptiff.write_tiff(p_, a, comp, rgb=len(shape) == 4)
+                    gpu_files.append(p_)
+        ij_be = os.path.join(tmp, "gpu_ij_be.tif")
+        write_imagej_tiff(ij_be, ij_g16, ">")
+        ij_le = os.path.join(tmp, "gpu_ij_le.tif")
+        write_imagej_tiff(ij_le, ij_g16, "<")
+        gpu_files += [ij_be, ij_le]
+        for p_ in gpu_files:
+            for o in ("C", "F"):
+                for zr in (None, [1, 3], 2):
+                    want = cpptiff.read_tiff(p_, zr, order=o)
+                    got = cpptiff.read_tiff(p_, zr, order=o, gpu=True)
+                    good = isinstance(got, cupy.ndarray) and got.shape == want.shape and got.dtype == want.dtype \
+                        and (got.flags.f_contiguous if o == "F" else got.flags.c_contiguous) \
+                        and np.array_equal(cupy.asnumpy(got, order="A"), want)
+                    check(good, f"GPU read {os.path.basename(p_)} order={o} z_range={zr}")
+                    into = cupy.empty(want.shape, dtype=want.dtype, order=o)
+                    back = cpptiff.read_tiff(p_, zr, order=o, out=into)
+                    check(back is into and np.array_equal(cupy.asnumpy(into, order="A"), want), f"GPU read into CuPy {os.path.basename(p_)} {o} {zr}")
+                    # (PyTorch's uint16 and other unsigned types are partly supported: left out)
+                    if torch is not None and o == "C" and np.dtype(want.dtype).name in ("uint8", "int16", "float32", "float64"):
+                        tt = torch.empty(want.shape, dtype=getattr(torch, np.dtype(want.dtype).name), device="cuda")
+                        cpptiff.read_tiff(p_, zr, out=tt)
+                        check(np.array_equal(tt.cpu().numpy(), want), f"GPU read into PyTorch {os.path.basename(p_)} {zr}")
+        # A batch: several files, ranges and outs, in one GPU call
+        # (gpu_files[2]: LZW uint16 (5, 37, 50); gpu_files[3]: LZW uint16 RGB (3, 20, 30, 3))
+        reqs = [gpu_files[3], (gpu_files[2], [1, 4]), (gpu_files[-1], None, cupy.empty(ij_g16.shape, dtype=ij_g16.dtype))]
+        got = cpptiff.read_tiff_batch(reqs, gpu=True)
+        want = [cpptiff.read_tiff(gpu_files[3]), cpptiff.read_tiff(gpu_files[2], [1, 4]), ij_g16]
+        check(len(got) == 3 and all(np.array_equal(cupy.asnumpy(g, order="A"), w) for g, w in zip(got, want)) and got[2] is reqs[2][2],
+              "GPU batch read")
+        # Planar color (a fixture the writer cannot make)
+        pp = os.path.join(tmp, "gpu_planar.tif")
+        plan = (rng_g.random((3, 16, 20, 3))*60000).astype(np.uint16)
+        write_planar_tiff(pp, plan, 5)
+        check(np.array_equal(cupy.asnumpy(cpptiff.read_tiff(pp, gpu=True), order="A"), cpptiff.read_tiff(pp)), "GPU read planar color")
+        # Outs of the wrong type or shape
+        raises(ValueError, lambda: cpptiff.read_tiff(gpu_files[2], out=cupy.empty((5, 37, 50), dtype=np.float32)), "GPU out of the wrong type")
+        raises(ValueError, lambda: cpptiff.read_tiff(gpu_files[2], out=cupy.empty((5, 37, 51), dtype=np.uint16)), "GPU out of the wrong shape")
+        raises(ValueError, lambda: cpptiff.read_tiff(gpu_files[2], out=cupy.empty((5, 37, 50), dtype=np.uint16, order="F")), "GPU out not C-contiguous")
+        print(f"GPU reads checked{' (and into PyTorch tensors)' if torch is not None else ''}")
+    else:
+        print(f"GPU reads skipped: {gpu_why}")
+
     if _failures:
         for f in _failures[:20]:
             print("FAIL:", f)

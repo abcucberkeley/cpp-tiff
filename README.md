@@ -24,6 +24,14 @@ Windows: Windows 10 or newer is required
 pip install cpp-tiff
 ````
 
+#### With GPU reads
+Reading straight into GPU memory needs Linux, an NVIDIA GPU (Volta or newer) and its driver. The gpu extra also installs nvCOMP, which decompresses on the GPU and which cpptiff finds by itself (see "Read straight into GPU memory" below)
+````
+pip install "cpp-tiff[gpu]"
+# gpu=True returns CuPy arrays, so it also needs CuPy (reading into PyTorch tensors does not)
+pip install cupy-cuda12x
+````
+
 ### Usage
 
 The reader returns a zyx numpy array for the given tiff file (zyxc for RGB/RGBA tiffs, with the color channel last, whether the file stores the colors interleaved or as separate planes)
@@ -107,6 +115,27 @@ cpptiff.read_tiff('filename.tif', out=im)
 cpptiff.write_tiff('outputFilename.tif', im, num_threads=4)
 ````
 
+#### Read straight into GPU memory
+For data needed on the GPU anyway, the strips' stored bytes are read, copied to the GPU and decompressed there: zstd and deflate with nvCOMP, LZW and the other codecs on the CPU (nvCOMP has no LZW), into the same copy. The GPU then undoes the predictor, swaps the bytes of big-endian files and puts the slices in place, in either order. The values are the same as read_tiff's. Linux only for now
+````
+import cpptiff
+# A CuPy array instead of a NumPy array (needs CuPy: pip install cupy-cuda12x)
+im = cpptiff.read_tiff('filename.tif', gpu=True)
+im = cpptiff.read_tiff('filename.tif', [0, 2], order='F', gpu=True)
+
+# Or read into GPU memory you have: a CuPy array, a PyTorch CUDA tensor, or anything with __cuda_array_interface__
+import torch
+out = torch.empty(cpptiff.get_image_shape('filename.tif'), dtype=torch.uint16, device='cuda')
+cpptiff.read_tiff('filename.tif', out=out, stream=torch.cuda.current_stream())
+
+# A batch goes to the GPU together (one decompression for all of its strips, which is what GPUs do best)
+ims = cpptiff.read_tiff_batch(['a.tif', ('b.tif', [0, 10])], gpu=True)
+
+# Whether GPU reads can run here, and if not, why
+ok, why = cpptiff.gpu_available()
+````
+CPPTIFF_GPU_PROFILE=1 prints where each GPU read's time went; CPPTIFF_GPU_PART_MAX_MB (256) sets the most a read sends to the GPU at once (a bigger read goes in parts, the next one read while the GPU works on the one before), and CPPTIFF_GPU_TIMEOUT the seconds a read waits for the GPU (nvCOMP can hang on damaged data; by default 30 plus 1 per 50 MB)
+
 ## CMake
 
 The C++ library can be compiled using the CMakeLists.txt file
@@ -125,6 +154,9 @@ cmake ..
 make -j
 make install
 ````
+
+### Reading into GPU memory
+gpureadtiff.h reads files straight into GPU memory, decompressing on the GPU (see the Python section; Linux only for now). Building needs nothing more: the library loads the NVIDIA driver and nvCOMP (5 or later: pip install nvidia-libnvcomp-cu12, or set CPPTIFF_NVCOMP_LIBRARY to its libnvcomp file) when a GPU read first needs them, and builds and runs without either
 
 ## MATLAB
 

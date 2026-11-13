@@ -5,6 +5,7 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, wait
 from .cpptiff import pybind11_read_tiff, pybind11_write_tiff, pybind11_get_image_shape, pybind11_default_threads
+from .cpptiff import pybind11_read_shape, pybind11_read_tiff_gpu, pybind11_gpu_available, pybind11_gpu_set_nvcomp
 
 
 def _threads(num_threads):
@@ -96,7 +97,7 @@ def _compression(compression):
     return name
 
 
-def read_tiff(file_name, z_range=None, num_threads=None, out=None, order='C'):
+def read_tiff(file_name, z_range=None, num_threads=None, out=None, order='C', gpu=False, stream=None):
     """Read a TIFF file into a NumPy array.
 
     order='C' (the default) returns (z, y, x), or (z, y, x, c) for RGB and RGBA
@@ -113,12 +114,21 @@ def read_tiff(file_name, z_range=None, num_threads=None, out=None, order='C'):
     out: a NumPy array to read into instead of a new one, of the shape read_tiff
     returns (or with a z axis of 1 for a single slice) and the file's data type,
     writeable and C-contiguous (F-contiguous for order='F'). It is returned.
+    out can also be GPU memory: a CuPy array, a PyTorch tensor on a CUDA device,
+    or anything with __cuda_array_interface__. The strips' stored bytes are then
+    read, copied to the GPU and decompressed there (zstd and deflate with nvCOMP;
+    LZW and other codecs on the CPU), with the GPU work on stream (a PyTorch or
+    CuPy stream, or a CUDA stream handle; by default the default stream), done
+    when this returns. gpu=True returns a new CuPy array read that way. Needs an
+    NVIDIA GPU and nvCOMP (pip install "cpp-tiff[gpu]"); see gpu_available().
     """
     file_name = _file_name(file_name)
     order = _order(order)
     z_range = _z_range(z_range)
     if not os.path.isfile(file_name):
         raise FileNotFoundError(f'{os.fsdecode(file_name)} does not exist!')
+    if gpu or (out is not None and _cuda_array(out) is not None):
+        return _read_gpu([(file_name, z_range, out)], order, num_threads, stream)[0]
     if out is not None:
         return pybind11_read_tiff(file_name, z_range, _threads(num_threads), out, order)
     im = pybind11_read_tiff(file_name, z_range, _threads(num_threads), None, order)
@@ -241,7 +251,7 @@ def _pool(threads_per_read):
 _BYTES_PER_THREAD = 16 << 20
 
 
-def read_tiff_batch(requests, num_threads=None, order='C'):
+def read_tiff_batch(requests, num_threads=None, order='C', gpu=False, stream=None):
     # Read many files (or slice ranges of them) at once, as reading them one after
     # another with read_tiff does, but with the reads overlapping (the GIL is
     # released while reading): the way to read a batch of files when each is small
@@ -253,6 +263,8 @@ def read_tiff_batch(requests, num_threads=None, order='C'):
     # OMP_NUM_THREADS, or every CPU). Each read gets a thread per 16 MB of file (at
     # least one, at most all of them), and as many reads as the threads allow run
     # at once.
+    # With gpu=True, or GPU memory as outs (see read_tiff), the batch goes to the GPU
+    # together, which decompresses all of its strips at once, on stream.
     order = _order(order)
     reqs = []
     for r in requests:
@@ -264,6 +276,8 @@ def read_tiff_batch(requests, num_threads=None, order='C'):
         reqs.append(r + (None,) * (3 - len(r)))
     if not reqs:
         return []
+    if gpu or any(r[2] is not None and _cuda_array(r[2]) is not None for r in reqs):
+        return _read_gpu([(_file_name(r[0]), _z_range(r[1]), r[2]) for r in reqs], order, num_threads, stream)
     total = _threads(num_threads) or pybind11_default_threads()
     names = [_file_name(r[0]) for r in reqs]
     sizes = sorted(os.path.getsize(f) if os.path.isfile(f) else 0 for f in names)
@@ -307,3 +321,133 @@ def get_image_shape(file_name, order='C'):
     if _order(order) == 'F':
         shape = shape[1:3] + shape[3:] + shape[:1]  # (z,y,x[,c]) -> (y,x[,c],z)
     return shape
+
+
+# ---- GPU reads (adapted from cpp-zarr's Python package)
+
+_TORCH_TYPES = {'uint8': '|u1', 'int8': '|i1', 'uint16': '<u2', 'int16': '<i2', 'uint32': '<u4', 'int32': '<i4',
+                'uint64': '<u8', 'int64': '<i8', 'float16': '<f2', 'float32': '<f4', 'float64': '<f8'}
+
+
+def _contiguous(shape, strides):
+    # (C-contiguous, F-contiguous) for element strides
+    def ok(axes):
+        expect = 1
+        for d in axes:
+            if shape[d] != 1 and strides[d] != expect:
+                return False
+            expect *= shape[d]
+        return True
+    n = len(shape)
+    return ok(range(n - 1, -1, -1)), ok(range(n))
+
+
+def _cuda_array(a):
+    # (device pointer, NumPy type string, shape, C-contiguous, F-contiguous) of GPU memory a (a PyTorch tensor
+    # on a CUDA device, or anything with __cuda_array_interface__, such as a CuPy array), or None when a is not
+    # GPU memory
+    if type(a).__module__.split('.')[0] == 'torch' and getattr(a, 'is_cuda', False):
+        name = str(a.dtype).replace('torch.', '')
+        if name not in _TORCH_TYPES:
+            raise TypeError(f'out has the data type {a.dtype}, which cpp-tiff does not read')
+        shape = tuple(int(v) for v in a.shape)
+        c, f = _contiguous(shape, tuple(a.stride()))
+        return int(a.data_ptr()), _TORCH_TYPES[name], shape, c, f
+    cai = getattr(a, '__cuda_array_interface__', None)
+    if cai is None:
+        return None
+    shape = tuple(int(v) for v in cai['shape'])
+    dt = np.dtype(cai['typestr'])
+    strides = cai.get('strides')
+    if strides is None:
+        c, f = True, len([v for v in shape if v != 1]) <= 1
+    else:
+        if any(st % dt.itemsize for st in strides):
+            raise ValueError('out must be C- or F-contiguous')
+        c, f = _contiguous(shape, tuple(st // dt.itemsize for st in strides))
+    if cai.get('readonly', False) or (len(cai['data']) > 1 and cai['data'][1]):
+        raise ValueError('out must be writeable')
+    return int(cai['data'][0]), dt.str if dt.itemsize > 1 else '|' + dt.str[1:], shape, c, f
+
+
+def _stream_handle(stream):
+    # A CUDA stream's handle: of a PyTorch stream (cuda_stream), a CuPy stream (ptr), or an int
+    if stream is None:
+        return 0
+    for attr in ('cuda_stream', 'ptr'):
+        if hasattr(stream, attr):
+            return int(getattr(stream, attr))
+    if isinstance(stream, int):
+        return stream
+    raise TypeError(f'stream must be a PyTorch or CuPy stream, or a CUDA stream handle, not {stream!r}')
+
+
+_nvcomp_looked = False
+
+
+def _find_nvcomp():
+    # nvCOMP from its pip package, for the library to load, found from pip's record of the files it installed
+    # (importing the package fails where another package named nvidia hides it, as in NVIDIA's PyTorch
+    # containers): the CUDA 12 build first, which the gpu extra installs and which runs on every GPU from Volta
+    # on (CUDA 13 builds need a Turing or newer one), then the CUDA 13 one and the older nvidia-nvcomp layout.
+    # CPPTIFF_NVCOMP_LIBRARY, when set, comes first.
+    global _nvcomp_looked
+    if _nvcomp_looked:
+        return
+    _nvcomp_looked = True
+    if os.environ.get('CPPTIFF_NVCOMP_LIBRARY'):
+        return
+    from importlib import metadata
+    for name in ('nvidia-libnvcomp-cu12', 'nvidia-libnvcomp-cu13', 'nvidia-nvcomp-cu12', 'nvidia-nvcomp-cu13'):
+        dist = None
+        for spelling in (name, name.replace('-', '_')):
+            try:
+                dist = metadata.distribution(spelling)
+                break
+            except metadata.PackageNotFoundError:
+                pass
+        if dist is None:
+            continue
+        libs = sorted(str(dist.locate_file(f)) for f in (dist.files or [])
+                      if (f.name.startswith('libnvcomp.so') or (f.name.startswith('nvcomp') and f.name.endswith('.dll')))
+                      and 'cpu' not in f.name)
+        libs = [p for p in libs if os.path.exists(p)]
+        if libs:
+            pybind11_gpu_set_nvcomp(libs[-1])
+            return
+
+
+def gpu_available():
+    """(True, '') when reads into GPU memory can run here; (False, why) when not (no NVIDIA driver or GPU, no
+    nvCOMP: pip install "cpp-tiff[gpu]")"""
+    _find_nvcomp()
+    return pybind11_gpu_available()
+
+
+def _read_gpu(requests, order, num_threads, stream):
+    # requests: (file_name, z_range, out) with out GPU memory, or None for a new CuPy array; read in one GPU
+    # batch. Returns the outs.
+    _find_nvcomp()
+    outs = []
+    for file_name, z_range, out in requests:
+        if out is None:
+            try:
+                import cupy
+            except ImportError:
+                raise ImportError('gpu=True makes CuPy arrays, and CuPy is not installed (pip install cupy-cuda12x); or '
+                                  'pass GPU memory to read into as out= (a PyTorch tensor on a CUDA device, for one)') from None
+            shape, dtype = pybind11_read_shape(file_name, z_range or [], order)
+            out = cupy.empty(tuple(shape), dtype=dtype, order=order)
+        elif _cuda_array(out) is None:
+            raise TypeError('out must be GPU memory for a read into GPU memory (a CuPy array, a PyTorch CUDA tensor, ...)')
+        outs.append(out)
+    reqs = []
+    for (file_name, z_range, _), out in zip(requests, outs):
+        ptr, typestr, shape, c, f = _cuda_array(out)
+        if order == 'C' and not c:
+            raise ValueError("out must be C-contiguous (or pass order='F' for a (y, x, z) F-contiguous out)")
+        if order == 'F' and not f:
+            raise ValueError("out must be F-contiguous for order='F'")
+        reqs.append((file_name, list(z_range or []), ptr, typestr, list(shape)))
+    pybind11_read_tiff_gpu(reqs, order, _threads(num_threads), _stream_handle(stream))
+    return outs

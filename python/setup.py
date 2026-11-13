@@ -81,6 +81,8 @@ setup(
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExt} if system=="Linux" else {"build_ext": build_ext},
     install_requires=['numpy>=1.20'],
+    # (reads into GPU memory: nvCOMP, which the library loads at run time; macOS has no NVIDIA GPUs)
+    extras_require={'gpu': ['nvidia-libnvcomp-cu12; platform_system != "Darwin"']},
     package_dir={'cpp-tiff': 'cpp-tiff'},
     package_data={"": shared_libraries} if system!="Linux" else {},
     include_package_data=True,

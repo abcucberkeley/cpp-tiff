@@ -137,7 +137,9 @@ add_dependencies(tiff libzstd_static)
 
 set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
-add_library(cppTiff_shared SHARED ${SRC_DIR}/helperfunctions.cpp ${SRC_DIR}/pathutil.cpp ${SRC_DIR}/lzwencode.cpp ${SRC_DIR}/lzwdecode.cpp ${SRC_DIR}/parallelreadtiff.cpp ${SRC_DIR}/parallelwritetiff.cpp)
+# (GPU reads: the CUDA driver and nvCOMP are loaded at run time, so they need nothing to build)
+add_library(cppTiff_shared SHARED ${SRC_DIR}/helperfunctions.cpp ${SRC_DIR}/pathutil.cpp ${SRC_DIR}/lzwencode.cpp ${SRC_DIR}/lzwdecode.cpp ${SRC_DIR}/parallelreadtiff.cpp ${SRC_DIR}/parallelwritetiff.cpp
+            ${SRC_DIR}/gpureadtiff.cpp ${SRC_DIR}/gpu/cudaapi.cpp ${SRC_DIR}/gpu/gpucommon.cpp)
 set_target_properties(cppTiff_shared PROPERTIES OUTPUT_NAME cppTiff)
 # Every function of the library starts on a 64-byte boundary, so its speed
 # depends on its own code only. Without it, the LZW codecs ran 2-6% faster or
@@ -153,7 +155,7 @@ add_dependencies(cppTiff_shared tiff)
 
 file(GLOB LIBTIFF_HEADERS "${LIBTIFF_DIR}/libtiff/*.h")
 
-set_target_properties(cppTiff_shared PROPERTIES PUBLIC_HEADER "${LIBTIFF_HEADERS};${tiff_BINARY_DIR}/libtiff/tiffconf.h;${tiff_BINARY_DIR}/libtiff/tiffvers.h;${ZSTD_DIR}/lib/zstd.h;${SRC_DIR}/helperfunctions.h;${SRC_DIR}/lzwencode.h;${SRC_DIR}/parallelreadtiff.h;${SRC_DIR}/parallelwritetiff.h")
+set_target_properties(cppTiff_shared PROPERTIES PUBLIC_HEADER "${LIBTIFF_HEADERS};${tiff_BINARY_DIR}/libtiff/tiffconf.h;${tiff_BINARY_DIR}/libtiff/tiffvers.h;${ZSTD_DIR}/lib/zstd.h;${SRC_DIR}/helperfunctions.h;${SRC_DIR}/lzwencode.h;${SRC_DIR}/parallelreadtiff.h;${SRC_DIR}/parallelwritetiff.h;${SRC_DIR}/gpureadtiff.h")
 
 # Include the header files
 target_include_directories(cppTiff_shared PRIVATE
@@ -172,6 +174,8 @@ target_link_libraries(cppTiff_shared PRIVATE
     ${zstd_BINARY_DIR}/lib/libzstd.a
     -static-libstdc++
     OpenMP::OpenMP_CXX
+    # (dlopen, for the GPU reads' CUDA driver and nvCOMP)
+    ${CMAKE_DL_LIBS}
 )
 
 # Bind the library's own calls to its static libtiff, zstd, zlib and libdeflate.
@@ -261,4 +265,10 @@ if(BUILD_TESTS)
     target_include_directories(roundtripTest PRIVATE ${SRC_DIR} ${LIBTIFF_DIR}/libtiff)
     target_link_libraries(roundtripTest PRIVATE cppTiff_shared OpenMP::OpenMP_CXX)
     add_test(NAME roundtrip COMMAND roundtripTest ${CMAKE_CURRENT_BINARY_DIR})
+    # GPU reads against the CPU reader (skipped without an NVIDIA GPU, driver and nvCOMP)
+    add_executable(gpuTest ${CMAKE_CURRENT_SOURCE_DIR}/tests/gputest.cpp)
+    set_target_properties(gpuTest PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_include_directories(gpuTest PRIVATE ${SRC_DIR} ${LIBTIFF_DIR}/libtiff)
+    target_link_libraries(gpuTest PRIVATE cppTiff_shared OpenMP::OpenMP_CXX)
+    add_test(NAME gpu COMMAND gpuTest ${CMAKE_CURRENT_BINARY_DIR})
 endif()

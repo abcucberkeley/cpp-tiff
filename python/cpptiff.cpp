@@ -3,10 +3,13 @@
 #include <pybind11/stl.h>
 #include <cstdlib>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 #include "parallelreadtiff.h"
 #include "parallelwritetiff.h"
 #include "helperfunctions.h"
+#include "gpureadtiff.h"
 
 // The NumPy data type of a file's samples: bits and sample format (2 signed
 // integers, 3 floats, otherwise unsigned integers). 16-bit floats are float16:
@@ -241,6 +244,101 @@ pybind11::tuple pybind11_get_image_shape(const std::string& fileName){
 }
 
 
+// The slices z_range picks of a file: (start, count); throws as pybind11_read_tiff does for a bad range
+static std::pair<uint64_t, uint64_t> sliceRange(const std::string &fileName, const TiffInfo &tinfo, const std::vector<uint64_t> &zRange){
+    if(!zRange.size()) return {0, tinfo.z};
+    if(zRange.size() > 2)
+        throw pybind11::value_error("z_range is one slice or [start, end), not " + std::to_string(zRange.size()) + " numbers");
+    const uint64_t end = zRange.size() == 2 ? zRange[1] : zRange[0] + 1;
+    const std::string given = zRange.size() == 2 ? "[" + std::to_string(zRange[0]) + ", " + std::to_string(zRange[1]) + "]"
+                                                 : std::to_string(zRange[0]);
+    if(zRange[0] >= end) throw pybind11::value_error("z_range " + given + " is empty: its start must be less than its end");
+    if(end > tinfo.z)
+        throw pybind11::index_error("z_range " + given + " is out of bounds: \"" + fileName + "\" has " + std::to_string(tinfo.z) +
+                                    (tinfo.z == 1 ? " slice (0)" : " slices (0 to " + std::to_string(tinfo.z - 1) + ")"));
+    return {zRange[0], end - zRange[0]};
+}
+
+// What read_tiff returns for a file's slices, for new GPU arrays: (shape, NumPy data type name), the shape in
+// order's layout without the z axis of a single slice, as read_tiff gives NumPy arrays
+pybind11::tuple pybind11_read_shape(const std::string &fileName, const std::vector<uint64_t> &zRange, const std::string &order){
+    TiffInfo tinfo;
+    uint8_t bad = 0;
+    {
+        pybind11::gil_scoped_release release;
+        bad = getTiffInfo(fileName.c_str(), tinfo);
+    }
+    if(bad) throw std::runtime_error("Could not open \"" + fileName + "\" as a TIFF");
+    const uint64_t z = sliceRange(fileName, tinfo, zRange).second;
+    if(tinfo.bits != 8 && tinfo.bits != 16 && tinfo.bits != 32 && tinfo.bits != 64)
+        throw std::runtime_error("\"" + fileName + "\" has " + std::to_string(tinfo.bits) + "-bit samples, which cannot be read");
+    std::vector<uint64_t> shape;
+    if(order == "F"){
+        shape = {tinfo.y, tinfo.x};
+        if(tinfo.samples > 1) shape.push_back(tinfo.samples);
+        if(z > 1) shape.push_back(z);
+    }
+    else{
+        if(z > 1) shape.push_back(z);
+        shape.insert(shape.end(), {tinfo.y, tinfo.x});
+        if(tinfo.samples > 1) shape.push_back(tinfo.samples);
+    }
+    return pybind11::make_tuple(shape, pybind11::str(numpyDtype(tinfo.bits, tinfo.sampleFormat)));
+}
+
+// Reads into GPU memory: requests of (file name, z range, device pointer, the memory's NumPy type string,
+// its shape), all in order's layout (C: (z, y, x[, c]); F: MATLAB's (y, x[, c], z)), with the GPU work on
+// stream (a CUDA stream handle, 0 for the default stream); each request's memory checked against its
+// file as out= is for read_tiff. The GIL is released while the files are read.
+void pybind11_read_tiff_gpu(const std::vector<std::tuple<std::string, std::vector<uint64_t>, uint64_t, std::string, std::vector<uint64_t>>> &requests,
+                            const std::string &order, const int64_t numThreads, const uint64_t stream){
+    if(numThreads < 0) throw pybind11::value_error("num_threads must be at least 1");
+    if(order != "C" && order != "F") throw pybind11::value_error("order must be 'C' or 'F', not '" + order + "'");
+    const bool fortran = order == "F";
+    std::vector<GpuTiffRead> reads;
+    for(const auto &r : requests){
+        const std::string &fileName = std::get<0>(r);
+        const std::vector<uint64_t> &zRange = std::get<1>(r);
+        TiffInfo tinfo;
+        uint8_t bad = 0;
+        {
+            pybind11::gil_scoped_release release;
+            bad = getTiffInfo(fileName.c_str(), tinfo);
+        }
+        if(bad) throw std::runtime_error("Could not open \"" + fileName + "\" as a TIFF");
+        const uint64_t z = sliceRange(fileName, tinfo, zRange).second;
+        if(tinfo.bits != 8 && tinfo.bits != 16 && tinfo.bits != 32 && tinfo.bits != 64)
+            throw std::runtime_error("\"" + fileName + "\" has " + std::to_string(tinfo.bits) + "-bit samples, which cannot be read");
+        const std::string want = pybind11::str(numpyDtype(tinfo.bits, tinfo.sampleFormat).attr("str")).cast<std::string>();
+        const std::string &have = std::get<3>(r);
+        // (one-byte types: NumPy's "|u1" and "<u1" are the same)
+        if(have != want && !(have.size() == 3 && want.size() == 3 && have.substr(1) == want.substr(1) && want[2] == '1'))
+            throw pybind11::value_error("out has data type " + have + ", not the file's " + want + " (\"" + fileName + "\")");
+        std::vector<uint64_t> cShape = {z, tinfo.y, tinfo.x}, fShape = {tinfo.y, tinfo.x};
+        if(tinfo.samples > 1){ cShape.push_back(tinfo.samples); fShape.push_back(tinfo.samples); }
+        fShape.push_back(z);
+        const std::vector<uint64_t> cOne(cShape.begin() + 1, cShape.end()), fOne(fShape.begin(), fShape.end() - 1);
+        const std::vector<uint64_t> &shape = std::get<4>(r), &wantShape = fortran ? fShape : cShape, &wantOne = fortran ? fOne : cOne;
+        if(shape != wantShape && !(z == 1 && shape == wantOne))
+            throw pybind11::value_error("out must have the shape read_tiff returns, " + shapeText(wantShape) + " (\"" + fileName + "\")");
+        reads.push_back(GpuTiffRead{fileName, zRange, (void*)(uintptr_t)std::get<2>(r)});
+    }
+    const CallThreads threads(numThreads);
+    std::string err;
+    uint8_t bad = 0;
+    {
+        pybind11::gil_scoped_release release;
+        bad = gpuReadTiff(reads, fortran, (void*)(uintptr_t)stream, (int)numThreads, err);
+    }
+    if(bad) throw std::runtime_error(err);
+}
+
+pybind11::tuple pybind11_gpu_available(){
+    std::string why;
+    const bool ok = gpuReadTiffAvailable(why);
+    return pybind11::make_tuple(ok, why);
+}
+
 PYBIND11_MODULE(cpptiff, m) {
 	pybind11::module::import("numpy");
 
@@ -253,6 +351,15 @@ PYBIND11_MODULE(cpptiff, m) {
 	      pybind11::arg("numThreads") = 0, "Write a tiff file");
 
 	m.def("pybind11_get_image_shape", &pybind11_get_image_shape, "Get the image shape without reading the entire image");
+
+	m.def("pybind11_read_shape", &pybind11_read_shape, "The shape and data type read_tiff returns for a file's slices");
+
+	m.def("pybind11_read_tiff_gpu", &pybind11_read_tiff_gpu, pybind11::arg("requests"), pybind11::arg("order"),
+	      pybind11::arg("numThreads") = 0, pybind11::arg("stream") = 0, "Read tiff files into GPU memory");
+
+	m.def("pybind11_gpu_available", &pybind11_gpu_available, "Whether GPU reads can run here, and if not, why");
+
+	m.def("pybind11_gpu_set_nvcomp", &gpuReadTiffSetNvcompLibrary, "Where to load nvCOMP from, before the first GPU read");
 
 	m.def("pybind11_default_threads", &callThreads,
 	      "The threads a call uses by default from the calling thread (OMP_NUM_THREADS, or every CPU)");
