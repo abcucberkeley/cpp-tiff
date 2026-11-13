@@ -1204,6 +1204,91 @@ int main(int argc, char** argv){
         }
     }
 
+    // ---- Directories first (the writer's mode "wf"): every directory, and its
+    // strip or tile arrays, before the first slice's data, in files that read
+    // back as those of mode "w" do: strips and tiles, LZW, zstd and none, gray
+    // and RGB, from row-major and MATLAB-layout data, one slice and many, read
+    // whole and as slice ranges in both layouts, with one thread and every
+    // thread; and getTiffInfo finds the same. Both ways of filling in the strip
+    // arrays: slice by slice, and at the end (CPPTIFF_WF_PATCH=close).
+    for(const char* patch : {"", "close"}){
+#ifdef _WIN32
+        _putenv_s("CPPTIFF_WF_PATCH", patch);
+#else
+        if(*patch) setenv("CPPTIFF_WF_PATCH", patch, 1);
+        else unsetenv("CPPTIFF_WF_PATCH");
+#endif
+        struct DF { const char* name; uint64_t x, y, z, spp, bits; const char* comp; uint64_t tile; bool transpose; };
+        const DF dfCases[] = {
+            {"df-u16-lzw",   40, 24, 9, 1, 16, "lzw",  0,  false},
+            {"df-u8-none",   40, 24, 9, 1,  8, "none", 0,  false},
+            {"df-f32-zstd",  40, 24, 9, 1, 32, "zstd", 0,  true},
+            {"df-u16-tiled", 40, 24, 5, 1, 16, "lzw",  16, false},
+            {"df-rgb8-zstd", 40, 24, 5, 3,  8, "zstd", 0,  false},
+            {"df-u16-one",   40, 24, 1, 1, 16, "lzw",  0,  false},
+            {"df-u16-many", 33, 17, 600, 1, 16, "none", 0, false},
+        };
+        const int prevThreads = omp_get_max_threads();
+        for(const DF& c : dfCases){
+            total++;
+            const uint64_t es = c.bits/8, sliceBytes = c.x*c.y*c.spp*es;
+            std::vector<uint8_t> src(sliceBytes*c.z);
+            uint64_t st = 0x9E3779B97F4A7C15ull ^ (c.x*131 + c.y*7 + c.z*5 + c.bits*3 + c.spp);
+            for(uint8_t& b : src){ st = st*6364136223846793005ull + 1442695040888963407ull; b = (uint8_t)(st >> 59); }
+            const std::vector<uint8_t> flip = flipped(src.data(), c.x, c.y, c.z, c.spp, es);
+            const std::string pw = dir + "/" + c.name + "-w.tif", pf = dir + "/" + c.name + "-wf.tif";
+            const uint16_t fmt = c.bits == 32 ? 3 : 1;
+            step(c.name, "dirs-first", "write both ways");
+            const std::vector<uint8_t>& in = c.transpose ? flip : src;
+            bool ok = !writeTiffParallelWrapper(c.x, c.y, c.z, pw.c_str(), in.data(), c.bits, 0, 8, "w", c.transpose, c.comp, fmt, c.tile, c.spp)
+                      && !writeTiffParallelWrapper(c.x, c.y, c.z, pf.c_str(), in.data(), c.bits, 0, 8, "wf", c.transpose, c.comp, fmt, c.tile, c.spp);
+            // The layout: every directory before the data of the first slice,
+            // and all the data after the last directory
+            bool layout = false;
+            if(ok){
+                TIFF* t = TIFFOpen(pf.c_str(), "r");
+                if(t){
+                    const uint64_t firstData = TIFFGetStrileOffset(t, 0);
+                    uint64_t lastDir = 0, minData = UINT64_MAX, dirs = 0;
+                    do{
+                        lastDir = std::max<uint64_t>(lastDir, TIFFCurrentDirOffset(t));
+                        for(uint32_t k = 0; k < TIFFNumberOfStrips(t); k++) minData = std::min<uint64_t>(minData, TIFFGetStrileOffset(t, k));
+                        dirs++;
+                    } while(TIFFReadDirectory(t));
+                    TIFFClose(t);
+                    layout = dirs == c.z && lastDir < firstData && minData == firstData;
+                }
+            }
+            TiffInfo iw, iff;
+            ok = ok && !getTiffInfo(pw.c_str(), iw) && !getTiffInfo(pf.c_str(), iff) && iff.z == c.z && iff.x == iw.x && iff.y == iw.y
+                 && iff.bits == iw.bits && iff.samples == iw.samples && iff.stripSize == iw.stripSize && iff.compression == iw.compression
+                 && iff.tiled == iw.tiled && iff.offsets.size() == c.z;
+            const uint64_t a = c.z > 2 ? 1 : 0, e = c.z > 2 ? c.z - 1 : c.z;
+            for(int t : {1, prevThreads}){
+                omp_set_num_threads(t);
+                step(c.name, "dirs-first", "reads");
+                void* nf = ok ? readTiffParallelWrapperNoXYFlip(pf.c_str(), {}) : nullptr;
+                void* nr = ok ? readTiffParallelWrapperNoXYFlip(pf.c_str(), {a, e}) : nullptr;
+                void* fl = ok ? readTiffParallelWrapper(pf.c_str()) : nullptr;
+                void* fr = ok ? readTiffParallelWrapper(pf.c_str(), {a, e}) : nullptr;
+                ok = nf && std::memcmp(nf, src.data(), src.size()) == 0
+                     && nr && std::memcmp(nr, src.data() + a*sliceBytes, (e - a)*sliceBytes) == 0
+                     && fl && std::memcmp(fl, flip.data(), flip.size()) == 0
+                     && fr && std::memcmp(fr, flip.data() + a*sliceBytes, (e - a)*sliceBytes) == 0;
+                free(nf); free(nr); free(fl); free(fr);
+            }
+            omp_set_num_threads(prevThreads);
+            std::remove(pw.c_str()); std::remove(pf.c_str());
+            if(ok && layout) std::printf("PASS  %-16s directories first%s\n", c.name, *patch ? ", arrays at the end" : "");
+            else { std::printf("FAIL  %-16s directories first%s  (read back=%d layout=%d)\n", c.name, *patch ? ", arrays at the end" : "", (int)ok, (int)layout); failures++; }
+        }
+    }
+#ifdef _WIN32
+    _putenv_s("CPPTIFF_WF_PATCH", "");
+#else
+    unsetenv("CPPTIFF_WF_PATCH");
+#endif
+
     // ---- Pieces of slices. A compressed stack of large slices with fewer than
     // 8 slices per thread is read in pieces of whole strips (or tiles) handed
     // out to the threads; every piece must land in its place, for strips,
