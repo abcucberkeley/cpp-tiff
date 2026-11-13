@@ -11,6 +11,7 @@
 #include "../src/helperfunctions.h"
 #include "lzwdecode.h"
 #include "pathutil.h"
+#include "tiffdirs.h"
 
 // RAII for libtiff handles: TIFFClose runs on every exit path, so the worker
 // functions don't carry a naked TIFF* with a manual close. (C++11: no make_unique.)
@@ -592,7 +593,17 @@ static uint16_t planesOf(TIFF* tif){
     return (spp > 1 && planarConfig == PLANARCONFIG_SEPARATE) ? spp : 1;
 }
 
-static bool setDirectoryWithRetry(TIFF* tif, uint64_t dir){
+// Puts directory dir's start, when the caller knows it (TiffInfo::offsets), in
+// the handle's directory map, so that TIFFSetDirectory reads that directory
+// straight away instead of walking the directories before it (see tiffdirs.h):
+// a thread of a stack's read, or every thread of a slice's, walked up to every
+// directory before its own, a read each (a millisecond each, cold, on VAST).
+static inline void knowDirectory(TIFF* tif, uint64_t dir, const std::vector<uint64_t>* offsets){
+    if(tif && offsets && dir < offsets->size()) _TIFFCheckDirNumberAndOffset(tif, (tdir_t)dir, (*offsets)[dir]);
+}
+
+static bool setDirectoryWithRetry(TIFF* tif, uint64_t dir, const std::vector<uint64_t>* offsets = nullptr){
+    knowDirectory(tif, dir, offsets);
     for(int attempt = 0; attempt < 3; attempt++)
         if(TIFFSetDirectory(tif, (tdir_t)dir)) return true;
     return false;
@@ -601,7 +612,8 @@ static bool setDirectoryWithRetry(TIFF* tif, uint64_t dir){
 // Backup method in case there are errors reading strips: re-read every slice a
 // scanline at a time, each worker taking a block of whole slices. Reports an
 // error if a row still cannot be read rather than leaving it unwritten.
-uint8_t readTiffParallelBak(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint8_t flipXY){
+static uint8_t readTiffParallelBakAt(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint8_t flipXY,
+                                     const std::vector<uint64_t>* offsets){
     int32_t numWorkers = omp_get_max_threads();
     int32_t batchSize = (z-1)/numWorkers+1;
     uint64_t bytes = bits/8;
@@ -630,7 +642,7 @@ uint8_t readTiffParallelBak(uint64_t x, uint64_t y, uint64_t z, const char* file
         const uint16_t planes = planesOf(tif.get());
         std::unique_ptr<uint8_t[]> line(new uint8_t[x*spp*bytes]);
         for(int64_t dir = first; dir < last && !err; dir++){
-            if(!setDirectoryWithRetry(tif.get(), (uint64_t)dir)){
+            if(!setDirectoryWithRetry(tif.get(), (uint64_t)dir, offsets)){
                 #pragma omp critical
                 {
                     err = 1;
@@ -659,7 +671,13 @@ uint8_t readTiffParallelBak(uint64_t x, uint64_t y, uint64_t z, const char* file
     return err;
 }
 
-uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint8_t flipXY, uint16_t compression){
+uint8_t readTiffParallelBak(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint8_t flipXY){
+    return readTiffParallelBakAt(x, y, z, fileName, tiff, bits, startSlice, flipXY, nullptr);
+}
+
+// readTiffParallel, given where the directories start when the caller knows (TiffInfo::offsets)
+static uint8_t readTiffParallelAt(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint8_t flipXY, uint16_t compression,
+                                  const std::vector<uint64_t>* offsets){
     uint64_t bytes = bits/8;
     // More rows per strip than the image has (2^32 - 1, the TIFF default, is
     // common) is one strip. The buffers below were sized from it, so a flip
@@ -843,6 +861,7 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
             // A fresh handle is already on directory 0, and TIFFSetDirectory
             // would read it again.
             uint8_t counter = 0;
+            knowDirectory(tif.get(), (uint64_t)dir, offsets);
             while(TIFFCurrentDirectory(tif.get()) != (tdir_t)dir && !TIFFSetDirectory(tif.get(), (uint64_t)dir)){
                 if(++counter == 3){
                     #pragma omp critical
@@ -1049,7 +1068,7 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
         }
     }
     if(err){
-        if(errBak) return readTiffParallelBak(x, y, z, fileName, tiff, bits, startSlice, flipXY);
+        if(errBak) return readTiffParallelBakAt(x, y, z, fileName, tiff, bits, startSlice, flipXY, offsets);
         else {
 			printf("%s", errString);
 		}
@@ -1062,13 +1081,18 @@ uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileNam
 // their first row, so workers split the image by whole strips and read each
 // one in row order. Reports an error if a row still cannot be read rather than
 // leaving it unwritten.
-uint8_t readTiffParallel2DBak(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint8_t flipXY){
+uint8_t readTiffParallel(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint8_t flipXY, uint16_t compression){
+    return readTiffParallelAt(x, y, z, fileName, tiff, bits, startSlice, stripSize, flipXY, compression, nullptr);
+}
+
+static uint8_t readTiffParallel2DBakAt(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint8_t flipXY,
+                                       const std::vector<uint64_t>* offsets){
     (void)z;   // a single image
     uint64_t bytes = bits/8;
     uint32_t rowsPerStrip = 0;
     {
         TiffPtr probe(openReaderTiff(fileName));
-        if(probe && setDirectoryWithRetry(probe.get(), startSlice))
+        if(probe && setDirectoryWithRetry(probe.get(), startSlice, offsets))
             TIFFGetFieldDefaulted(probe.get(), TIFFTAG_ROWSPERSTRIP, &rowsPerStrip);
     }
     if(!rowsPerStrip || rowsPerStrip > y) rowsPerStrip = (uint32_t)y;
@@ -1097,7 +1121,7 @@ uint8_t readTiffParallel2DBak(uint64_t x, uint64_t y, uint64_t z, const char* fi
             }
             continue;
         }
-        if(!setDirectoryWithRetry(tif.get(), startSlice)){
+        if(!setDirectoryWithRetry(tif.get(), startSlice, offsets)){
             #pragma omp critical
             {
                 err = 1;
@@ -1130,7 +1154,13 @@ uint8_t readTiffParallel2DBak(uint64_t x, uint64_t y, uint64_t z, const char* fi
 }
 
 
-uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint8_t flipXY){
+uint8_t readTiffParallel2DBak(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint8_t flipXY){
+    return readTiffParallel2DBakAt(x, y, z, fileName, tiff, bits, startSlice, flipXY, nullptr);
+}
+
+// readTiffParallel2D, given where the directories start when the caller knows (TiffInfo::offsets)
+static uint8_t readTiffParallel2DAt(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint8_t flipXY,
+                                    const std::vector<uint64_t>* offsets){
     // More rows per strip than the image has is one strip (see readTiffParallel).
     stripSize = std::max<uint64_t>(1, std::min(stripSize, y));
     int32_t numWorkers = omp_get_max_threads();
@@ -1215,6 +1245,7 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
         // A fresh handle is already on directory 0, and TIFFSetDirectory would
         // read it again.
         uint8_t counter = 0;
+        knowDirectory(tif, startSlice, offsets);
         while(TIFFCurrentDirectory(tif) != (tdir_t)startSlice && !TIFFSetDirectory(tif, startSlice) && counter<3){
             printf("Thread %d: File \"%s\" Directory \"%llu\" failed to open. Try %d\n",w,fileName,(unsigned long long)startSlice,counter+1);
             counter++;
@@ -1337,12 +1368,16 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
     TIFFClose(tif);
 
     if(err) {
-        if(errBak) return readTiffParallel2DBak(x, y, z, fileName, tiff, bits, startSlice, flipXY);
+        if(errBak) return readTiffParallel2DBakAt(x, y, z, fileName, tiff, bits, startSlice, flipXY, offsets);
         else printf("%s", errString);
     }
 	return err;
 }
 
+
+uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint8_t flipXY){
+    return readTiffParallel2DAt(x, y, z, fileName, tiff, bits, startSlice, stripSize, flipXY, nullptr);
+}
 
 // Bytes each thread reads at a time from an ImageJ stack, in whole rows. A 40 GB
 // stack read from VAST with 48 threads took as long with 4 MB as with 16 MB
@@ -1517,14 +1552,15 @@ void* readTiffParallelInfo(const char* fileName, const TiffInfo &info, void* tif
 	const bool sliceBySlice = !imageJIm && !tiled && z > 1 && startSlice + z <= 64
 	                          && sliceBytesAll >= (compression == COMPRESSION_NONE ? (uint64_t)16 << 20 : (uint64_t)4 << 20)
 	                          && 2*z <= std::min<uint64_t>((uint64_t)omp_get_max_threads(), sliceStrips);
+	const std::vector<uint64_t>* offsets = info.offsets.size() == info.directories ? &info.offsets : nullptr;
 	uint8_t err = 0;
 	if(imageJIm)    err = readTiffParallelImageJ(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY);
-	else if(z <= 1) err = readTiffParallel2D(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY);
+	else if(z <= 1) err = readTiffParallel2DAt(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY, offsets);
 	else if(sliceBySlice){
 		for(uint64_t s = 0; s < z && !err; s++)
-			err = readTiffParallel2D(x,y,1,fileName, static_cast<uint8_t*>(tiff) + s*sliceBytesAll, bits, startSlice + s, stripSize, flipXY);
+			err = readTiffParallel2DAt(x,y,1,fileName, static_cast<uint8_t*>(tiff) + s*sliceBytesAll, bits, startSlice + s, stripSize, flipXY, offsets);
 	}
-	else            err = readTiffParallel(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY, compression);
+	else            err = readTiffParallelAt(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY, compression, offsets);
 	// A failed read leaves part of the buffer unwritten, so report it instead of
 	// returning partial data. The reader has already printed why.
 	if(err){

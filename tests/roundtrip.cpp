@@ -1034,6 +1034,10 @@ int main(int argc, char** argv){
                   && info.stripSize == rps && info.compression == comp
                   && info.tiled == tiled && info.planar == planar
                   && info.imageJ == ij && info.imageJ == c.imageJ && info.imageJImages == ijImages;
+                // Where each directory starts, as libtiff finds it walking there
+                ok = ok && info.offsets.size() == info.directories;
+                for(uint64_t d = 0; ok && d < info.directories; d++)
+                    ok = TIFFSetDirectory(tif, (tdir_t)d) && TIFFCurrentDirOffset(tif) == info.offsets[d];
             }
             if(tif) TIFFClose(tif);
             free(dims);
@@ -1041,6 +1045,51 @@ int main(int argc, char** argv){
             if(ok) std::printf("PASS  %-16s metadata in one pass\n", c.name);
             else { std::printf("FAIL  %-16s metadata in one pass  (differs from the helpers)\n", c.name); failures++; }
         }
+    }
+
+    // ---- Where the directories start (TiffInfo::offsets). Reads given them read
+    // what reads without them do: whole stacks, slice ranges and single slices
+    // near the end, in both layouts, with one thread and every thread. And they
+    // are what the readers go by: with two directories' starts swapped, a read
+    // of one of the slices returns the other.
+    {
+        total++;
+        const uint64_t ox = 64, oy = 48, oz = 150, sliceBytes = ox*oy*2;
+        std::vector<uint16_t> src(ox*oy*oz);
+        for(uint64_t i = 0; i < src.size(); i++) src[i] = (uint16_t)((i*2654435761u) >> 7);
+        const std::string path = dir + "/offsets.tif";
+        step("offsets", "dirs", "write + reads with and without the starts");
+        TiffInfo info;
+        bool ok = writeLibtiff(path, (const uint8_t*)src.data(), ox, oy, oz, 1, 16, 1, COMPRESSION_LZW, 24, 0, false, false)
+                  && !getTiffInfo(path.c_str(), info) && info.offsets.size() == oz;
+        TiffInfo walk = info;
+        walk.offsets.clear();
+        const int prevThreads = omp_get_max_threads();
+        const std::vector<std::vector<uint64_t>> ranges = {{}, {140, 150}, {149}, {75}};
+        for(int t : {1, prevThreads})
+            for(const std::vector<uint64_t>& r : ranges)
+                for(uint8_t flip = 0; flip < 2 && ok; flip++){
+                    omp_set_num_threads(t);
+                    void* a = readTiffParallelInfo(path.c_str(), info, NULL, flip, r);
+                    void* b = readTiffParallelInfo(path.c_str(), walk, NULL, flip, r);
+                    const uint64_t n = (r.empty() ? oz : r.size() == 2 ? r[1] - r[0] : 1)*sliceBytes;
+                    ok = a && b && std::memcmp(a, b, n) == 0
+                         && (flip || std::memcmp(a, (const uint8_t*)src.data() + (r.empty() ? 0 : r[0])*sliceBytes, n) == 0);
+                    free(a); free(b);
+                }
+        omp_set_num_threads(prevThreads);
+        step("offsets", "dirs", "swapped starts");
+        bool used = false;
+        if(ok){
+            TiffInfo swapped = info;
+            std::swap(swapped.offsets[100], swapped.offsets[101]);
+            void* s = readTiffParallelInfo(path.c_str(), swapped, NULL, 0, {100});
+            used = s && std::memcmp(s, (const uint8_t*)src.data() + 101*sliceBytes, sliceBytes) == 0;
+            free(s);
+        }
+        std::remove(path.c_str());
+        if(ok && used) std::printf("PASS  %-16s directory starts\n", "offsets");
+        else { std::printf("FAIL  %-16s directory starts  (reads=%d used=%d)\n", "offsets", (int)ok, (int)used); failures++; }
     }
 
     // ---- Pieces of slices. A compressed stack of large slices with fewer than

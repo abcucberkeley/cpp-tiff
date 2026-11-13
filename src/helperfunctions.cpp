@@ -8,6 +8,7 @@
 #include "tiffio.h"
 #include "helperfunctions.h"
 #include "pathutil.h"
+#include "tiffdirs.h"
 #ifdef __linux__
 #include <fcntl.h>
 #endif
@@ -225,6 +226,13 @@ uint8_t getTiffInfo(const char* fileName, TiffInfo &info){
         }
     }
     info.directories = countDirectories(tif);
+    // The walk went through every directory, so the handle's map has them all
+    info.offsets.resize(info.directories);
+    for(uint64_t d = 0; d < info.directories; d++)
+        if(!_TIFFGetOffsetFromDirNumber(tif, (tdir_t)d, &info.offsets[d])){
+            info.offsets.clear();
+            break;
+        }
     TIFFClose(tif);
     info.z = info.directories;
     info.imageJ = imageJDescription && info.directories == 1 && compression == COMPRESSION_NONE && !info.tiled && !info.planar;

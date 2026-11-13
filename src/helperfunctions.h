@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <stdarg.h>
 #include <string>
+#include <vector>
 
 #ifndef _WIN32
 // The path with a leading ~ or ~name expanded to that home folder; any other path unchanged
@@ -48,6 +49,11 @@ struct TiffInfo {
     bool imageJ = false;
     // The ImageJ description's images= count (imageJImGetZ; 0 without one)
     uint64_t imageJImages = 0;
+    // Where each directory starts in the file, as the walk found them: a read
+    // given them (readTiffParallelInfo) reaches each of its slices' directories
+    // with one read, where a new handle walked every directory before it. Empty
+    // if the walk did not find them all; the readers then walk.
+    std::vector<uint64_t> offsets;
 };
 
 // Fills info; returns 1 if the file cannot be opened as a TIFF.

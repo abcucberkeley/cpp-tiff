@@ -58,10 +58,6 @@ void mexFunction(int nlhs, mxArray *plhs[],
 
     uint64_t x = info.x, y = info.y, z = 1, bits = info.bits, startSlice = 0;
     const uint64_t spp = info.samples;
-    // The ImageJ reader takes the pixels as one contiguous block, which is not
-    // how tiled or planar (separate color planes) data is laid out, so
-    // info.imageJ leaves those out.
-    const uint8_t imageJIm = info.imageJ;
     if(nrhs == 1){
         z = info.z;
     }
@@ -83,11 +79,6 @@ void mexFunction(int nlhs, mxArray *plhs[],
         startSlice = (uint64_t)first - 1;
         z = (uint64_t)last - startSlice;
     }
-
-    // libtiff's own value: the TIFF default (2^32 - 1, one strip) when the tag
-    // is missing. The readers limit it to the image height.
-    uint64_t stripSize = info.stripSize;
-    uint16_t compression = info.compression;
 
     uint64_t samples = spp;
 
@@ -112,10 +103,10 @@ void mexFunction(int nlhs, mxArray *plhs[],
     plhs[0] = mxCreateNumericArray(ndim,(mwSize*)dim,classID, mxREAL);
     void* tiff = mxGetData(plhs[0]);
 
-    // Bytes are moved purely by bit width, so the worker only needs `bits`.
-    uint8_t err = 0;
-    if(imageJIm)    err = readTiffParallelImageJ(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY);
-    else if(z <= 1) err = readTiffParallel2D(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY);
-    else            err = readTiffParallel(x,y,z,fileName, tiff, bits, startSlice, stripSize, flipXY, compression);
-    if(err) mexErrMsgIdAndTxt("tiff:tiffError","An Error occured within the read function");
+    // Read as the library's other callers read: readTiffParallelInfo picks the
+    // reader (and reads a stack of a few large slices one slice at a time with
+    // every thread, which the choice made here did not) and gives the readers
+    // where the directories start, from the walk above.
+    if(!readTiffParallelInfo(fileName, info, tiff, flipXY, {startSlice, startSlice + z}))
+        mexErrMsgIdAndTxt("tiff:tiffError","An Error occured within the read function");
 }
