@@ -187,6 +187,14 @@ im = parallelReadTiff('path/to/file.tif');
 im = parallelReadTiff('path/to/file.tif',[1 10]);
 ````
 
+#### parallelReadTiffGPU - Read a Tiff image into a gpuArray
+For data needed on the GPU anyway: parallelReadTiff's values, read straight into GPU memory (see "Read straight into GPU memory" in the Python section). Needs Linux, the Parallel Computing Toolbox, an NVIDIA GPU and nvCOMP (pip install nvidia-libnvcomp-cu12), whose library file CPPTIFF_NVCOMP_LIBRARY names
+````
+setenv('CPPTIFF_NVCOMP_LIBRARY', '/path/to/libnvcomp.so.6');
+im = parallelReadTiffGPU('path/to/file.tif');
+im = parallelReadTiffGPU('path/to/file.tif',[1 10]);
+````
+
 #### parallelWriteTiff - Write an array out as a Tiff image
 ````
 im = rand(100,100,100);

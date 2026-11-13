@@ -336,6 +336,58 @@ function test_matlab(mexDir)
     end
     fprintf('PASS  paths in other scripts\n');
 
+    % 11. GPU reads (parallelReadTiffGPU, where it was built, MATLAB has a GPU
+    %     it can use and nvCOMP is found): gpuArrays of what parallelReadTiff
+    %     reads, for every class and codec, ranges, color and ImageJ stacks in
+    %     both byte orders; a range past the end refused
+    canGpu = false;
+    if exist('parallelReadTiffGPU', 'file') == 3
+        try
+            canGpu = gpuDeviceCount > 0;
+        catch
+        end
+    end
+    gpuWhy = 'no parallelReadTiffGPU, or no GPU';
+    if canGpu
+        f = fullfile(tmp, 'gpu_probe.tif');
+        parallelWriteTiff(f, makeData([8 8 2], 'uint16'), 'w', 'zstd');
+        try
+            parallelReadTiffGPU(f);
+        catch me
+            canGpu = false;
+            gpuWhy = me.message;
+        end
+        delete(f);
+    end
+    if canGpu
+        for k = 1:numel(types)
+            for c = 1:numel(comps)
+                f = fullfile(tmp, sprintf('gpu_%s_%s.tif', types{k}, comps{c}));
+                d = makeData([37 50 5], types{k});
+                parallelWriteTiff(f, d, 'w', comps{c});
+                g = parallelReadTiffGPU(f);
+                assert(isa(g, 'gpuArray') && isequal(gather(g), parallelReadTiff(f)), 'gpu: %s %s', types{k}, comps{c});
+                assert(isequal(gather(parallelReadTiffGPU(f, [2 4])), parallelReadTiff(f, [2 4])), 'gpu: %s %s range', types{k}, comps{c});
+                delete(f);
+                nchecked = nchecked + 1;
+            end
+        end
+        f = fullfile(tmp, 'gpu_rgb.tif');
+        parallelWriteTiff(f, makeData([24 40 3 4], 'uint16'), 'w', 'lzw');
+        assert(isequal(gather(parallelReadTiffGPU(f)), parallelReadTiff(f)), 'gpu: rgb');
+        for bo = {'l', 'b'}
+            f = fullfile(tmp, ['gpu_ij_' bo{1} '.tif']);
+            writeImageJTiff(f, makeData([24 40 5], 'uint16'), bo{1});
+            assert(isequal(gather(parallelReadTiffGPU(f)), parallelReadTiff(f)), 'gpu: imagej %s', bo{1});
+            assert(isequal(gather(parallelReadTiffGPU(f, [2 3])), parallelReadTiff(f, [2 3])), 'gpu: imagej %s range', bo{1});
+        end
+        assert(throws(@() parallelReadTiffGPU(f, [1 9])), 'gpu: a range past the end was accepted');
+        nchecked = nchecked + 3;
+        fprintf('PASS  GPU reads\n');
+    else
+        fprintf('GPU reads skipped: %s\n', gpuWhy);
+    end
+
     fprintf('MATLAB tests PASSED (%d round trips)\n', nchecked);
 end
 
