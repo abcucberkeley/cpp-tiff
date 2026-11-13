@@ -318,6 +318,11 @@ void gpuReadTiffSetNvcompLibrary(const std::string &path){
     setNvcompLibrary(path);
 }
 
+void gpuReleaseBuffers(){
+    // (no GPU read or write has loaded the driver: nothing was kept)
+    if(const Api* a = apiIfLoaded()) releaseBuffers(a);
+}
+
 uint8_t gpuReadTiff(const std::vector<GpuTiffRead> &reads, const bool flipXY, void* stream, const int threadsGiven,
                     std::string &errString){
     TIFFSetWarningHandler(DummyHandler);

@@ -171,6 +171,36 @@ static bool writeImageJ(const std::string &path, const std::vector<uint8_t> &dat
     return std::fclose(fp) == 0 && ok;
 }
 
+// After the device's primary context is reset (as MATLAB's reset(gpuDevice) and cudaDeviceReset reset it): the context
+// made current again, and GPU memory filled with 0x5a, which takes the addresses the freed buffers had (bufs, freed by
+// unchanged()). unchanged: whether every byte of it is still 0x5a.
+static std::vector<CUdeviceptr> resetAndFill(CUdevice dev, CUcontext &ctx, uint64_t each, int n){
+    ck(A->cuDevicePrimaryCtxReset(dev), "cuDevicePrimaryCtxReset");
+    ck(A->cuDevicePrimaryCtxRetain(&ctx, dev), "cuDevicePrimaryCtxRetain");
+    ck(A->cuCtxSetCurrent(ctx), "cuCtxSetCurrent");
+    std::vector<CUdeviceptr> bufs;
+    for(int i = 0; i < n; i++){
+        CUdeviceptr p = 0;
+        if(A->cuMemAlloc(&p, each)) break;
+        ck(A->cuMemsetD8Async(p, 0x5a, each, nullptr), "cuMemsetD8Async");
+        bufs.push_back(p);
+    }
+    ck(A->cuStreamSynchronize(nullptr), "cuStreamSynchronize");
+    return bufs;
+}
+static bool unchanged(std::vector<CUdeviceptr> &bufs, uint64_t each){
+    bool same = true;
+    std::vector<uint8_t> h(each);
+    for(CUdeviceptr p : bufs){
+        ck(A->cuMemcpyDtoHAsync(h.data(), p, each, nullptr), "cuMemcpyDtoHAsync");
+        ck(A->cuStreamSynchronize(nullptr), "cuStreamSynchronize");
+        for(uint8_t b : h) if(b != 0x5a){ same = false; break; }
+        A->cuMemFree(p);
+    }
+    bufs.clear();
+    return same;
+}
+
 // The reads read on the CPU (the reference) and on the GPU in one call, compared; prints a FAIL line. expectFail:
 // the CPU read fails, and the GPU read must too.
 static bool compare(const std::vector<std::string> &paths, const std::vector<std::vector<uint64_t>> &ranges, bool flip,
@@ -366,6 +396,30 @@ int main(int argc, char** argv){
             }
             std::remove(path.c_str());
         }
+    }
+
+    // The buffers kept between reads freed (gpuReleaseBuffers), and the context reset (as MATLAB's reset(gpuDevice) resets
+    // it): the reads after make new buffers, and write nothing into memory that is no longer theirs
+    {
+        const Spec s{512, 512, 8, 1, 16, 1, COMPRESSION_ZSTD, PREDICTOR_HORIZONTAL, 32, 0, false, false};
+        const Spec l{300, 200, 4, 1, 16, 1, COMPRESSION_LZW, PREDICTOR_NONE, 16, 0, false, false};
+        const std::string ps = fileFor(s), pl = fileFor(l);
+        for(bool flip : {false, true}) compare({ps, pl}, {{}, {}}, flip, std::string("before freeing the buffers") + (flip ? " flip" : ""));
+        gpuReleaseBuffers();
+        gpuReleaseBuffers();
+        for(bool flip : {false, true}) compare({ps, pl}, {{}, {}}, flip, std::string("after freeing the buffers") + (flip ? " flip" : ""));
+        if(A->cuDevicePrimaryCtxReset){
+            const uint64_t each = (uint64_t)64 << 20;
+            std::vector<CUdeviceptr> fill = resetAndFill(dev, ctx, each, 16);
+            for(bool flip : {false, true}) compare({ps, pl}, {{}, {}}, flip, std::string("after a reset") + (flip ? " flip" : ""));
+            total++;
+            if(!unchanged(fill, each)){ std::printf("FAIL  after a reset: a read wrote into memory allocated after it\n"); failures++; }
+            gpuReleaseBuffers();
+            compare({ps}, {{}}, false, "after a reset and freeing the buffers");
+        }
+        else std::printf("(no cuDevicePrimaryCtxReset: the reset case is left out)\n");
+        std::remove(ps.c_str());
+        std::remove(pl.c_str());
     }
 
     // A damaged deflate strip (its zlib header intact): the CPU read fails, and so must the GPU read

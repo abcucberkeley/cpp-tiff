@@ -146,6 +146,8 @@ cpptiff.write_tiff('filename.tif', im, 'zstd')
 # The GPU work goes after the work on the data's library's current stream (by default), or on stream=
 cpptiff.write_tiff('filename.tif', torch_tensor, 'zstd', stream=torch.cuda.current_stream())
 ````
+GPU reads and writes keep their GPU buffers (and pinned host memory) for the next call: after big zstd writes, several GB of GPU memory. `cpptiff.gpu_release_buffers()` frees them (in C++ gpuReleaseBuffers(), in MATLAB clearing parallelReadTiffGPU and parallelWriteTiffGPU), and the next call makes new ones.
+
 CPPTIFF_GPU_WRITE_PART_MB sets the most a write takes from the GPU at once (by default 256 MB, and for zstd about 6 strips for each of the GPU's multiprocessors, up to 2 GB: nvCOMP compresses a part's strips side by side)
 
 ## CMake

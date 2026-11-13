@@ -899,8 +899,19 @@ def main():
         raises(TypeError, lambda: cpptiff.write_tiff(pg, cupy.zeros((4, 4), dtype=cupy.bool_)), "GPU write of booleans")
         raises(ValueError, lambda: cpptiff.write_tiff(pg, cupy.zeros((0, 4), dtype=cupy.uint8)), "GPU write of an empty array")
         raises(ValueError, lambda: cpptiff.write_tiff(pg, cupy.zeros((2, 3, 4, 5), dtype=cupy.uint8)), "GPU write of 4D data of 5 samples")
+        # The buffers kept between calls freed (gpu_release_buffers): the reads and writes after make new ones
+        cpptiff.gpu_release_buffers()
+        check(np.array_equal(cupy.asnumpy(cpptiff.read_tiff(gpu_files[2], gpu=True), order="A"), cpptiff.read_tiff(gpu_files[2])),
+              "GPU read after gpu_release_buffers")
+        a = (rng_g.random((4, 64, 64))*200).astype(np.uint16)
+        cpptiff.gpu_release_buffers()
+        cpptiff.write_tiff(pg, cupy.asarray(a), "zstd")
+        check(np.array_equal(cpptiff.read_tiff(pg), a), "GPU write after gpu_release_buffers")
+        cpptiff.gpu_release_buffers()
         print(f"GPU writes checked{' (and from PyTorch tensors)' if torch is not None else ''}")
     else:
+        # (nothing kept: freeing is nothing)
+        cpptiff.gpu_release_buffers()
         print(f"GPU reads and writes skipped: {gpu_why}")
 
     if _failures:

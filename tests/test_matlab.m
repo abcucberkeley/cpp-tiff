@@ -428,6 +428,18 @@ function test_matlab(mexDir)
         parallelWriteTiff(fc, d, 'w', 'lzw', 32);
         assert(isequal(bytesOf(fg), bytesOf(fc)), 'gpu write: tiled');
         assert(throws(@() parallelWriteTiffGPU(fg, d)), 'gpu write: host data was accepted');
+        % reset(gpuDevice), which frees every GPU allocation (the buffers GPU reads and writes keep too), and clear of
+        % the MEX files, which frees those buffers: the reads and writes after them are right
+        d = makeData([64 48 5], 'uint16');
+        parallelWriteTiffGPU(fg, gpuArray(d), 'w', 'zstd');
+        reset(gpuDevice);
+        assert(isequal(gather(parallelReadTiffGPU(fg)), d), 'gpu: read after reset(gpuDevice)');
+        parallelWriteTiffGPU(fg, gpuArray(d), 'w', 'lzw');
+        assert(isequal(parallelReadTiff(fg), d), 'gpu write: after reset(gpuDevice)');
+        clear parallelReadTiffGPU parallelWriteTiffGPU
+        assert(isequal(gather(parallelReadTiffGPU(fg)), d), 'gpu: read after clear');
+        parallelWriteTiffGPU(fg, gpuArray(d), 'w', 'zstd');
+        assert(isequal(parallelReadTiff(fg), d), 'gpu write: after clear');
         delete(fg);
         delete(fc);
         nchecked = nchecked + 5;

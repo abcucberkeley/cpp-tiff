@@ -14,9 +14,18 @@
 #include "../src/gpureadtiff.h"
 #include "../src/helperfunctions.h"
 
+// At clear (of this MEX file, or clear mex) and when MATLAB exits, the GPU memory GPU reads and writes keep for the next
+// call is freed (gpuReleaseBuffers). After reset(gpuDevice), which frees it all, the next call makes new buffers.
+static void releaseAtClear(){ gpuReleaseBuffers(); }
+
 void mexFunction(int nlhs, mxArray *plhs[],
                  int nrhs, const mxArray *prhs[])
 {
+    static bool registered = false;
+    if(!registered){
+        mexAtExit(releaseAtClear);
+        registered = true;
+    }
     if(nrhs < 1 || nrhs > 2) mexErrMsgIdAndTxt("tiff:inputError","This function takes one or two arguments only");
     char* fileName = NULL;
     if(!mxIsClass(prhs[0], "string")){

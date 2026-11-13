@@ -391,6 +391,10 @@ PYBIND11_MODULE(cpptiff, m) {
 	      "Write GPU memory as a TIFF file");
 
 	m.def("pybind11_gpu_set_nvcomp", &gpuReadTiffSetNvcompLibrary, "Where to load nvCOMP from, before the first GPU read");
+	m.def("pybind11_gpu_release_buffers", [](){
+	          pybind11::gil_scoped_release release;
+	          gpuReleaseBuffers();
+	      }, "Free the GPU and pinned host memory GPU reads and writes keep for the next call");
 
 	m.def("pybind11_default_threads", &callThreads,
 	      "The threads a call uses by default from the calling thread (OMP_NUM_THREADS, or every CPU)");

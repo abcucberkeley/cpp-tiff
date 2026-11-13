@@ -31,6 +31,13 @@ bool gpuReadTiffAvailable(std::string &why);
 // Where to load nvCOMP from (a libnvcomp file), before the first GPU read
 void gpuReadTiffSetNvcompLibrary(const std::string &path);
 
+// Frees the GPU memory and pinned host memory that GPU reads and writes (gpuwritetiff.h) keep for the next call: a
+// read's or a write's buffers for two of its parts (after a write of zstd strips, several GB of GPU memory; parts are
+// sized to the GPU). The next call makes new ones. Buffers of reads and writes running at the time are left to them.
+// After a context is reset (MATLAB's reset(gpuDevice), cudaDeviceReset) or destroyed, the next call sees that its
+// buffers went with it and makes new ones: nothing is to be freed then.
+void gpuReleaseBuffers();
+
 // One file to read: its slices (all of them, or zRange: {first} or {first, end}, as for
 // readTiffParallelInfo) and the GPU memory they go to, every read's in one CUDA context (the device's
 // primary context for memory that CUDA runtime users such as PyTorch, CuPy and MATLAB allocate)

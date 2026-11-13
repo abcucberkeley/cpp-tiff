@@ -12,6 +12,7 @@
 #include "gpu/mxGPUArray.h"
 #include "tiffio.h"
 #include "../src/gpuwritetiff.h"
+#include "../src/gpureadtiff.h"
 #include "../src/helperfunctions.h"
 
 // A char array or string argument as UTF-8
@@ -30,9 +31,18 @@ static std::string textArg(const mxArray* a, const char* what){
     return out;
 }
 
+// At clear (of this MEX file, or clear mex) and when MATLAB exits, the GPU memory GPU reads and writes keep for the next
+// call is freed (gpuReleaseBuffers). After reset(gpuDevice), which frees it all, the next call makes new buffers.
+static void releaseAtClear(){ gpuReleaseBuffers(); }
+
 void mexFunction(int nlhs, mxArray *plhs[],
                  int nrhs, const mxArray *prhs[])
 {
+    static bool registered = false;
+    if(!registered){
+        mexAtExit(releaseAtClear);
+        registered = true;
+    }
     (void)nlhs; (void)plhs;
     if(nrhs < 2 || nrhs > 6) mexErrMsgIdAndTxt("tiff:inputError","This function takes 2 to 6 arguments");
     std::string fileName = textArg(prhs[0], "first argument (the file name)");

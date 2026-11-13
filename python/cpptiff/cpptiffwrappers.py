@@ -6,7 +6,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, wait
 from .cpptiff import pybind11_read_tiff, pybind11_write_tiff, pybind11_get_image_shape, pybind11_default_threads
 from .cpptiff import pybind11_read_shape, pybind11_read_tiff_gpu, pybind11_gpu_available, pybind11_gpu_set_nvcomp
-from .cpptiff import pybind11_write_tiff_gpu
+from .cpptiff import pybind11_write_tiff_gpu, pybind11_gpu_release_buffers
 
 
 def _threads(num_threads):
@@ -435,6 +435,13 @@ def gpu_available():
     nvCOMP: pip install "cpp-tiff[gpu]")"""
     _find_nvcomp()
     return pybind11_gpu_available()
+
+
+def gpu_release_buffers():
+    """Free the GPU memory (and pinned host memory) that reads into GPU memory and writes from it keep for the next
+    call: buffers for two parts of a read or write, which after writes of zstd strips are several GB of GPU memory.
+    The next GPU read or write makes new ones. Buffers of reads and writes running in other threads are left to them."""
+    pybind11_gpu_release_buffers()
 
 
 def _read_gpu(requests, order, num_threads, stream):

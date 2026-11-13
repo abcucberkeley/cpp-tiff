@@ -55,6 +55,11 @@ struct WriteSlot {
 // The kernels and reusable buffers of one CUDA context
 struct Ctx {
     CUcontext ctx = nullptr;
+    // A small allocation and its buffer ID: once the context is reset (MATLAB's reset(gpuDevice), cudaDeviceReset) or
+    // destroyed, the allocation is gone or another's, and the kernels and buffers here with it (see context)
+    CUdeviceptr sentinel = 0;
+    unsigned long long sentinelId = 0;
+    bool stale = false;
     CUmodule mod = nullptr;
     CUfunction placeC[4] = {nullptr, nullptr, nullptr, nullptr};   // (by element size: 1, 2, 4, 8 bytes)
     CUfunction placeF[4] = {nullptr, nullptr, nullptr, nullptr};
@@ -68,8 +73,12 @@ struct Ctx {
     std::vector<std::unique_ptr<WriteSlot>> writeSlots;
 };
 
-// The context's kernels and buffers (loading its kernels the first time); c must be current
+// The context's kernels and buffers (loading its kernels the first time, and again after the context was reset); c
+// must be current
 Ctx& context(const Api* a, CUcontext c);
+
+// Frees the buffers of every context's slots that no read or write is using (gpuReleaseBuffers)
+void releaseBuffers(const Api* a);
 
 // A slot of the context, free until given back
 Slot& takeSlot(Ctx &c);

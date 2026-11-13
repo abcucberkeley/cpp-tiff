@@ -95,6 +95,36 @@ static CUdeviceptr toGpu(const std::vector<uint8_t> &v){
     return d;
 }
 
+// After the device's primary context is reset (as MATLAB's reset(gpuDevice) and cudaDeviceReset reset it): the context
+// made current again, and GPU memory filled with 0x5a, which takes the addresses the freed buffers had (bufs, freed by
+// unchanged()). unchanged: whether every byte of it is still 0x5a.
+static std::vector<CUdeviceptr> resetAndFill(CUdevice dev, CUcontext &ctx, uint64_t each, int n){
+    ck(A->cuDevicePrimaryCtxReset(dev), "cuDevicePrimaryCtxReset");
+    ck(A->cuDevicePrimaryCtxRetain(&ctx, dev), "cuDevicePrimaryCtxRetain");
+    ck(A->cuCtxSetCurrent(ctx), "cuCtxSetCurrent");
+    std::vector<CUdeviceptr> bufs;
+    for(int i = 0; i < n; i++){
+        CUdeviceptr p = 0;
+        if(A->cuMemAlloc(&p, each)) break;
+        ck(A->cuMemsetD8Async(p, 0x5a, each, nullptr), "cuMemsetD8Async");
+        bufs.push_back(p);
+    }
+    ck(A->cuStreamSynchronize(nullptr), "cuStreamSynchronize");
+    return bufs;
+}
+static bool unchanged(std::vector<CUdeviceptr> &bufs, uint64_t each){
+    bool same = true;
+    std::vector<uint8_t> h(each);
+    for(CUdeviceptr p : bufs){
+        ck(A->cuMemcpyDtoHAsync(h.data(), p, each, nullptr), "cuMemcpyDtoHAsync");
+        ck(A->cuStreamSynchronize(nullptr), "cuStreamSynchronize");
+        for(uint8_t b : h) if(b != 0x5a){ same = false; break; }
+        A->cuMemFree(p);
+    }
+    bufs.clear();
+    return same;
+}
+
 // The file read back on the CPU (row-major) must be data
 static bool readsBack(const std::string &path, const Case &c, const std::vector<uint8_t> &data, const std::string &label){
     TiffInfo info;
@@ -308,6 +338,30 @@ int main(int argc, char** argv){
         }
         if(fileBytes(pg) != fileBytes(pc)){ fail(label, "the file is not the CPU writer's"); continue; }
         readsBack(pg, c, data, label);
+    }
+
+    // The buffers kept between writes freed (gpuReleaseBuffers), and the context reset (as MATLAB's reset(gpuDevice)
+    // resets it): the writes after make new buffers, and write nothing into memory that is no longer theirs
+    {
+        const Case z{512, 512, 8, 1, 16, SAMPLEFORMAT_UINT}, w{300, 200, 4, 3, 8, SAMPLEFORMAT_UINT};
+        auto both = [&](const std::string &label){
+            for(bool flip : {false, true}){
+                check(z, "zstd", flip, dir, label + " zstd" + (flip ? " flip" : ""), false);
+                check(w, "lzw", flip, dir, label + " lzw rgb" + (flip ? " flip" : ""), true);
+            }
+        };
+        both("before freeing the buffers:");
+        gpuReleaseBuffers();
+        gpuReleaseBuffers();
+        both("after freeing the buffers:");
+        if(A->cuDevicePrimaryCtxReset){
+            const uint64_t each = (uint64_t)64 << 20;
+            std::vector<CUdeviceptr> fill = resetAndFill(dev, ctx, each, 16);
+            both("after a reset:");
+            total++;
+            if(!unchanged(fill, each)){ std::printf("FAIL  after a reset: a write wrote into memory allocated after it\n"); failures++; }
+        }
+        else std::printf("(no cuDevicePrimaryCtxReset: the reset case is left out)\n");
     }
 
     // Errors: host memory, an unknown compression or mode, a file that cannot be made

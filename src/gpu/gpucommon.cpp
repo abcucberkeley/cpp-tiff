@@ -16,11 +16,29 @@ void ck(const Api* a, CUresult r, const char* what){
     if(r) throw Fail(std::string(what)+": "+errorText(a, r));
 }
 
+// Whether the context's kernels and buffers are still its own: not after it was reset or destroyed (its handle can
+// come back for a new one), when its sentinel allocation is gone or belongs to another allocation
+static bool stillValid(const Api* a, const Ctx &x){
+    if(!x.sentinel) return true;
+    unsigned long long id = 0;
+    return !a->cuPointerGetAttribute(&id, 7 /* CU_POINTER_ATTRIBUTE_BUFFER_ID */, x.sentinel) && id == x.sentinelId;
+}
+
 Ctx& context(const Api* a, CUcontext c){
     std::lock_guard<std::mutex> g(ctxMutex);
-    for(auto &x : ctxs) if(x->ctx == c) return *x;
+    for(auto &x : ctxs){
+        if(x->ctx != c || x->stale) continue;
+        if(stillValid(a, *x)) return *x;
+        // (reset: its kernels and buffers went with it; kept, not freed, in case a call still holds it)
+        x->stale = true;
+    }
     std::unique_ptr<Ctx> x(new Ctx());
     x->ctx = c;
+    if(!a->cuMemAlloc(&x->sentinel, 256) &&
+       a->cuPointerGetAttribute(&x->sentinelId, 7 /* CU_POINTER_ATTRIBUTE_BUFFER_ID */, x->sentinel)){
+        a->cuMemFree(x->sentinel);
+        x->sentinel = 0;
+    }
     std::string ptx;
     for(const char* p : cpptiffKernelsPtx) ptx += p;
     char log[4096] = {0};
@@ -79,6 +97,31 @@ WriteSlot& takeWriteSlot(Ctx &c){
 void giveWriteSlot(Ctx &c, WriteSlot &s){
     std::lock_guard<std::mutex> g(c.m);
     s.busy = false;
+}
+
+void releaseBuffers(const Api* a){
+    std::lock_guard<std::mutex> g(ctxMutex);
+    for(auto &x : ctxs){
+        if(x->stale || !stillValid(a, *x)) continue;
+        CtxScope scope(a, x->ctx);
+        std::lock_guard<std::mutex> gs(x->m);
+        // (a slot no call holds has finished its GPU work: slots are given back once it has, or marked lost)
+        for(auto &s : x->slots){
+            if(s->busy || s->lost) continue;
+            for(CUdeviceptr* p : {&s->comp, &s->dec, &s->temp, &s->work}) if(*p){ a->cuMemFree(*p); *p = 0; }
+            if(s->host){ a->cuMemFreeHost(s->host); s->host = nullptr; }
+            s->compBytes = s->decBytes = s->tempBytes = s->workBytes = s->hostBytes = 0;
+        }
+        for(auto &s : x->writeSlots){
+            if(s->busy || s->lost) continue;
+            for(CUdeviceptr* p : {&s->in, &s->out, &s->temp, &s->work, &s->packed}) if(*p){ a->cuMemFree(*p); *p = 0; }
+            for(uint8_t** p : {&s->host, &s->tab, &s->res}) if(*p){ a->cuMemFreeHost(*p); *p = nullptr; }
+            std::free(s->enc);
+            s->enc = nullptr;
+            s->inBytes = s->outBytes = s->tempBytes = s->workBytes = s->packedBytes = 0;
+            s->hostBytes = s->tabBytes = s->resBytes = s->encBytes = 0;
+        }
+    }
 }
 
 void waitFor(const Api* a, CUevent ev, double timeout, const char* what){
