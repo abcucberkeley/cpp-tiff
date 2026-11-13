@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <random>
 #include <string>
 #include <vector>
@@ -43,12 +44,11 @@ struct Spec {
     bool planar, bigEndian;
 };
 
-static bool writeStack(const std::string &path, const Spec &s, const std::vector<uint8_t> &data){
-    TIFF* tif = TIFFOpen(path.c_str(), s.bigEndian ? "w8b" : "w8l");
-    if(!tif) return false;
-    const uint64_t es = s.bits/8, slice = s.x*s.y*s.spp*es;
+// One directory of a stack: the slice's data row-major (y, x, c) in the host's byte order
+static bool writeDir(TIFF* tif, const Spec &s, const uint8_t* src){
+    const uint64_t es = s.bits/8;
     std::vector<uint8_t> plane;
-    for(uint64_t k = 0; k < s.z; k++){
+    {
         TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, (uint32_t)s.x);
         TIFFSetField(tif, TIFFTAG_IMAGELENGTH, (uint32_t)s.y);
         TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, (uint16_t)s.bits);
@@ -59,7 +59,6 @@ static bool writeStack(const std::string &path, const Spec &s, const std::vector
         TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, s.spp >= 3 ? PHOTOMETRIC_RGB : PHOTOMETRIC_MINISBLACK);
         if(s.spp == 4){ const uint16_t extra = EXTRASAMPLE_UNASSALPHA; TIFFSetField(tif, TIFFTAG_EXTRASAMPLES, 1, &extra); }
         TIFFSetField(tif, TIFFTAG_PLANARCONFIG, s.planar ? PLANARCONFIG_SEPARATE : PLANARCONFIG_CONTIG);
-        const uint8_t* src = data.data() + k*slice;
         // (planar: each color's plane on its own, from the chunky data)
         const uint64_t planes = s.planar ? s.spp : 1, ppx = s.planar ? 1 : s.spp;
         for(uint64_t p = 0; p < planes; p++){
@@ -80,10 +79,8 @@ static bool writeStack(const std::string &path, const Spec &s, const std::vector
                             const uint64_t cols = std::min<uint64_t>(s.tile, s.x - tx*s.tile);
                             std::memcpy(&t[r*s.tile*ppx*es], img + ((ty*s.tile + r)*s.x + tx*s.tile)*ppx*es, cols*ppx*es);
                         }
-                        if(TIFFWriteEncodedTile(tif, (uint32_t)(p*across*down + ty*across + tx), t.data(), (tmsize_t)t.size()) < 0){
-                            TIFFClose(tif);
+                        if(TIFFWriteEncodedTile(tif, (uint32_t)(p*across*down + ty*across + tx), t.data(), (tmsize_t)t.size()) < 0)
                             return false;
-                        }
                     }
             }
             else{
@@ -92,17 +89,39 @@ static bool writeStack(const std::string &path, const Spec &s, const std::vector
                 for(uint64_t i = 0; i < strips; i++){
                     const uint64_t rows = std::min<uint64_t>(s.rps, s.y - i*s.rps);
                     if(TIFFWriteEncodedStrip(tif, (uint32_t)(p*strips + i), (void*)(img + i*s.rps*s.x*ppx*es),
-                                             (tmsize_t)(rows*s.x*ppx*es)) < 0){
-                        TIFFClose(tif);
+                                             (tmsize_t)(rows*s.x*ppx*es)) < 0)
                         return false;
-                    }
                 }
             }
         }
-        if(!TIFFWriteDirectory(tif)){ TIFFClose(tif); return false; }
+        if(!TIFFWriteDirectory(tif)) return false;
+    }
+    return true;
+}
+
+static bool writeStack(const std::string &path, const Spec &s, const std::vector<uint8_t> &data){
+    TIFF* tif = TIFFOpen(path.c_str(), s.bigEndian ? "w8b" : "w8l");
+    if(!tif) return false;
+    const uint64_t slice = s.x*s.y*s.spp*(s.bits/8);
+    bool ok = true;
+    for(uint64_t k = 0; k < s.z && ok; k++) ok = writeDir(tif, s, data.data() + k*slice);
+    TIFFClose(tif);
+    return ok;
+}
+
+// A stack of directories unlike each other: one slice for each spec, its data from make
+static bool writeMixed(const std::string &path, const std::vector<Spec> &specs, const std::function<std::vector<uint8_t>(const Spec&)> &make){
+    TIFF* tif = TIFFOpen(path.c_str(), "w8l");
+    if(!tif) return false;
+    bool ok = true;
+    for(const Spec &s : specs){
+        Spec one = s;
+        one.z = 1;
+        const std::vector<uint8_t> d = make(one);
+        ok = ok && writeDir(tif, one, d.data());
     }
     TIFFClose(tif);
-    return true;
+    return ok;
 }
 
 // An ImageJ stack: one directory, the slices back to back after it (the layout of tests/roundtrip.cpp's
@@ -306,6 +325,47 @@ int main(int argc, char** argv){
         for(bool flip : {false, true}) compare({path}, {{}}, flip, std::string("parts") + (flip ? " flip" : ""));
         setEnv("CPPTIFF_GPU_PART_MAX_MB", nullptr);
         std::remove(path.c_str());
+    }
+
+    // Stacks whose directories differ from the first in rows per strip (more and fewer), codec and predictor, strips
+    // and tiles and tile size, chunky and planar color: the GPU reads each directory by its own layout, as the CPU
+    // reader does; a directory of another size, sample size or number of samples, which the CPU reader refuses, the
+    // GPU read must refuse too
+    {
+        const uint16_t Z = COMPRESSION_ZSTD, L = COMPRESSION_LZW, N = COMPRESSION_NONE, Dfl = COMPRESSION_ADOBE_DEFLATE;
+        const uint16_t P0 = PREDICTOR_NONE, P2 = PREDICTOR_HORIZONTAL, U = SAMPLEFORMAT_UINT;
+        struct M { const char* name; std::vector<Spec> specs; bool fails; };
+        const std::vector<M> mixes = {
+            {"rows per strip 24 then 8", {{40, 24, 1, 1, 16, U, Z, P0, 24, 0, false, false}, {40, 24, 1, 1, 16, U, Z, P0, 8, 0, false, false},
+                                          {40, 24, 1, 1, 16, U, Z, P0, 8, 0, false, false}}, false},
+            {"rows per strip 5 then 24", {{40, 24, 1, 1, 16, U, L, P0, 5, 0, false, false}, {40, 24, 1, 1, 16, U, L, P0, 24, 0, false, false},
+                                          {40, 24, 1, 1, 16, U, L, P0, 7, 0, false, false}}, false},
+            {"codecs", {{50, 30, 1, 1, 16, U, Z, P2, 7, 0, false, false}, {50, 30, 1, 1, 16, U, L, P0, 9, 0, false, false},
+                        {50, 30, 1, 1, 16, U, Dfl, P2, 30, 0, false, false}, {50, 30, 1, 1, 16, U, N, P0, 4, 0, false, false}}, false},
+            {"strips then tiles", {{70, 45, 1, 1, 16, U, Z, P0, 8, 0, false, false}, {70, 45, 1, 1, 16, U, Z, P0, 0, 32, false, false},
+                                   {70, 45, 1, 1, 16, U, L, P0, 0, 16, false, false}}, false},
+            {"tiles then strips", {{70, 45, 1, 1, 8, U, Dfl, P0, 0, 16, false, false}, {70, 45, 1, 1, 8, U, Dfl, P0, 11, 0, false, false}}, false},
+            {"chunky then planar", {{40, 30, 1, 3, 16, U, Z, P0, 10, 0, false, false}, {40, 30, 1, 3, 16, U, Z, P0, 7, 0, true, false},
+                                    {40, 30, 1, 3, 16, U, N, P0, 30, 0, false, false}}, false},
+            {"planar then chunky", {{40, 30, 1, 3, 8, U, L, P0, 6, 0, true, false}, {40, 30, 1, 3, 8, U, L, P0, 6, 0, false, false}}, false},
+            {"another size", {{40, 24, 1, 1, 16, U, Z, P0, 8, 0, false, false}, {80, 48, 1, 1, 16, U, Z, P0, 8, 0, false, false}}, true},
+            {"another sample size", {{40, 24, 1, 1, 16, U, Z, P0, 8, 0, false, false}, {40, 24, 1, 1, 8, U, Z, P0, 8, 0, false, false}}, true},
+            {"another number of samples", {{40, 24, 1, 3, 8, U, N, P0, 8, 0, false, false}, {40, 24, 1, 1, 8, U, N, P0, 8, 0, false, false}}, true},
+        };
+        for(const M &m : mixes){
+            const std::string path = dir + "/gpu_mixed_" + std::to_string(fileNo++) + ".tif";
+            if(!writeMixed(path, m.specs, make)){ std::printf("FAIL  could not write %s\n", path.c_str()); failures++; continue; }
+            const uint64_t z = m.specs.size();
+            for(bool flip : {false, true}){
+                const std::string label = std::string("mixed directories: ") + m.name + (flip ? " flip" : "");
+                compare({path}, {{}}, flip, label, m.fails);
+                if(!m.fails){
+                    compare({path}, {{1, z}}, flip, label + " [1,z)");
+                    compare({path}, {{z - 1}}, flip, label + " last");
+                }
+            }
+            std::remove(path.c_str());
+        }
     }
 
     // A damaged deflate strip (its zlib header intact): the CPU read fails, and so must the GPU read
