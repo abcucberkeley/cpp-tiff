@@ -21,6 +21,16 @@ using namespace ctcuda;
 static const Api* A = nullptr;
 static int total = 0, failures = 0;
 
+// An environment variable set, or unset with value nullptr (Windows has no setenv)
+static void setEnv(const char* name, const char* value){
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if(value) setenv(name, value, 1);
+    else unsetenv(name);
+#endif
+}
+
 static void ck(CUresult r, const char* what){
     if(r){ std::fprintf(stderr, "%s: %s\n", what, errorText(A, r).c_str()); std::exit(2); }
 }
@@ -288,9 +298,9 @@ int main(int argc, char** argv){
     {
         const Spec s{512, 512, 12, 1, 16, 1, COMPRESSION_ZSTD, PREDICTOR_NONE, 64, 0, false, false};
         const std::string path = fileFor(s);
-        setenv("CPPTIFF_GPU_PART_MAX_MB", "1", 1);
+        setEnv("CPPTIFF_GPU_PART_MAX_MB", "1");
         for(bool flip : {false, true}) compare({path}, {{}}, flip, std::string("parts") + (flip ? " flip" : ""));
-        unsetenv("CPPTIFF_GPU_PART_MAX_MB");
+        setEnv("CPPTIFF_GPU_PART_MAX_MB", nullptr);
         std::remove(path.c_str());
     }
 
