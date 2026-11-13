@@ -566,6 +566,65 @@ int main(int argc, char** argv){
         }
     }
 
+    // ---- ImageJ stacks read by several threads, each its own run of 4 MB
+    // blocks of whole rows: slices of more than one block (a run then starts
+    // and ends inside a slice), runs of whole slices, a single slice, every
+    // sample size in both byte orders, RGB and odd sizes; each read whole and
+    // as a slice range, in both layouts, with 1, 3 and every thread.
+    {
+        struct IJP { const char* name; uint64_t x, y, z, spp, bits; bool be; };
+        const IJP ijpCases[] = {
+            {"ijp-g16-be-cut", 1500, 1500,  7, 1, 16, true},    // 4.5 MB slices, two blocks each
+            {"ijp-rgb8-cut",   1500, 1000,  3, 3,  8, false},   // the same in RGB
+            {"ijp-g64-be-one",  900,  800,  1, 1, 64, true},    // one 5.8 MB slice, two blocks
+            {"ijp-g8-odd",       37,   29, 11, 1,  8, false},
+            {"ijp-g32-be",       40,   24,  9, 1, 32, true},
+            {"ijp-g64-be",       33,   21,  9, 1, 64, true},
+            {"ijp-g64-le",       33,   21,  9, 1, 64, false},
+            {"ijp-rgb16-be",     40,   24,  9, 3, 16, true},
+        };
+        const int prevThreads = omp_get_max_threads();
+        for(const IJP& c : ijpCases){
+            total++;
+            const uint64_t es = c.bits/8, sliceBytes = c.x*c.y*c.spp*es;
+            std::vector<uint8_t> src(sliceBytes*c.z);
+            uint64_t st = 0x9E3779B97F4A7C15ull ^ (c.x*131 + c.y*7 + c.bits);
+            for(uint8_t& b : src){ st = st*6364136223846793005ull + 1442695040888963407ull; b = (uint8_t)(st >> 56); }
+            // The flip layout: column-major (y, x[, c], z)
+            std::vector<uint8_t> flipped(src.size());
+            for(uint64_t k = 0; k < c.z; k++)
+                for(uint64_t i = 0; i < c.y; i++)
+                    for(uint64_t j = 0; j < c.x; j++)
+                        for(uint64_t ch = 0; ch < c.spp; ch++)
+                            std::memcpy(&flipped[(i + j*c.y + ch*c.x*c.y + k*c.x*c.y*c.spp)*es],
+                                        &src[(((k*c.y + i)*c.x + j)*c.spp + ch)*es], es);
+            const std::string path = dir + "/" + c.name + ".tif";
+            step(c.name, "imagej-par", "write fixture");
+            const bool made = writeImageJTiff(path, src.data(), c.x, c.y, c.z, c.spp, c.bits, c.be);
+            // A slice range inside the stack (the whole of a single slice)
+            const uint64_t a = c.z > 2 ? 1 : 0, e = c.z > 2 ? c.z - 1 : c.z;
+            std::string bad = made ? "" : " fixture";
+            for(int t : {1, 3, prevThreads}){
+                omp_set_num_threads(t);
+                step(c.name, "imagej-par", "reads");
+                void* nf = made ? readTiffParallelWrapperNoXYFlip(path.c_str(), {}) : nullptr;
+                void* nr = made ? readTiffParallelWrapperNoXYFlip(path.c_str(), {a, e}) : nullptr;
+                void* fl = made ? readTiffParallelWrapper(path.c_str()) : nullptr;
+                void* fr = made ? readTiffParallelWrapper(path.c_str(), {a, e}) : nullptr;
+                const bool good = nf && std::memcmp(nf, src.data(), src.size()) == 0
+                    && nr && std::memcmp(nr, src.data() + a*sliceBytes, (e - a)*sliceBytes) == 0
+                    && fl && std::memcmp(fl, flipped.data(), flipped.size()) == 0
+                    && fr && std::memcmp(fr, flipped.data() + a*sliceBytes, (e - a)*sliceBytes) == 0;
+                free(nf); free(nr); free(fl); free(fr);
+                if(made && !good) bad += " " + std::to_string(t) + " threads";
+            }
+            omp_set_num_threads(prevThreads);
+            std::remove(path.c_str());
+            if(bad.empty()) std::printf("PASS  %-14s imagej-par\n", c.name);
+            else { std::printf("FAIL  %-14s imagej-par (%s)\n", c.name, bad.c_str() + 1); failures++; }
+        }
+    }
+
     // ---- Scanline fallbacks, called directly on valid files. Wide and tall
     // images (the old row offset only ran past the buffer when x < y), 3D, 2D
     // and an offset z-range, both layouts, grayscale from the library's writer

@@ -1344,175 +1344,124 @@ uint8_t readTiffParallel2D(uint64_t x, uint64_t y, uint64_t z, const char* fileN
 }
 
 
-// Seek to an absolute byte offset; 0 on success. fseek takes a long, which is
-// 32 bits on Windows, so offsets past 2 GB need the 64-bit variants.
-static int seekFile(FILE* fp, uint64_t offset){
-#ifdef _WIN32
-    return _fseeki64(fp, (long long)offset, SEEK_SET);
-#else
-    return fseeko(fp, (off_t)offset, SEEK_SET);
-#endif
+// Bytes each thread reads at a time from an ImageJ stack, in whole rows. A 40 GB
+// stack read from VAST with 48 threads took as long with 4 MB as with 16 MB
+// (cold 7.2 and 7.6 s, warm 2.5 and 2.3 s), and a flip read transposes each
+// block from a buffer of this size.
+static const uint64_t imageJBlockBytes = (uint64_t)4 << 20;
+
+// Rows [r0, r0 + rows) of output slice k, read into buf in the file's row-major
+// layout, transposed into the column-major (y, x[, c], z) MATLAB output. Bit
+// copies, so the sample format does not matter.
+template <typename T>
+static void flipImageJBlockT(void* out, const uint8_t* buf, int64_t x, int64_t y, int64_t rows, int64_t r0,
+                             int64_t sliceOff, int64_t samples){
+    if(samples == 1) flipTransposeStrip<T>(static_cast<T*>(out), reinterpret_cast<const T*>(buf), x, y, rows, r0, sliceOff);
+    else flipTransposeStripRGB<T>(static_cast<T*>(out), reinterpret_cast<const T*>(buf), x, y, rows, r0, sliceOff, samples);
 }
 
-// Reading images saved by ImageJ
+static void flipImageJBlock(void* out, const uint8_t* buf, uint64_t x, uint64_t y, uint64_t rows, uint64_t r0,
+                            uint64_t k, uint64_t samples, uint64_t bytes){
+    const int64_t sliceOff = (int64_t)(k*x*y*samples);
+    switch(bytes){
+        case 1: flipImageJBlockT<uint8_t>(out, buf, (int64_t)x, (int64_t)y, (int64_t)rows, (int64_t)r0, sliceOff, (int64_t)samples); break;
+        case 2: flipImageJBlockT<uint16_t>(out, buf, (int64_t)x, (int64_t)y, (int64_t)rows, (int64_t)r0, sliceOff, (int64_t)samples); break;
+        case 4: flipImageJBlockT<uint32_t>(out, buf, (int64_t)x, (int64_t)y, (int64_t)rows, (int64_t)r0, sliceOff, (int64_t)samples); break;
+        case 8: flipImageJBlockT<uint64_t>(out, buf, (int64_t)x, (int64_t)y, (int64_t)rows, (int64_t)r0, sliceOff, (int64_t)samples); break;
+    }
+}
+
+// Reading images saved by ImageJ. ImageJ writes a stack as one directory and
+// then every slice, uncompressed and back to back, so the slices are read
+// straight from the file. Each thread opens the file itself and reads its own
+// contiguous run of the stack, in blocks of whole rows, with positioned reads
+// through libtiff's read procs (read() on Linux and macOS, ReadFile on Windows),
+// swapping the bytes of each block while it is in cache. A flip read reads each
+// block into a per-thread buffer and transposes it into the output from there.
+// One thread used to read the whole stack, a second pass then swapped it, and
+// a flip read made a copy of the whole stack to transpose it from: a 40 GB
+// stack took 48.9 s to read from VAST cold and 21.1 s warm.
 uint8_t readTiffParallelImageJ(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint8_t flipXY){
-    std::atomic<uint8_t> err{0};
-    FILE *fp = fopenPath(fileName, "rb");
-    if(!fp){ 
-		printf("File \"%s\" cannot be opened from Disk\n",fileName);
-		err = 1;
-		return err;
-	}
-    TIFF* tif = tiffOpenPath(fileName, "r");
+    (void)stripSize;
+    // ("m": the reads below go through read procs, so a memory map would go unused)
+    TiffPtr tif(tiffOpenPath(fileName, "rm"));
     if(!tif){
-		printf("File \"%s\" cannot be opened\n",fileName);
-		fclose(fp);
-		err = 1;
-		return err;
-	}
+        printf("File \"%s\" cannot be opened\n", fileName);
+        return 1;
+    }
     uint64_t* offsets = NULL;
-    TIFFGetField(tif, TIFFTAG_STRIPOFFSETS, &offsets);
+    TIFFGetField(tif.get(), TIFFTAG_STRIPOFFSETS, &offsets);
     if(!offsets){
         printf("Could not get offsets from the tiff file\n");
-        TIFFClose(tif);
-        fclose(fp);
-        err = 1;
-        return err;
+        return 1;
     }
-    const uint64_t offset = offsets[0];
-
+    const uint64_t dataOffset = offsets[0];
     // ImageJ RGB stacks are chunky interleaved (spp=3), so every size below
     // scales by samples. Grayscale (samples==1) is unchanged.
     uint16_t spp = 1;
-    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
-    const uint64_t samples = spp;
-
-    // The raw fread below bypasses libtiff, so swap bytes only when the file's
-    // byte order differs from the host's (ImageJ itself writes big-endian, but
-    // other programs write ImageJ-format files little-endian).
-    const int needSwap = TIFFIsByteSwapped(tif);
-
-    TIFFClose(tif);
-
-    uint64_t bytes = bits/8;
-    // The data is one contiguous block, so a z-range is just an offset into it.
-    if(seekFile(fp, offset + startSlice*x*y*samples*bytes)){
-        printf("File \"%s\": cannot seek to the image data\n",fileName);
-        fclose(fp);
-        err = 1;
-        return err;
+    TIFFGetFieldDefaulted(tif.get(), TIFFTAG_SAMPLESPERPIXEL, &spp);
+    const uint64_t samples = spp, bytes = bits/8;
+    // The reads bypass libtiff, so bytes are swapped only when the file's byte
+    // order differs from the host's (ImageJ itself writes big-endian, but other
+    // programs write ImageJ-format files little-endian).
+    const bool swap = bytes > 1 && TIFFIsByteSwapped(tif.get());
+    const uint64_t fileSize = (uint64_t)TIFFGetSizeProc(tif.get())(TIFFClientdata(tif.get()));
+    tif.reset();
+    const uint64_t rowBytes = x*samples*bytes, sliceBytes = y*rowBytes;
+    if(!sliceBytes || !z) return 0;
+    // A stack cut short, as an interrupted copy leaves it, is an error rather
+    // than the rest of the output left unread.
+    if(dataOffset + (startSlice + z)*sliceBytes > fileSize){
+        printf("File \"%s\" ends before its image data does\n", fileName);
+        return 1;
     }
-    //#pragma omp parallel for
-    /*
-    for(uint64_t i = 0; i < z; i++){
-    uint64_t cOffset = x*y*bytes*i;
-    //pread(fd,tiff+cOffset,x*y*bytes,offset+cOffset);
-    read(fd,tiff+cOffset,x*y*bytes);
-    }*/
-    // fread at most INT_MAX bytes at a time. A short read means the file ends
-    // before its image data does (e.g. an interrupted copy), so report that
-    // instead of retrying forever or returning the unread part of the buffer.
-    const uint64_t tBytes = x*y*z*samples*bytes;
-    uint64_t chunk = 0;
-    while(chunk < tBytes){
-        const uint64_t want = std::min<uint64_t>(tBytes - chunk, INT_MAX);
-        const uint64_t got = fread(static_cast<uint8_t*>(tiff)+chunk,1,want,fp);
-        chunk += got;
-        if(got < want) break;
-    }
-    fclose(fp);
-    if(chunk < tBytes){
-        printf("File \"%s\" ends before its image data does\n",fileName);
-        err = 1;
-        return err;
-    }
-    // Swap endianess for types greater than 8 bits when the file's byte order
-    // differs from the host's.
-    if(bits > 8 && needSwap){
-        #pragma omp parallel for
-        for(uint64_t i = 0; i < x*y*z*samples; i++){
-            switch(bits){
-                case 16:
-                    //((uint16_t*)tiff)[i] = ((((uint16_t*)tiff)[i] & 0xff) >> 8) | (((uint16_t*)tiff)[i] << 8);
-                    //((uint16_t*)tiff)[i] = bswap_16(((uint16_t*)tiff)[i]);
-                    ((uint16_t*)tiff)[i] = ((((uint16_t*)tiff)[i] << 8) & 0xff00) | ((((uint16_t*)tiff)[i] >> 8) & 0x00ff);
+
+    // Each slice is cut into blocks of equal numbers of rows (the last may have
+    // fewer), and thread w reads blocks [blocks*w/team, blocks*(w+1)/team) in
+    // file order: one sequential stream per thread.
+    const uint64_t cuts = std::min<uint64_t>(y, std::max<uint64_t>(1, (sliceBytes + imageJBlockBytes - 1)/imageJBlockBytes));
+    const uint64_t blockRows = (y + cuts - 1)/cuts, sliceBlocks = (y + blockRows - 1)/blockRows;
+    const uint64_t blocks = z*sliceBlocks;
+    // Every thread is in the team, those without blocks only waiting at the end
+    // (see readTiffParallel: libgomp restarts the threads a smaller team leaves out).
+    const int32_t pool = std::max(1, omp_get_max_threads());
+    const uint64_t team = std::min<uint64_t>((uint64_t)pool, blocks);
+    std::atomic<uint8_t> err{0};
+    #pragma omp parallel num_threads(pool)
+    {
+        const uint64_t w = (uint64_t)omp_get_thread_num();
+        if(w < team){
+            TiffPtr own(tiffOpenPath(fileName, "rm"));
+            for(int tries = 0; !own && tries < 3; tries++) own.reset(tiffOpenPath(fileName, "rm"));
+            uint8_t none = 0;
+            if(!own && err.compare_exchange_strong(none, 1))
+                printf("Thread %d: TIFFOpen failed for \"%s\"\n", (int)w, fileName);
+            std::vector<uint8_t> buffer(own && flipXY ? blockRows*rowBytes : 0);
+            const uint64_t first = blocks*w/team, last = blocks*(w + 1)/team;
+            for(uint64_t b = first; own && b < last && !err; b++){
+                const uint64_t k = b/sliceBlocks, r0 = (b % sliceBlocks)*blockRows;
+                const uint64_t rows = std::min<uint64_t>(blockRows, y - r0), n = rows*rowBytes;
+                uint8_t* dst = flipXY ? buffer.data() : static_cast<uint8_t*>(tiff) + k*sliceBytes + r0*rowBytes;
+                const toff_t at = (toff_t)(dataOffset + (startSlice + k)*sliceBytes + r0*rowBytes);
+                thandle_t h = TIFFClientdata(own.get());
+                if(TIFFGetSeekProc(own.get())(h, at, SEEK_SET) != at || (uint64_t)TIFFGetReadProc(own.get())(h, dst, (tmsize_t)n) != n){
+                    none = 0;
+                    if(err.compare_exchange_strong(none, 1))
+                        printf("File \"%s\" ends before its image data does\n", fileName);
                     break;
-                case 32:
-                    //((num & 0xff000000) >> 24) | ((num & 0x00ff0000) >> 8) | ((num & 0x0000ff00) << 8) | (num << 24)
-                    //((float*)tiff)[i] = bswap_32(((float*)tiff)[i]);
-                    ((uint32_t*)tiff)[i] = ((((uint32_t*)tiff)[i] << 24) & 0xff000000 ) |
-                        ((((uint32_t*)tiff)[i] <<  8) & 0x00ff0000 ) |
-                        ((((uint32_t*)tiff)[i] >>  8) & 0x0000ff00 ) |
-                        ((((uint32_t*)tiff)[i] >> 24) & 0x000000ff );
-                    break;
-                case 64:
-                    //((double*)tiff)[i] = bswap_64(((double*)tiff)[i]);
-                    ((uint64_t*)tiff)[i] = ( (((uint64_t*)tiff)[i] << 56) & 0xff00000000000000UL ) |
-                        ( (((uint64_t*)tiff)[i] << 40) & 0x00ff000000000000UL ) |
-                        ( (((uint64_t*)tiff)[i] << 24) & 0x0000ff0000000000UL ) |
-                        ( (((uint64_t*)tiff)[i] <<  8) & 0x000000ff00000000UL ) |
-                        ( (((uint64_t*)tiff)[i] >>  8) & 0x00000000ff000000UL ) |
-                        ( (((uint64_t*)tiff)[i] >> 24) & 0x0000000000ff0000UL ) |
-                        ( (((uint64_t*)tiff)[i] >> 40) & 0x000000000000ff00UL ) |
-                        ( (((uint64_t*)tiff)[i] >> 56) & 0x00000000000000ffUL );
-                    break;
-            }
-
-        }
-    }
-    // Find a way to do this in-place without making a copy
-    if(flipXY){
-        uint64_t size = x*y*z*samples*(bits/8);
-        void* tiffC = malloc(size);
-        memcpy(tiffC,tiff,size);
-        if(samples == 1){
-        #pragma omp parallel for
-        for(uint64_t k = 0; k < z; k++){
-            for(uint64_t j = 0; j < x; j++){
-                for(uint64_t i = 0; i < y; i++){
-                    switch(bits){
-                        case 8:
-                            ((uint8_t*)tiff)[i+(j*y)+(k*x*y)] = ((uint8_t*)tiffC)[j+(i*x)+(k*x*y)];
-                            break;
-                        case 16:
-                            ((uint16_t*)tiff)[i+(j*y)+(k*x*y)] = ((uint16_t*)tiffC)[j+(i*x)+(k*x*y)];
-                            break;
-                        case 32:
-                            ((float*)tiff)[i+(j*y)+(k*x*y)] = ((float*)tiffC)[j+(i*x)+(k*x*y)];
-                            break;
-                        case 64:
-                            ((double*)tiff)[i+(j*y)+(k*x*y)] = ((double*)tiffC)[j+(i*x)+(k*x*y)];
-                            break;
+                }
+                if(swap){
+                    switch(bytes){
+                        case 2: TIFFSwabArrayOfShort(reinterpret_cast<uint16_t*>(dst), (tmsize_t)(n/2)); break;
+                        case 4: TIFFSwabArrayOfLong(reinterpret_cast<uint32_t*>(dst), (tmsize_t)(n/4)); break;
+                        case 8: TIFFSwabArrayOfLong8(reinterpret_cast<uint64_t*>(dst), (tmsize_t)(n/8)); break;
                     }
                 }
+                if(flipXY) flipImageJBlock(tiff, dst, x, y, rows, r0, k, samples, bytes);
             }
         }
-        }
-        else{
-            // De-interleave each chunky slice into the column-major (y,x,c,z)
-            // MATLAB layout, same mapping as the strip readers use.
-            #pragma omp parallel for
-            for(uint64_t k = 0; k < z; k++){
-                const uint64_t off = k*x*y*samples;
-                switch(bits){
-                    case 8:
-                        flipTransposeStripRGB<uint8_t>((uint8_t*)tiff, (uint8_t*)tiffC + off, x, y, y, 0, off, samples);
-                        break;
-                    case 16:
-                        flipTransposeStripRGB<uint16_t>((uint16_t*)tiff, (uint16_t*)tiffC + off, x, y, y, 0, off, samples);
-                        break;
-                    case 32:
-                        flipTransposeStripRGB<float>((float*)tiff, (float*)tiffC + off, x, y, y, 0, off, samples);
-                        break;
-                    case 64:
-                        flipTransposeStripRGB<double>((double*)tiff, (double*)tiffC + off, x, y, y, 0, off, samples);
-                        break;
-                }
-            }
-        }
-        free(tiffC);
     }
-	return err;
+    return err;
 }
 
 
