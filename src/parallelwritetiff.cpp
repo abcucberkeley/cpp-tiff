@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -547,37 +548,82 @@ int bfMap(thandle_t, void**, toff_t*){ return 0; }
 void bfUnmap(thandle_t, void*, toff_t){}
 #endif
 
-// The directories-first layout's metadata, written by the writer itself after
-// libtiff has written the directories (CPPTIFF_WF_PATCH=close, a prototype):
-// the file's first bytes, its header and every slice's directory as libtiff
-// wrote them with their strip (or tile) arrays deferred, then every slice's
-// arrays. The deferred entries are pointed at their arrays here (or hold the
-// value itself, for one strip a slice), the image data goes after all of it,
-// and at the end the arrays are filled in and the whole of it written again,
-// once: no directory is read back or rewritten slice by slice. A write cut
-// short leaves every slice's arrays empty.
-class FirstDirectories {
+// A file in memory, for libtiff to write a stack's directories into (see
+// DirectoriesFirst)
+struct MemFile {
+    std::vector<uint8_t> buf;
+    uint64_t pos = 0;
+};
+tmsize_t mfRead(thandle_t h, void* p, tmsize_t n){
+    MemFile* m = static_cast<MemFile*>(h);
+    const uint64_t k = m->pos >= m->buf.size() ? 0 : std::min<uint64_t>((uint64_t)n, m->buf.size() - m->pos);
+    if(k) memcpy(p, m->buf.data() + m->pos, (size_t)k);
+    m->pos += k;
+    return (tmsize_t)k;
+}
+tmsize_t mfWrite(thandle_t h, void* p, tmsize_t n){
+    MemFile* m = static_cast<MemFile*>(h);
+    if(m->pos + (uint64_t)n > m->buf.size()) m->buf.resize((size_t)(m->pos + (uint64_t)n), 0);
+    memcpy(m->buf.data() + m->pos, p, (size_t)n);
+    m->pos += (uint64_t)n;
+    return n;
+}
+toff_t mfSeek(thandle_t h, toff_t off, int whence){
+    MemFile* m = static_cast<MemFile*>(h);
+    m->pos = whence == SEEK_SET ? off : whence == SEEK_CUR ? m->pos + off : m->buf.size() + off;
+    return m->pos;
+}
+int mfClose(thandle_t){ return 0; }
+toff_t mfSize(thandle_t h){ return static_cast<MemFile*>(h)->buf.size(); }
+int mfMap(thandle_t, void**, toff_t*){ return 0; }
+void mfUnmap(thandle_t, void*, toff_t){}
+
+// The layout mode "w" writes: every slice's directory, then their strip (or
+// tile) arrays, all before the image data, as GDAL writes cloud-optimized
+// TIFFs, so that a reader finds every directory in the first megabytes of the
+// file instead of one after each slice's data (a walk of a stack's directories
+// cold from network storage took a read for each). libtiff writes the
+// directories into memory, with their arrays deferred; here the arrays are laid
+// out after them and every link to a directory (the header's to the first,
+// each directory's to the next) is 0, and all of it goes to the start of the
+// file. As each slice is finished, its data in the file, its arrays are filled
+// in and then its directory is linked (finish), so that a file cut short (a
+// write killed, a full disk) holds exactly the slices that were finished, as a
+// file of the old layout (mode "wc") does: a directory not yet linked is never
+// read. The directories are written by libtiff, the rest by the writer itself:
+// no directory is read back. Every slice has the same tags, so libtiff writes
+// the first three directories and the others are copies of the first, if the
+// second and third are (libtiff took 5 us a directory: 0.012 s of a 0.1 s write
+// of 2,500 slices of 128 KB to /dev/shm, before any data could be written);
+// a value outside its entry would be at another place in each directory (none
+// of setTags's is: each fits in its 8 bytes), and then libtiff writes them all.
+class DirectoriesFirst {
 public:
-    // Reads back what libtiff wrote and lays out the arrays after it; false if
-    // the directories are not as libtiff writes them (BigTIFF in this machine's
-    // byte order, with deferred arrays).
-    bool init(TIFF* tif, uint64_t slices, uint64_t chunks, bool tiled){
-        if(!TIFFIsBigTIFF(tif) || TIFFIsByteSwapped(tif)) return false;
-        thandle_t h = TIFFClientdata(tif);
-        const uint64_t end = (uint64_t)TIFFGetSeekProc(tif)(h, 0, SEEK_END);
-        meta_.resize(end);
-        if(TIFFGetSeekProc(tif)(h, 0, SEEK_SET) != 0 || (uint64_t)TIFFGetReadProc(tif)(h, meta_.data(), (tmsize_t)end) != end) return false;
+    // The stack's directories as libtiff writes them (setTags sets a
+    // directory's tags), and the arrays after them; false (with why) if they
+    // are not as libtiff writes them (BigTIFF in this machine's byte order,
+    // with deferred arrays).
+    bool build(uint64_t slices, uint64_t chunks, bool tiled, const std::function<void(TIFF*)>& setTags, const char*& why){
+        // (CPPTIFF_COPY_DIRECTORIES=0: libtiff writes every one, for tests)
+        const char* copyEnv = getenv("CPPTIFF_COPY_DIRECTORIES");
+        const bool copy = slices > 3 && !(copyEnv && !strcmp(copyEnv, "0"));
+        if(!(copy && libtiffDirs(3, tiled, setTags, why) && copyDirs(slices)) && !libtiffDirs(slices, tiled, setTags, why)) return false;
+        why = "the directories are not as libtiff writes them";
+        const uint64_t end = meta_.size();
+        meta_.reserve((end + 7)/8*8 + (chunks > 1 ? 2*slices*chunks*8 : 0));
         meta_.resize((end + 7)/8*8, 0);
         where_.assign(2*slices, 0);
+        nextAt_.assign(slices, 0);
         chunks_ = chunks;
         const uint16_t tags[2] = {(uint16_t)(tiled ? TIFFTAG_TILEOFFSETS : TIFFTAG_STRIPOFFSETS),
                                   (uint16_t)(tiled ? TIFFTAG_TILEBYTECOUNTS : TIFFTAG_STRIPBYTECOUNTS)};
         const uint16_t long8 = TIFF_LONG8;
         for(uint64_t s = 0; s < slices; s++){
-            uint64_t off = 0, n = 0;
-            if(!_TIFFGetOffsetFromDirNumber(tif, (tdir_t)s, &off) || off + 8 > end) return false;
+            const uint64_t off = ifdAt_[s];
+            uint64_t n = 0;
+            if(off + 8 > end) return false;
             memcpy(&n, &meta_[off], 8);
-            if(off + 8 + n*20 > end) return false;
+            if(off + 8 + n*20 + 8 > end) return false;
             int found = 0;
             for(uint64_t i = 0; i < n; i++){
                 const uint64_t e = off + 8 + i*20;   // (the entry: tag, type, count, then the value or where it is)
@@ -600,18 +646,27 @@ public:
                 }
             }
             if(found != 2) return false;
+            nextAt_[s] = off + 8 + n*20;
         }
+        // (every link 0 until its slice is finished)
+        const uint64_t zero = 0;
+        memcpy(&meta_[8], &zero, 8);
+        for(uint64_t s = 0; s < slices; s++) memcpy(&meta_[nextAt_[s]], &zero, 8);
+        why = "";
         return true;
     }
     // Where the image data starts
     uint64_t dataStart() const { return meta_.size(); }
+    // Chunk c of slice s is at offset, bytes long
     void set(uint64_t s, uint64_t c, uint64_t offset, uint64_t bytes){
         memcpy(&meta_[where_[2*s] + c*8], &offset, 8);
         memcpy(&meta_[where_[2*s + 1] + c*8], &bytes, 8);
     }
-    // Writes the arrays of slices [s0, s1) where they are (the bytes between
-    // them are as written before, so the run is written whole)
-    bool writeRange(TIFF* tif, uint64_t s0, uint64_t s1) const {
+    // Writes all of it at the start of the file (every directory unlinked)
+    bool writeAll(TIFF* tif) const { return put(tif, 0, meta_.size()); }
+    // Slices [s0, s1), their data in the file: their arrays written, then the
+    // links to their directories
+    bool finish(TIFF* tif, uint64_t s0, uint64_t s1){
         if(s0 >= s1) return true;
         uint64_t a = UINT64_MAX, b = 0;
         for(uint64_t s = s0; s < s1; s++)
@@ -619,19 +674,72 @@ public:
                 a = std::min<uint64_t>(a, where_[2*s + k]);
                 b = std::max<uint64_t>(b, where_[2*s + k] + chunks_*8);
             }
+        if(!put(tif, a, b)) return false;
+        a = UINT64_MAX; b = 0;
+        for(uint64_t s = s0; s < s1; s++){
+            const uint64_t at = s ? nextAt_[s - 1] : 8;
+            memcpy(&meta_[at], &ifdAt_[s], 8);
+            a = std::min<uint64_t>(a, at);
+            b = std::max<uint64_t>(b, at + 8);
+        }
+        return put(tif, a, b);
+    }
+private:
+    // libtiff writes k directories into memory: meta_, and where each is
+    bool libtiffDirs(uint64_t k, bool tiled, const std::function<void(TIFF*)>& setTags, const char*& why){
+        MemFile mem;
+        TIFF* m = TIFFClientOpen("directories", "w8", (thandle_t)&mem, mfRead, mfWrite, mfSeek, mfClose, mfSize, mfMap, mfUnmap);
+        if(!m){ why = "the directories could not be made (out of memory?)"; return false; }
+        bool ok = true;
+        for(uint64_t s = 0; s < k && ok; s++){
+            setTags(m);
+            ok = TIFFDeferStrileArrayWriting(m) && TIFFWriteCheck(m, tiled ? 1 : 0, "writeSlices") && TIFFWriteDirectory(m);
+        }
+        ifdAt_.assign(k, 0);
+        for(uint64_t s = 0; s < k && ok; s++) ok = _TIFFGetOffsetFromDirNumber(m, (tdir_t)s, &ifdAt_[s]) != 0;
+        ok = ok && TIFFIsBigTIFF(m) && !TIFFIsByteSwapped(m);
+        meta_.swap(mem.buf);
+        TIFFClose(m);
+        if(!ok) why = "the directories could not be made (out of memory?)";
+        return ok;
+    }
+    // libtiff's first three directories (meta_) made into the stack's: the
+    // first copied for every slice, each the same distance after the one
+    // before; false if libtiff's second and third are not such copies (their
+    // links aside, which build sets to 0)
+    bool copyDirs(uint64_t slices){
+        if(ifdAt_.size() != 3 || ifdAt_[1] <= ifdAt_[0] || ifdAt_[2] <= ifdAt_[1]) return false;
+        const uint64_t at = ifdAt_[0], stride = ifdAt_[1] - at, len = meta_.size() - ifdAt_[2];
+        uint64_t n = 0;
+        if(ifdAt_[2] - ifdAt_[1] != stride || len > stride || len < 16) return false;
+        memcpy(&n, &meta_[at], 8);
+        if(n > (len - 16)/20) return false;
+        const uint64_t link = 8 + n*20;   // (where in a directory its link to the next is)
+        for(uint64_t k = 1; k < 3; k++)
+            if(memcmp(&meta_[ifdAt_[k]], &meta_[at], link) || memcmp(&meta_[ifdAt_[k] + link + 8], &meta_[at + link + 8], len - link - 8)) return false;
+        for(uint64_t k = 0; k < 2; k++)
+            for(uint64_t i = ifdAt_[k] + len; i < ifdAt_[k + 1]; i++)
+                if(meta_[i]) return false;
+        std::vector<uint8_t> all(at + (slices - 1)*stride + len, 0);
+        memcpy(all.data(), meta_.data(), at);   // (the header)
+        ifdAt_.resize(slices);
+        for(uint64_t s = 0; s < slices; s++){
+            ifdAt_[s] = at + s*stride;
+            memcpy(&all[ifdAt_[s]], &meta_[at], len);
+        }
+        meta_.swap(all);
+        return true;
+    }
+    // meta_[a, b) to the file, where it is
+    bool put(TIFF* tif, uint64_t a, uint64_t b) const {
         thandle_t h = TIFFClientdata(tif);
         return TIFFGetSeekProc(tif)(h, (toff_t)a, SEEK_SET) == (toff_t)a
                && (uint64_t)TIFFGetWriteProc(tif)(h, (void*)&meta_[a], (tmsize_t)(b - a)) == b - a;
     }
-    // Writes all of it at the start of the file
-    bool write(TIFF* tif) const {
-        thandle_t h = TIFFClientdata(tif);
-        return TIFFGetSeekProc(tif)(h, 0, SEEK_SET) == 0
-               && (uint64_t)TIFFGetWriteProc(tif)(h, (void*)meta_.data(), (tmsize_t)meta_.size()) == meta_.size();
-    }
-private:
     std::vector<uint8_t> meta_;
-    std::vector<uint64_t> where_;   // per slice: where in meta_ its offsets go, then its byte counts
+    std::vector<uint64_t> where_;    // per slice: where in meta_ its offsets go, then its byte counts
+    std::vector<uint64_t> ifdAt_;    // per slice: where its directory is
+    std::vector<uint64_t> nextAt_;   // per slice: where its directory's link to the next is
     uint64_t chunks_ = 0;
 };
 
@@ -655,32 +763,40 @@ struct ChunkClaims {
     }
 };
 
-// Write every slice in order: tags, its chunks (waiting for producers unless
+// Write every slice in order: its chunks (waiting for producers unless
 // produceInline, where this thread makes each chunk just before writing it),
-// then its directory. writerChunk tells producers how far the writer is;
-// while it waits, the writer prepares chunks from claims, if given.
-// Returns 0 on success.
+// and in mode "w" its arrays and the link to its directory (every directory is
+// written first: see DirectoriesFirst), in "wc" and "a" then its directory.
+// writerChunk tells producers how far the writer is; while it waits, the
+// writer prepares chunks from claims, if given. Returns 0 on success.
 uint8_t writeSlices(const WriteJob& j, const char* fileName, const char* mode, Chunk* chunks,
                     std::atomic<int64_t>& writerChunk, std::atomic<bool>& failed,
                     bool produceInline, uint8_t* scratch, BufferPool* pool, ChunkClaims* claims){
-    if(strcmp(mode,"w") && strcmp(mode,"wf") && strcmp(mode,"a")){
-        printf("Error: mode \"%s\" is not supported. Use w, wf or a for mode type\n", mode);
+    // "w": a new file, every directory first; "wc": a new file of the old
+    // layout, each slice's directory after its data; "a": slices added to a
+    // file, as "wc" writes them ("wf", the prototype's name, is "w")
+    if(strcmp(mode,"w") && strcmp(mode,"wc") && strcmp(mode,"wf") && strcmp(mode,"a")){
+        printf("Error: mode \"%s\" is not supported. Use w, wc or a for mode type\n", mode);
         failed = true;
         return 1;
     }
     const bool append = !strcmp(mode,"a");
-    // "wf": a new file with every directory first (see below)
-    const bool dirsFirst = !strcmp(mode,"wf");
-    // (CPPTIFF_WF_PATCH=close: the arrays written by the writer itself at the
-    // end; =N: by the writer itself after every N slices, the slices' data sent
-    // first, so that a write cut short leaves every finished slice readable,
-    // with no directory read back; unset: by libtiff, slice by slice)
-    const char* patchEnv = getenv("CPPTIFF_WF_PATCH");
-    const uint64_t patchEvery = patchEnv && *patchEnv && strcmp(patchEnv, "close") ? std::max<uint64_t>(1, strtoull(patchEnv, NULL, 10)) : 0;
-    const bool patchAtClose = dirsFirst && patchEnv && (!strcmp(patchEnv, "close") || patchEvery);
-    uint64_t patchedTo = 0;   // (slices whose arrays are written)
-    FirstDirectories firstDirs;
-    uint64_t dataAt = 0;   // (with patchAtClose: where the next chunk goes)
+    const bool dirsFirst = !strcmp(mode,"w") || !strcmp(mode,"wf");
+    // (directories first: the finished slices are linked once at least
+    // kLinkBytes of their data has been written since the last link, and at the
+    // end, so that slices of 1 MB or more are linked one by one: linked one at a
+    // time, 2,500 uncompressed slices of 128 KB took 1.02-1.03 times as long to
+    // write to a local SSD and to /dev/shm, three system calls more a slice (its
+    // data sent, its arrays and its link). A write cut short loses at most 1 MB
+    // of its last finished slices, where the classic layout's queue of small
+    // strips holds up to 64 MB. CPPTIFF_LINK_SLICES=N links every N slices
+    // instead, for tests.)
+    const uint64_t kLinkBytes = (uint64_t)1 << 20;
+    const char* linkEnv = getenv("CPPTIFF_LINK_SLICES");
+    const uint64_t linkEvery = linkEnv && *linkEnv ? std::max<uint64_t>(1, strtoull(linkEnv, NULL, 10)) : 0;
+    uint64_t linkedTo = 0, linkedAt = 0;   // (slices finished and linked, and where their data ended)
+    DirectoriesFirst firstDirs;
+    uint64_t dataAt = 0;   // (directories first: where the next chunk goes)
     TIFF* tif = NULL;
 #ifndef _WIN32
     // Uncompressed row-major strips come straight from the caller's array,
@@ -701,7 +817,7 @@ uint8_t writeSlices(const WriteJob& j, const char* fileName, const char* mode, C
     const char* what = "";
     // Explicit type tag: caller-provided format, or derive from bits for legacy callers.
     const uint16_t sf = j.sampleFormat ? j.sampleFormat : (j.bits >= 32 ? SAMPLEFORMAT_IEEEFP : SAMPLEFORMAT_UINT);
-    auto setTags = [&](){
+    auto setTags = [&](TIFF* tif){
         TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, (uint32_t)j.x);
         TIFFSetField(tif, TIFFTAG_IMAGELENGTH, (uint32_t)j.y);
         TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, (uint16_t)j.bits);
@@ -723,33 +839,15 @@ uint8_t writeSlices(const WriteJob& j, const char* fileName, const char* mode, C
         }
         TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT, sf);
     };
-    // Directories first: every slice's directory, then their strip (or tile)
-    // arrays, still zeros, all before the image data, as GDAL writes cloud-
-    // optimized TIFFs, so that a reader finds every directory in the first
-    // megabytes of the file instead of one after each slice's data. Each
-    // slice's arrays are filled in where they are once its data is written
-    // (TIFFFlush rewrites only them).
+    // Directories first (see DirectoriesFirst): every directory, unlinked, at
+    // the start of the file, and the data after it
     if(dirsFirst){
-        for(uint64_t s = 0; s < j.nSlices && !err; s++){
-            setTags();
-            if(!TIFFDeferStrileArrayWriting(tif) || !TIFFWriteCheck(tif, j.tileSize != 0, "writeSlices") || !TIFFWriteDirectory(tif)){
-                err = 1; what = "a directory could not be written (disk full or I/O error?)";
-            }
-        }
-        if(patchAtClose){
-            if(!err && !(firstDirs.init(tif, j.nSlices, j.chunksPerSlice, j.tileSize != 0) && firstDirs.write(tif))){
-                err = 1; what = "the directories could not be laid out first (I/O error?)";
-            }
-            dataAt = firstDirs.dataStart();
-        }
-        else for(uint64_t s = 0; s < j.nSlices && !err; s++)
-            if(!TIFFSetDirectory(tif, (tdir_t)s) || !TIFFForceStrileArrayWriting(tif)){
-                err = 1; what = "a directory's strip arrays could not be written (disk full or I/O error?)";
-            }
+        if(!firstDirs.build(j.nSlices, j.chunksPerSlice, j.tileSize != 0, setTags, what)) err = 1;
+        else if(!firstDirs.writeAll(tif)){ err = 1; what = "the directories could not be written (disk full or I/O error?)"; }
+        dataAt = linkedAt = firstDirs.dataStart();
     }
     for(uint64_t s = 0; s < j.nSlices && !err; s++){
-        if(!dirsFirst) setTags();
-        else if(!patchAtClose && !TIFFSetDirectory(tif, (tdir_t)s)){ err = 1; what = "a directory could not be read back (I/O error?)"; break; }
+        if(!dirsFirst) setTags(tif);
 
         for(uint64_t c = 0; c < j.chunksPerSlice; c++){
             const uint8_t* p;
@@ -777,7 +875,7 @@ uint8_t writeSlices(const WriteJob& j, const char* fileName, const char* mode, C
                 p = ch->data;
             }
             tmsize_t w = -1;
-            if(patchAtClose){
+            if(dirsFirst){
                 thandle_t h = TIFFClientdata(tif);
                 if(TIFFGetSeekProc(tif)(h, (toff_t)dataAt, SEEK_SET) == (toff_t)dataAt && TIFFGetWriteProc(tif)(h, (void*)p, (tmsize_t)n) == (tmsize_t)n){
                     firstDirs.set(s, c, dataAt, (uint64_t)n);
@@ -790,30 +888,23 @@ uint8_t writeSlices(const WriteJob& j, const char* fileName, const char* mode, C
             if(ch){ pool->put(ch->data); ch->data = NULL; }
             if(w != (tmsize_t)n){ err = 1; what = "a strip could not be written (disk full or I/O error?)"; break; }
         }
-#ifndef _WIN32
-        // (directories first: the slice's data sent before libtiff writes the
-        // arrays that point to it, so that a write cut short leaves each slice
-        // whole or with empty arrays: killed with small strips still queued, a
-        // write of 20,000 slices had left up to 5,295 of them with arrays past
-        // the end of the file)
-        if(!err && dirsFirst && !patchAtClose && !io.flush()){ err = 1; what = "a strip could not be written (disk full or I/O error?)"; }
-#endif
-        if(!err && !patchAtClose && !(dirsFirst ? TIFFFlush(tif) : TIFFWriteDirectory(tif))){ err = 1; what = "a directory could not be written (disk full or I/O error?)"; }
-        if(!err && patchAtClose && patchEvery && ((s + 1) % patchEvery == 0 || s + 1 == j.nSlices)){
+        if(!err && !dirsFirst && !TIFFWriteDirectory(tif)){ err = 1; what = "a directory could not be written (disk full or I/O error?)"; }
+        // Directories first: the finished slices' data sent first (it may wait
+        // in the queue), then their arrays, then the links to them, so that a
+        // write cut short never links a slice whose data or arrays are not in
+        // the file (written before the queue went out, the arrays had pointed
+        // past the end of the file for a quarter of the slices of a write of
+        // 20,000 killed near its end)
+        const bool linkNow = s + 1 == j.nSlices || (linkEvery ? (s + 1) % linkEvery == 0 : dataAt - linkedAt >= kLinkBytes);
+        if(!err && dirsFirst && linkNow){
 #ifndef _WIN32
             if(!io.flush()){ err = 1; what = "a strip could not be written (disk full or I/O error?)"; break; }
 #endif
-            if(!firstDirs.writeRange(tif, patchedTo, s + 1)){ err = 1; what = "the strip arrays could not be written (disk full or I/O error?)"; break; }
-            patchedTo = s + 1;
+            if(!firstDirs.finish(tif, linkedTo, s + 1)){ err = 1; what = "a directory could not be linked (disk full or I/O error?)"; break; }
+            linkedTo = s + 1;
+            linkedAt = dataAt;
         }
     }
-#ifndef _WIN32
-    // (the data sent before the arrays that point to it: killed between the
-    // two, a write had left a quarter of its slices with arrays past the end of
-    // the file)
-    if(!err && patchAtClose && patchedTo < j.nSlices && !io.flush()){ err = 1; what = "a strip could not be written (disk full or I/O error?)"; }
-#endif
-    if(!err && patchAtClose && patchedTo < j.nSlices && !firstDirs.write(tif)){ err = 1; what = "the strip arrays could not be written (disk full or I/O error?)"; }
     if(!err && !TIFFFlush(tif)){ err = 1; what = "the file could not be flushed (disk full or I/O error?)"; }
     TIFFClose(tif);
 #ifndef _WIN32
