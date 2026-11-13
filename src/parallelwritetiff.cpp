@@ -569,6 +569,7 @@ public:
         if(TIFFGetSeekProc(tif)(h, 0, SEEK_SET) != 0 || (uint64_t)TIFFGetReadProc(tif)(h, meta_.data(), (tmsize_t)end) != end) return false;
         meta_.resize((end + 7)/8*8, 0);
         where_.assign(2*slices, 0);
+        chunks_ = chunks;
         const uint16_t tags[2] = {(uint16_t)(tiled ? TIFFTAG_TILEOFFSETS : TIFFTAG_STRIPOFFSETS),
                                   (uint16_t)(tiled ? TIFFTAG_TILEBYTECOUNTS : TIFFTAG_STRIPBYTECOUNTS)};
         const uint16_t long8 = TIFF_LONG8;
@@ -608,6 +609,20 @@ public:
         memcpy(&meta_[where_[2*s] + c*8], &offset, 8);
         memcpy(&meta_[where_[2*s + 1] + c*8], &bytes, 8);
     }
+    // Writes the arrays of slices [s0, s1) where they are (the bytes between
+    // them are as written before, so the run is written whole)
+    bool writeRange(TIFF* tif, uint64_t s0, uint64_t s1) const {
+        if(s0 >= s1) return true;
+        uint64_t a = UINT64_MAX, b = 0;
+        for(uint64_t s = s0; s < s1; s++)
+            for(int k = 0; k < 2; k++){
+                a = std::min<uint64_t>(a, where_[2*s + k]);
+                b = std::max<uint64_t>(b, where_[2*s + k] + chunks_*8);
+            }
+        thandle_t h = TIFFClientdata(tif);
+        return TIFFGetSeekProc(tif)(h, (toff_t)a, SEEK_SET) == (toff_t)a
+               && (uint64_t)TIFFGetWriteProc(tif)(h, (void*)&meta_[a], (tmsize_t)(b - a)) == b - a;
+    }
     // Writes all of it at the start of the file
     bool write(TIFF* tif) const {
         thandle_t h = TIFFClientdata(tif);
@@ -617,6 +632,7 @@ public:
 private:
     std::vector<uint8_t> meta_;
     std::vector<uint64_t> where_;   // per slice: where in meta_ its offsets go, then its byte counts
+    uint64_t chunks_ = 0;
 };
 
 // Hands out the chunks to prepare, in file order. A producer takes the next
@@ -655,8 +671,14 @@ uint8_t writeSlices(const WriteJob& j, const char* fileName, const char* mode, C
     const bool append = !strcmp(mode,"a");
     // "wf": a new file with every directory first (see below)
     const bool dirsFirst = !strcmp(mode,"wf");
+    // (CPPTIFF_WF_PATCH=close: the arrays written by the writer itself at the
+    // end; =N: by the writer itself after every N slices, the slices' data sent
+    // first, so that a write cut short leaves every finished slice readable,
+    // with no directory read back; unset: by libtiff, slice by slice)
     const char* patchEnv = getenv("CPPTIFF_WF_PATCH");
-    const bool patchAtClose = dirsFirst && patchEnv && !strcmp(patchEnv, "close");
+    const uint64_t patchEvery = patchEnv && *patchEnv && strcmp(patchEnv, "close") ? std::max<uint64_t>(1, strtoull(patchEnv, NULL, 10)) : 0;
+    const bool patchAtClose = dirsFirst && patchEnv && (!strcmp(patchEnv, "close") || patchEvery);
+    uint64_t patchedTo = 0;   // (slices whose arrays are written)
     FirstDirectories firstDirs;
     uint64_t dataAt = 0;   // (with patchAtClose: where the next chunk goes)
     TIFF* tif = NULL;
@@ -768,9 +790,30 @@ uint8_t writeSlices(const WriteJob& j, const char* fileName, const char* mode, C
             if(ch){ pool->put(ch->data); ch->data = NULL; }
             if(w != (tmsize_t)n){ err = 1; what = "a strip could not be written (disk full or I/O error?)"; break; }
         }
+#ifndef _WIN32
+        // (directories first: the slice's data sent before libtiff writes the
+        // arrays that point to it, so that a write cut short leaves each slice
+        // whole or with empty arrays: killed with small strips still queued, a
+        // write of 20,000 slices had left up to 5,295 of them with arrays past
+        // the end of the file)
+        if(!err && dirsFirst && !patchAtClose && !io.flush()){ err = 1; what = "a strip could not be written (disk full or I/O error?)"; }
+#endif
         if(!err && !patchAtClose && !(dirsFirst ? TIFFFlush(tif) : TIFFWriteDirectory(tif))){ err = 1; what = "a directory could not be written (disk full or I/O error?)"; }
+        if(!err && patchAtClose && patchEvery && ((s + 1) % patchEvery == 0 || s + 1 == j.nSlices)){
+#ifndef _WIN32
+            if(!io.flush()){ err = 1; what = "a strip could not be written (disk full or I/O error?)"; break; }
+#endif
+            if(!firstDirs.writeRange(tif, patchedTo, s + 1)){ err = 1; what = "the strip arrays could not be written (disk full or I/O error?)"; break; }
+            patchedTo = s + 1;
+        }
     }
-    if(!err && patchAtClose && !firstDirs.write(tif)){ err = 1; what = "the strip arrays could not be written (disk full or I/O error?)"; }
+#ifndef _WIN32
+    // (the data sent before the arrays that point to it: killed between the
+    // two, a write had left a quarter of its slices with arrays past the end of
+    // the file)
+    if(!err && patchAtClose && patchedTo < j.nSlices && !io.flush()){ err = 1; what = "a strip could not be written (disk full or I/O error?)"; }
+#endif
+    if(!err && patchAtClose && patchedTo < j.nSlices && !firstDirs.write(tif)){ err = 1; what = "the strip arrays could not be written (disk full or I/O error?)"; }
     if(!err && !TIFFFlush(tif)){ err = 1; what = "the file could not be flushed (disk full or I/O error?)"; }
     TIFFClose(tif);
 #ifndef _WIN32

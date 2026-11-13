@@ -1209,9 +1209,11 @@ int main(int argc, char** argv){
     // back as those of mode "w" do: strips and tiles, LZW, zstd and none, gray
     // and RGB, from row-major and MATLAB-layout data, one slice and many, read
     // whole and as slice ranges in both layouts, with one thread and every
-    // thread; and getTiffInfo finds the same. Both ways of filling in the strip
-    // arrays: slice by slice, and at the end (CPPTIFF_WF_PATCH=close).
-    for(const char* patch : {"", "close"}){
+    // thread; and getTiffInfo finds the same. Every way of filling in the strip
+    // arrays: slice by slice by libtiff, by the writer at the end
+    // (CPPTIFF_WF_PATCH=close), and by the writer every slice and every 7
+    // slices (=1, =7).
+    for(const char* patch : {"", "close", "1", "7"}){
 #ifdef _WIN32
         _putenv_s("CPPTIFF_WF_PATCH", patch);
 #else
@@ -1279,8 +1281,9 @@ int main(int argc, char** argv){
             }
             omp_set_num_threads(prevThreads);
             std::remove(pw.c_str()); std::remove(pf.c_str());
-            if(ok && layout) std::printf("PASS  %-16s directories first%s\n", c.name, *patch ? ", arrays at the end" : "");
-            else { std::printf("FAIL  %-16s directories first%s  (read back=%d layout=%d)\n", c.name, *patch ? ", arrays at the end" : "", (int)ok, (int)layout); failures++; }
+            const std::string how = !*patch ? "" : !strcmp(patch, "close") ? ", arrays at the end" : std::string(", arrays every ") + patch + " slices";
+            if(ok && layout) std::printf("PASS  %-16s directories first%s\n", c.name, how.c_str());
+            else { std::printf("FAIL  %-16s directories first%s  (read back=%d layout=%d)\n", c.name, how.c_str(), (int)ok, (int)layout); failures++; }
         }
     }
 #ifdef _WIN32
