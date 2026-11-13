@@ -414,9 +414,23 @@ uint8_t gpuReadTiff(const std::vector<GpuTiffRead> &reads, const bool flipXY, vo
             else if(q.how == GpuLzw){ bLzw += q.stored; bLzwOut += q.decoded; }
             else{ bGpu += q.stored; bGpuOut += q.decoded; }
         }
-        // Parts of at most CPPTIFF_GPU_PART_MAX_MB (256) MB of staging and of decoded bytes (a unit bigger than
-        // that is a part of its own), two of them at a time: the host fills one while the GPU works on the other
-        const uint64_t partMax = std::max<uint64_t>(1, envNumber("CPPTIFF_GPU_PART_MAX_MB", 256)) << 20;
+        // Parts of at most partMax bytes of staging and of decoded bytes (a unit bigger than that is a part of its
+        // own), two of them at a time: the host fills one while the GPU works on the other. nvCOMP decompresses a
+        // batch's streams side by side, so a part holds about 4 streams for each of the GPU's multiprocessors: with
+        // strips of 2 MB, parts of 256 MB gave a B200 127 at a time, and zstd read 2.3 times as fast in parts of
+        // 1 GB; parts of 256 MB at least (smaller ones overlap the host's reading and the GPU's work more: deflate
+        // strips of 256 KB read 1.2 times as fast in them as in parts of 1 GB), at most 1 GB, and no more than an
+        // eighth of the GPU's free memory. CPPTIFF_GPU_PART_MAX_MB sets it instead.
+        uint64_t codecBytes = 0, codecUnits = 0;
+        for(const Planned &q : units)
+            if(q.how == GpuZstd || q.how == GpuDeflate || q.how == GpuLzw){ codecBytes += q.decoded; codecUnits++; }
+        uint64_t partMax = (uint64_t)256 << 20;
+        if(codecUnits) partMax = std::max<uint64_t>(partMax, 4*(uint64_t)std::max(1, c.sms)*(codecBytes/codecUnits));
+        partMax = std::min<uint64_t>(partMax, (uint64_t)1 << 30);
+        size_t freeMem = 0, totalMem = 0;
+        if(!a->cuMemGetInfo(&freeMem, &totalMem) && freeMem) partMax = std::min<uint64_t>(partMax, std::max<uint64_t>(freeMem/8, (uint64_t)64 << 20));
+        if(std::getenv("CPPTIFF_GPU_PART_MAX_MB") && *std::getenv("CPPTIFF_GPU_PART_MAX_MB"))
+            partMax = std::max<uint64_t>(1, envNumber("CPPTIFF_GPU_PART_MAX_MB", 256)) << 20;
         std::vector<Part> parts;
         {
             Part p;

@@ -134,7 +134,7 @@ ims = cpptiff.read_tiff_batch(['a.tif', ('b.tif', [0, 10])], gpu=True)
 # Whether GPU reads can run here, and if not, why
 ok, why = cpptiff.gpu_available()
 ````
-CPPTIFF_GPU_PROFILE=1 prints where each GPU read's time went; CPPTIFF_GPU_PART_MAX_MB (256) sets the most a read sends to the GPU at once (a bigger read goes in parts, the next one read while the GPU works on the one before), and CPPTIFF_GPU_TIMEOUT the seconds a read waits for the GPU (nvCOMP can hang on damaged data; by default 30 plus 1 per 50 MB)
+CPPTIFF_GPU_PROFILE=1 prints where each GPU read's time went; CPPTIFF_GPU_PART_MAX_MB sets the most a read sends to the GPU at once (a bigger read goes in parts, the next one read while the GPU works on the one before; by default sized to the GPU and the file's strips, 256 MB to 1 GB), and CPPTIFF_GPU_TIMEOUT the seconds a read waits for the GPU (nvCOMP can hang on damaged data; by default 30 plus 1 per 50 MB)
 
 ## CMake
 
