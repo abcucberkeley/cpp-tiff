@@ -61,13 +61,6 @@ struct ReadState {
     bool cpu = false;          // read on the CPU and copied
 };
 
-uint64_t envNumber(const char* name, uint64_t dflt){
-    const char* e = std::getenv(name);
-    if(!e || !*e) return dflt;
-    const long long v = std::atoll(e);
-    return v >= 0 ? (uint64_t)v : dflt;
-}
-
 // Each thread's handle of each file, opened when first needed
 struct Handles {
     std::vector<std::vector<TIFF*>> h;
@@ -300,26 +293,8 @@ void layOut(std::vector<Planned> &units, Part &p, const Ctx &c){
     p.decoded = dec;
 }
 
-// Waits for the GPU's work up to ev, failing after timeout seconds (0: no limit)
-void waitFor(const Api* a, CUevent ev, double timeout, const char* what){
-    const auto t0 = std::chrono::steady_clock::now();
-    for(;;){
-        const CUresult r = a->cuEventQuery(ev);
-        if(r == 0) return;
-        if(r != 600 /* CUDA_ERROR_NOT_READY */) ck(a, r, what);
-        if(timeout > 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > timeout)
-            throw Fail(std::string(what)+": the GPU did not finish within "+std::to_string((long long)timeout)+
-                       " s (damaged data can make nvCOMP hang; CPPTIFF_GPU_TIMEOUT sets the limit)");
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
-    }
-}
-
 double secondsSince(std::chrono::steady_clock::time_point t0){
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-}
-
-void launch(const Api* a, CUfunction f, unsigned gx, unsigned gy, unsigned bx, unsigned by, CUstream s, void** args){
-    ck(a, a->cuLaunchKernel(f, gx, gy, 1, bx, by, 1, 0, s, args, nullptr), "cuLaunchKernel");
 }
 
 }  // namespace

@@ -10,6 +10,7 @@
 #include "parallelwritetiff.h"
 #include "helperfunctions.h"
 #include "gpureadtiff.h"
+#include "gpuwritetiff.h"
 
 // The NumPy data type of a file's samples: bits and sample format (2 signed
 // integers, 3 floats, otherwise unsigned integers). 16-bit floats are float16:
@@ -333,6 +334,32 @@ void pybind11_read_tiff_gpu(const std::vector<std::tuple<std::string, std::vecto
     if(bad) throw std::runtime_error(err);
 }
 
+// Writes GPU memory: x by y pixels of samples samples, z slices, at ptr, of NumPy type string typestr, row-major
+// (z, y, x[, c]), or with fortran MATLAB's column-major (y, x[, c], z), as pybind11_write_tiff writes them, with
+// the GPU work on stream (a CUDA stream handle, 0 for the default stream). The GIL is released while the file is
+// written.
+void pybind11_write_tiff_gpu(const std::string &fileName, const uint64_t ptr, const std::string &typestr, const uint64_t x,
+                             const uint64_t y, const uint64_t z, const uint64_t samples, const std::string &compression,
+                             const bool fortran, const uint64_t tile, const int64_t numThreads, const uint64_t stream){
+    if(numThreads < 0) throw pybind11::value_error("num_threads must be at least 1");
+    const char kind = typestr.size() >= 3 ? typestr[1] : '?';
+    const uint64_t bytes = typestr.size() >= 3 ? std::strtoull(typestr.c_str() + 2, nullptr, 10) : 0;
+    if((kind != 'u' && kind != 'i' && kind != 'f') || (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8) || (kind == 'f' && bytes == 1))
+        throw pybind11::type_error("data type " + typestr + " cannot be written: use integers of 8, 16, 32 or 64 bits, "
+                                   "or floats of 16, 32 or 64 bits");
+    if(typestr[0] == '>') throw pybind11::value_error("data must be in this machine's byte order");
+    const uint16_t sampleFormat = kind == 'i' ? 2 : kind == 'f' ? 3 : 1;
+    const CallThreads threads(numThreads);
+    std::string err;
+    uint8_t bad = 0;
+    {
+        pybind11::gil_scoped_release release;
+        bad = gpuWriteTiff(fileName.c_str(), (const void*)(uintptr_t)ptr, x, y, z, bytes*8, samples, sampleFormat, compression, "w",
+                           fortran, tile, (void*)(uintptr_t)stream, (int)numThreads, err);
+    }
+    if(bad) throw std::runtime_error(err);
+}
+
 pybind11::tuple pybind11_gpu_available(){
     std::string why;
     const bool ok = gpuReadTiffAvailable(why);
@@ -358,6 +385,10 @@ PYBIND11_MODULE(cpptiff, m) {
 	      pybind11::arg("numThreads") = 0, pybind11::arg("stream") = 0, "Read tiff files into GPU memory");
 
 	m.def("pybind11_gpu_available", &pybind11_gpu_available, "Whether GPU reads can run here, and if not, why");
+	m.def("pybind11_write_tiff_gpu", &pybind11_write_tiff_gpu, pybind11::arg("fileName"), pybind11::arg("ptr"), pybind11::arg("typestr"),
+	      pybind11::arg("x"), pybind11::arg("y"), pybind11::arg("z"), pybind11::arg("samples"), pybind11::arg("compression"),
+	      pybind11::arg("fortran"), pybind11::arg("tile"), pybind11::arg("numThreads"), pybind11::arg("stream"),
+	      "Write GPU memory as a TIFF file");
 
 	m.def("pybind11_gpu_set_nvcomp", &gpuReadTiffSetNvcompLibrary, "Where to load nvCOMP from, before the first GPU read");
 

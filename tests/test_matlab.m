@@ -388,6 +388,56 @@ function test_matlab(mexDir)
         fprintf('GPU reads skipped: %s\n', gpuWhy);
     end
 
+    % 12. GPU writes (parallelWriteTiffGPU, where it was built and GPU reads
+    %     run): gpuArrays written as parallelWriteTiff writes the same data, for
+    %     every class and codec (LZW and uncompressed files the same bytes, zstd
+    %     ones the same values), color, a single image, slices added (mode 'a')
+    %     and a tiled write; host data refused
+    if canGpu && exist('parallelWriteTiffGPU', 'file') == 3
+        fg = fullfile(tmp, 'gpuw_gpu.tif');
+        fc = fullfile(tmp, 'gpuw_cpu.tif');
+        for k = 1:numel(types)
+            for c = 1:numel(comps)
+                d = makeData([37 50 5], types{k});
+                parallelWriteTiffGPU(fg, gpuArray(d), 'w', comps{c});
+                parallelWriteTiff(fc, d, 'w', comps{c});
+                assert(isequal(parallelReadTiff(fg), d), 'gpu write: %s %s', types{k}, comps{c});
+                if ~strcmp(comps{c}, 'zstd')
+                    assert(isequal(bytesOf(fg), bytesOf(fc)), 'gpu write: %s %s is not parallelWriteTiff''s file', types{k}, comps{c});
+                end
+                nchecked = nchecked + 1;
+            end
+        end
+        d = makeData([24 40 3 4], 'uint16');
+        parallelWriteTiffGPU(fg, gpuArray(d), 'w', 'zstd');
+        assert(isequal(parallelReadTiff(fg), d), 'gpu write: rgb');
+        d = makeData([24 40 4], 'uint8');
+        parallelWriteTiffGPU(fg, gpuArray(d), 'w', 'lzw', 0, true);
+        parallelWriteTiff(fc, d, 'w', 'lzw', 0, true);
+        assert(isequal(bytesOf(fg), bytesOf(fc)), 'gpu write: rgba image');
+        d = makeData([30 20], 'single');
+        parallelWriteTiffGPU(fg, gpuArray(d), 'w', 'zstd');
+        assert(isequal(parallelReadTiff(fg), d), 'gpu write: one image');
+        d = makeData([30 20 6], 'uint16');
+        parallelWriteTiffGPU(fg, gpuArray(d(:, :, 1:3)), 'w', 'lzw');
+        parallelWriteTiffGPU(fg, gpuArray(d(:, :, 4:6)), 'a', 'lzw');
+        parallelWriteTiff(fc, d(:, :, 1:3), 'w', 'lzw');
+        parallelWriteTiff(fc, d(:, :, 4:6), 'a', 'lzw');
+        assert(isequal(bytesOf(fg), bytesOf(fc)) && isequal(parallelReadTiff(fg), d), 'gpu write: mode a');
+        parallelWriteTiffGPU(fg, gpuArray(d), 'w', 'lzw', 32);
+        parallelWriteTiff(fc, d, 'w', 'lzw', 32);
+        assert(isequal(bytesOf(fg), bytesOf(fc)), 'gpu write: tiled');
+        assert(throws(@() parallelWriteTiffGPU(fg, d)), 'gpu write: host data was accepted');
+        delete(fg);
+        delete(fc);
+        nchecked = nchecked + 5;
+        fprintf('PASS  GPU writes\n');
+    elseif canGpu
+        fprintf('GPU writes skipped: no parallelWriteTiffGPU\n');
+    else
+        fprintf('GPU writes skipped: %s\n', gpuWhy);
+    end
+
     fprintf('MATLAB tests PASSED (%d round trips)\n', nchecked);
 end
 

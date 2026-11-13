@@ -24,8 +24,8 @@ Windows: Windows 10 or newer is required
 pip install cpp-tiff
 ````
 
-#### With GPU reads
-Reading straight into GPU memory needs Linux, an NVIDIA GPU (Volta or newer) and its driver. The gpu extra also installs nvCOMP, which decompresses on the GPU and which cpptiff finds by itself (see "Read straight into GPU memory" below)
+#### With GPU reads and writes
+Reading straight into GPU memory and writing from it need Linux, an NVIDIA GPU (Volta or newer) and its driver. The gpu extra also installs nvCOMP, which decompresses and compresses on the GPU and which cpptiff finds by itself (see "Read straight into GPU memory" and "Write from GPU memory" below)
 ````
 pip install "cpp-tiff[gpu]"
 # gpu=True returns CuPy arrays, so it also needs CuPy (reading into PyTorch tensors does not)
@@ -136,6 +136,18 @@ ok, why = cpptiff.gpu_available()
 ````
 CPPTIFF_GPU_PROFILE=1 prints where each GPU read's time went; CPPTIFF_GPU_PART_MAX_MB sets the most a read sends to the GPU at once (a bigger read goes in parts, the next one read while the GPU works on the one before; by default sized to the GPU and the file's strips, 256 MB to 1 GB), and CPPTIFF_GPU_TIMEOUT the seconds a read waits for the GPU (nvCOMP can hang on damaged data; by default 30 plus 1 per 50 MB)
 
+#### Write from GPU memory
+write_tiff writes GPU data (a CuPy array, a PyTorch CUDA tensor, or anything with __cuda_array_interface__) from the GPU, which puts MATLAB's layout in the file's order and compresses zstd strips with nvCOMP, at nvCOMP's one level: the file reads as write_tiff's of the same data does, with other compressed bytes. LZW (which nvCOMP does not have) and uncompressed strips are copied back a part at a time and compressed here as write_tiff compresses them, so those files are write_tiff's, byte for byte. The file is written here while the GPU works on the next part. Tiled writes are copied back whole and written by the CPU writer. Linux only for now
+````
+import cupy
+import cpptiff
+im = cupy.random.randint(0, 1000, (100, 512, 512), dtype=cupy.uint16)
+cpptiff.write_tiff('filename.tif', im, 'zstd')
+# The GPU work goes after the work on the data's library's current stream (by default), or on stream=
+cpptiff.write_tiff('filename.tif', torch_tensor, 'zstd', stream=torch.cuda.current_stream())
+````
+CPPTIFF_GPU_WRITE_PART_MB sets the most a write takes from the GPU at once (by default 256 MB, and for zstd about 6 strips for each of the GPU's multiprocessors, up to 2 GB: nvCOMP compresses a part's strips side by side)
+
 ## CMake
 
 The C++ library can be compiled using the CMakeLists.txt file
@@ -155,8 +167,8 @@ make -j
 make install
 ````
 
-### Reading into GPU memory
-gpureadtiff.h reads files straight into GPU memory, decompressing on the GPU (see the Python section; Linux only for now). Building needs nothing more: the library loads the NVIDIA driver and nvCOMP (5 or later: pip install nvidia-libnvcomp-cu12, or set CPPTIFF_NVCOMP_LIBRARY to its libnvcomp file) when a GPU read first needs them, and builds and runs without either
+### Reading into GPU memory and writing from it
+gpureadtiff.h reads files straight into GPU memory, decompressing on the GPU, and gpuwritetiff.h writes them from GPU memory, compressing zstd strips on the GPU (see the Python section; Linux only for now). Building needs nothing more: the library loads the NVIDIA driver and nvCOMP (5 or later: pip install nvidia-libnvcomp-cu12, or set CPPTIFF_NVCOMP_LIBRARY to its libnvcomp file) when a GPU read or write first needs them, and builds and runs without either
 
 ## MATLAB
 
@@ -213,6 +225,13 @@ rgbStack = zeros(512,512,3,10,'uint8');
 parallelWriteTiff('path/to/rgbStack.tif',rgbStack);
 rgbImage = zeros(512,512,3,'uint8');
 parallelWriteTiff('path/to/rgbImage.tif',rgbImage,'w','lzw',0,true);
+````
+
+#### parallelWriteTiffGPU - Write a gpuArray out as a Tiff image
+parallelWriteTiff's write of a gpuArray, with the same arguments (see "Write from GPU memory" in the Python section: zstd strips are compressed on the GPU, and LZW and uncompressed files are parallelWriteTiff's, byte for byte). Needs what parallelReadTiffGPU needs
+````
+setenv('CPPTIFF_NVCOMP_LIBRARY', '/path/to/libnvcomp.so.6');
+parallelWriteTiffGPU('path/to/file.tif',gpuArray(im),'w','zstd');
 ````
 
 #### Threads

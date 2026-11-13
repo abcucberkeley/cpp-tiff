@@ -6,6 +6,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, wait
 from .cpptiff import pybind11_read_tiff, pybind11_write_tiff, pybind11_get_image_shape, pybind11_default_threads
 from .cpptiff import pybind11_read_shape, pybind11_read_tiff_gpu, pybind11_gpu_available, pybind11_gpu_set_nvcomp
+from .cpptiff import pybind11_write_tiff_gpu
 
 
 def _threads(num_threads):
@@ -144,7 +145,7 @@ def read_tiff(file_name, z_range=None, num_threads=None, out=None, order='C', gp
     return im
 
 
-def write_tiff(file_name, data, compression='lzw', tile=0, rgb=None, num_threads=None, order='C'):
+def write_tiff(file_name, data, compression='lzw', tile=0, rgb=None, num_threads=None, order='C', stream=None):
     """Write data as a TIFF file, one page per slice.
 
     order='C' (the default): grayscale data is (z, y, x) or (y, x); RGB and RGBA
@@ -159,10 +160,22 @@ def write_tiff(file_name, data, compression='lzw', tile=0, rgb=None, num_threads
     'none'). Data in the other byte order is converted first.
     num_threads: the threads this call uses, as for read_tiff (the GIL is
     released while writing).
+
+    data in GPU memory (a CuPy array, a PyTorch tensor on a CUDA device, or
+    anything with __cuda_array_interface__) is written from the GPU: zstd strips
+    are compressed there (with nvCOMP: pip install "cpp-tiff[gpu]"), and the file
+    reads as the CPU writer's (LZW and uncompressed files are the CPU writer's,
+    byte for byte). The GPU work goes on stream (a PyTorch or CuPy stream, or a
+    CUDA stream handle; by default the current stream of the data's library,
+    where the work that made the data most likely went), after the work queued
+    there before, and is done when this returns.
     """
     file_name = _file_name(file_name)
     order = _order(order)
     compression = _compression(compression)
+    if _cuda_array(data, 'data') is not None:
+        _write_gpu(file_name, data, compression, tile, rgb, num_threads, order, stream)
+        return
     data = np.asarray(data)
     ndims = data.ndim
     if rgb is None:
@@ -342,14 +355,14 @@ def _contiguous(shape, strides):
     return ok(range(n - 1, -1, -1)), ok(range(n))
 
 
-def _cuda_array(a):
+def _cuda_array(a, role='out'):
     # (device pointer, NumPy type string, shape, C-contiguous, F-contiguous) of GPU memory a (a PyTorch tensor
     # on a CUDA device, or anything with __cuda_array_interface__, such as a CuPy array), or None when a is not
-    # GPU memory
+    # GPU memory. role: 'out' (memory to read into, which must be writeable) or 'data' (data to write).
     if type(a).__module__.split('.')[0] == 'torch' and getattr(a, 'is_cuda', False):
         name = str(a.dtype).replace('torch.', '')
         if name not in _TORCH_TYPES:
-            raise TypeError(f'out has the data type {a.dtype}, which cpp-tiff does not read')
+            raise TypeError(f'{role} has the data type {a.dtype}, which cpp-tiff does not ' + ('read' if role == 'out' else 'write'))
         shape = tuple(int(v) for v in a.shape)
         c, f = _contiguous(shape, tuple(a.stride()))
         return int(a.data_ptr()), _TORCH_TYPES[name], shape, c, f
@@ -363,9 +376,9 @@ def _cuda_array(a):
         c, f = True, len([v for v in shape if v != 1]) <= 1
     else:
         if any(st % dt.itemsize for st in strides):
-            raise ValueError('out must be C- or F-contiguous')
+            raise ValueError(f'{role} must be C- or F-contiguous')
         c, f = _contiguous(shape, tuple(st // dt.itemsize for st in strides))
-    if cai.get('readonly', False) or (len(cai['data']) > 1 and cai['data'][1]):
+    if role == 'out' and (cai.get('readonly', False) or (len(cai['data']) > 1 and cai['data'][1])):
         raise ValueError('out must be writeable')
     return int(cai['data'][0]), dt.str if dt.itemsize > 1 else '|' + dt.str[1:], shape, c, f
 
@@ -451,3 +464,82 @@ def _read_gpu(requests, order, num_threads, stream):
         reqs.append((file_name, list(z_range or []), ptr, typestr, list(shape)))
     pybind11_read_tiff_gpu(reqs, order, _threads(num_threads), _stream_handle(stream))
     return outs
+
+
+def _current_stream(a):
+    # The current stream of GPU data's library (PyTorch's on the tensor's device, or CuPy's), which the work that
+    # made the data most likely went on; None (the default stream) for other data
+    module = type(a).__module__.split('.')[0]
+    if module == 'torch':
+        import torch
+        return torch.cuda.current_stream(a.device)
+    if module == 'cupy':
+        import cupy
+        return cupy.cuda.get_current_stream()
+    return None
+
+
+def _gpu_copy(a, order):
+    # A C- (or F-) contiguous copy of GPU data, made by its library on its current stream, which is then waited
+    # for (the write may go on another stream); other GPU data must be contiguous already
+    module = type(a).__module__.split('.')[0]
+    if module == 'torch':
+        dims = list(range(a.dim() - 1, -1, -1))
+        b = a.contiguous() if order == 'C' else a.permute(dims).contiguous().permute(dims)
+    elif module == 'cupy':
+        import cupy
+        b = cupy.ascontiguousarray(a) if order == 'C' else cupy.asfortranarray(a)
+    else:
+        raise ValueError(f"data must be {'C' if order == 'C' else 'F'}-contiguous" + (" (or pass order='F' for (y, x, z) "
+                         "F-contiguous data)" if order == 'C' else ''))
+    stream = _current_stream(a)
+    if stream is not None:
+        stream.synchronize()
+    return b
+
+
+def _write_gpu(file_name, data, compression, tile, rgb, num_threads, order, stream):
+    # write_tiff of GPU memory (see write_tiff)
+    _find_nvcomp()
+    if stream is None:
+        stream = _current_stream(data)
+    _, typestr, shape, c, f = _cuda_array(data, 'data')
+    if typestr[0] == '>' and type(data).__module__.split('.')[0] == 'cupy':
+        data = data.astype(data.dtype.newbyteorder('='))
+        _, typestr, shape, c, f = _cuda_array(data, 'data')
+    if typestr[1] not in 'uif' or typestr[2:] not in ('1', '2', '4', '8') or typestr[1:] == 'f1':
+        raise TypeError(f'data type {typestr} cannot be written: use integers of 8, 16, 32 or 64 bits, '
+                        'or floats of 16, 32 or 64 bits')
+    ndims = len(shape)
+    if rgb is None:
+        rgb = ndims == 4
+    if order == 'F':
+        if rgb:
+            if ndims not in (3, 4):
+                raise ValueError("RGB data must be (y, x, c) or (y, x, c, z) with order='F'!")
+            if shape[2] not in (3, 4):
+                raise ValueError(f"RGB data must have 3 (RGB) or 4 (RGBA) samples on its third axis with order='F', not {shape[2]}!")
+        elif ndims not in (2, 3):
+            raise ValueError("data must be (y, x, z) or (y, x), or 4D (y, x, c, z) color data, with order='F'!")
+    elif rgb:
+        if ndims not in (3, 4):
+            raise ValueError('RGB data must be (y, x, c) or (z, y, x, c)!')
+        if shape[-1] not in (3, 4):
+            raise ValueError(f'RGB data must have 3 (RGB) or 4 (RGBA) samples on its last axis, not {shape[-1]}!')
+    elif ndims not in (2, 3):
+        raise ValueError('data must be 3D or 2D, or 4D (z, y, x, c) color data!')
+    if any(n == 0 for n in shape):
+        raise ValueError(f'cannot write an empty array of shape {shape}: a TIFF image has at least one pixel')
+    if not (c if order == 'C' else f):
+        data = _gpu_copy(data, order)
+    ptr, typestr, shape, c, f = _cuda_array(data, 'data')
+    if order == 'F':
+        y, x = shape[0], shape[1]
+        spp = shape[2] if rgb else 1
+        z = shape[3] if rgb and ndims == 4 else shape[2] if not rgb and ndims == 3 else 1
+    else:
+        spp = shape[-1] if rgb else 1
+        y, x = (shape[-3], shape[-2]) if rgb else (shape[-2], shape[-1])
+        z = shape[0] if (rgb and ndims == 4) or (not rgb and ndims == 3) else 1
+    pybind11_write_tiff_gpu(file_name, ptr, typestr, x, y, z, spp, compression, order == 'F', tile, _threads(num_threads),
+                            _stream_handle(stream))

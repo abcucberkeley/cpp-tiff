@@ -1,5 +1,5 @@
-// The CUDA driver API and nvCOMP, loaded when a GPU read first needs them (internal to the library,
-// not installed): cpp-tiff builds and runs without either, and only GPU reads need them. Adapted
+// The CUDA driver API and nvCOMP, loaded when a GPU read or write first needs them (internal to the
+// library, not installed): cpp-tiff builds and runs without either, and only GPU reads and writes need them. Adapted
 // from cpp-zarr's (src/gpu/cudaapi.h there), in a namespace of cpp-tiff's own, since both libraries
 // are often loaded into one process.
 // (The driver API works in whatever context the caller's GPU memory belongs to, the one CUDA runtime
@@ -72,6 +72,14 @@ struct Api {
     int (*tempSize6[NCodecs])(size_t, size_t, NvcompOpts, size_t*, size_t, void*);
     int (*tempSize5[NCodecs])(size_t, size_t, NvcompOpts, size_t*, size_t);
     int (*alignments[NCodecs])(NvcompOpts, NvcompAlignments*);
+    // nvCOMP's compression (GPU writes), per codec (null for one the loaded nvCOMP does not compress)
+    int (*compressAsync[NCodecs])(const void* const*, const size_t*, size_t, size_t, void*, size_t, void* const*, size_t*,
+                                  NvcompOpts, int*, void*);
+    // (nvCOMP 6: ...CompressGetTempSize, which takes a stream; nvCOMP 5: ...CompressGetTempSizeAsync)
+    int (*compTempSize6[NCodecs])(size_t, size_t, NvcompOpts, size_t*, size_t, void*);
+    int (*compTempSize5[NCodecs])(size_t, size_t, NvcompOpts, size_t*, size_t);
+    int (*compMaxOutput[NCodecs])(size_t, NvcompOpts, size_t*);
+    int (*compAlignments[NCodecs])(NvcompOpts, NvcompAlignments*);
     int nvcompMajor = 0;
     std::string nvcompPath;
 };

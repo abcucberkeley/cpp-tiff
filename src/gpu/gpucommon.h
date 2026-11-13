@@ -1,9 +1,10 @@
-// What GPU reads (gpureadtiff.cpp) need of the GPU beyond the driver API: each CUDA context's kernels and
-// reusable buffers, and the context GPU memory belongs to. Internal to the library (not installed);
-// adapted from cpp-zarr's src/gpu/gpucommon.h.
+// What GPU reads and writes (gpureadtiff.cpp, gpuwritetiff.cpp) need of the GPU beyond the driver API: each
+// CUDA context's kernels and reusable buffers, and the context GPU memory belongs to. Internal to the library
+// (not installed); adapted from cpp-zarr's src/gpu/gpucommon.h.
 #ifndef CPPTIFF_GPUCOMMON_H
 #define CPPTIFF_GPUCOMMON_H
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -31,6 +32,26 @@ struct Slot {
     CUstream stream = nullptr;       // its parts' GPU work: the copy, the decompression, the kernels (two slots' parts overlap)
 };
 
+// A part of a GPU write's reusable buffers
+struct WriteSlot {
+    bool busy = false;
+    bool lost = false;               // (its GPU work never finished: its buffers are never reused)
+    CUdeviceptr in = 0, out = 0, temp = 0, work = 0, packed = 0;   // gathered strips, nvCOMP's output and temporary
+    size_t inBytes = 0, outBytes = 0, tempBytes = 0, workBytes = 0, packedBytes = 0;   // memory, tables, packed output
+    uint8_t* host = nullptr;         // pinned: the part's strips as they go to the file (compressed or not)
+    size_t hostBytes = 0;
+    uint8_t* tab = nullptr;          // pinned: the tables copied to the GPU
+    size_t tabBytes = 0;
+    uint8_t* res = nullptr;          // pinned: compressed sizes, offsets and statuses copied back
+    size_t resBytes = 0;
+    uint8_t* enc = nullptr;          // strips compressed on the host (malloc'ed, touched only as far as they go)
+    size_t encBytes = 0;
+    CUevent done = nullptr;          // recorded after the part's GPU work (and its copy back)
+    CUevent sharedDone = nullptr;    // recorded once the part is done with the buffers a write's parts share (see gpuwritetiff.cpp)
+    CUstream stream = nullptr;
+    ~WriteSlot(){ std::free(enc); }
+};
+
 // The kernels and reusable buffers of one CUDA context
 struct Ctx {
     CUcontext ctx = nullptr;
@@ -38,10 +59,13 @@ struct Ctx {
     CUfunction placeC[4] = {nullptr, nullptr, nullptr, nullptr};   // (by element size: 1, 2, 4, 8 bytes)
     CUfunction placeF[4] = {nullptr, nullptr, nullptr, nullptr};
     CUfunction unpredict = nullptr, check = nullptr, lzw = nullptr;
+    CUfunction gatherF[4] = {nullptr, nullptr, nullptr, nullptr};   // (GPU writes)
+    CUfunction scan = nullptr, pack = nullptr;
     int sms = 1;
     NvcompAlignments align[NCodecs];
     std::mutex m;
     std::vector<std::unique_ptr<Slot>> slots;
+    std::vector<std::unique_ptr<WriteSlot>> writeSlots;
 };
 
 // The context's kernels and buffers (loading its kernels the first time); c must be current
@@ -50,6 +74,17 @@ Ctx& context(const Api* a, CUcontext c);
 // A slot of the context, free until given back
 Slot& takeSlot(Ctx &c);
 void giveSlot(Ctx &c, Slot &s);
+WriteSlot& takeWriteSlot(Ctx &c);
+void giveWriteSlot(Ctx &c, WriteSlot &s);
+
+// Waits for the GPU's work up to ev, failing after timeout seconds (0: no limit)
+void waitFor(const Api* a, CUevent ev, double timeout, const char* what);
+
+// Launches f on a grid of gx x gy blocks of bx x by threads on stream s
+void launch(const Api* a, CUfunction f, unsigned gx, unsigned gy, unsigned bx, unsigned by, CUstream s, void** args);
+
+// The environment variable name as a number (dflt when unset, empty or negative)
+uint64_t envNumber(const char* name, uint64_t dflt);
 
 // GPU memory of at least need bytes in p (have of them), its contents not kept
 void growDevice(const Api* a, CUdeviceptr &p, size_t &have, const size_t need);

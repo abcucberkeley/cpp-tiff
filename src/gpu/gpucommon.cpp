@@ -1,7 +1,9 @@
 #include "gpucommon.h"
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <map>
+#include <thread>
 #include "kernels_ptx.h"
 
 namespace ctcuda {
@@ -35,6 +37,10 @@ Ctx& context(const Api* a, CUcontext c){
     ck(a, a->cuModuleGetFunction(&x->unpredict, x->mod, "ct_unpredict"), "cuModuleGetFunction");
     ck(a, a->cuModuleGetFunction(&x->check, x->mod, "ct_check"), "cuModuleGetFunction");
     ck(a, a->cuModuleGetFunction(&x->lzw, x->mod, "ct_lzw"), "cuModuleGetFunction");
+    for(int i = 0; i < 4; i++)
+        ck(a, a->cuModuleGetFunction(&x->gatherF[i], x->mod, (std::string("ct_gather_f")+names[i]).c_str()), "cuModuleGetFunction");
+    ck(a, a->cuModuleGetFunction(&x->scan, x->mod, "ct_scan"), "cuModuleGetFunction");
+    ck(a, a->cuModuleGetFunction(&x->pack, x->mod, "ct_pack"), "cuModuleGetFunction");
     CUdevice dev = 0;
     ck(a, a->cuCtxGetDevice(&dev), "cuCtxGetDevice");
     a->cuDeviceGetAttribute(&x->sms, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, dev);
@@ -60,6 +66,43 @@ Slot& takeSlot(Ctx &c){
 void giveSlot(Ctx &c, Slot &s){
     std::lock_guard<std::mutex> g(c.m);
     s.busy = false;
+}
+
+WriteSlot& takeWriteSlot(Ctx &c){
+    std::lock_guard<std::mutex> g(c.m);
+    for(auto &s : c.writeSlots) if(!s->busy && !s->lost){ s->busy = true; return *s; }
+    c.writeSlots.emplace_back(new WriteSlot());
+    c.writeSlots.back()->busy = true;
+    return *c.writeSlots.back();
+}
+
+void giveWriteSlot(Ctx &c, WriteSlot &s){
+    std::lock_guard<std::mutex> g(c.m);
+    s.busy = false;
+}
+
+void waitFor(const Api* a, CUevent ev, double timeout, const char* what){
+    const auto t0 = std::chrono::steady_clock::now();
+    for(;;){
+        const CUresult r = a->cuEventQuery(ev);
+        if(r == 0) return;
+        if(r != 600 /* CUDA_ERROR_NOT_READY */) ck(a, r, what);
+        if(timeout > 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > timeout)
+            throw Fail(std::string(what)+": the GPU did not finish within "+std::to_string((long long)timeout)+
+                       " s (damaged data can make nvCOMP hang; CPPTIFF_GPU_TIMEOUT sets the limit)");
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+}
+
+void launch(const Api* a, CUfunction f, unsigned gx, unsigned gy, unsigned bx, unsigned by, CUstream s, void** args){
+    ck(a, a->cuLaunchKernel(f, gx, gy, 1, bx, by, 1, 0, s, args, nullptr), "cuLaunchKernel");
+}
+
+uint64_t envNumber(const char* name, uint64_t dflt){
+    const char* e = std::getenv(name);
+    if(!e || !*e) return dflt;
+    const long long v = std::atoll(e);
+    return v >= 0 ? (uint64_t)v : dflt;
 }
 
 void growDevice(const Api* a, CUdeviceptr &p, size_t &have, const size_t need){

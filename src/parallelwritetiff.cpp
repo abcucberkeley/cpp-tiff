@@ -27,6 +27,7 @@
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #endif
+#include "preparedwrite.h"
 #include "tiffio.h"
 #include "lzwencode.h"
 #include "helperfunctions.h"
@@ -128,13 +129,11 @@ static void gatherTileTransposedColor(T* tile, const T* slice, uint64_t x, uint6
 
 namespace {
 
-// One strip or tile on its way to the file. A producer fills data and then
-// publishes size with release order; the writer reads size with acquire order
-// before touching data, so it never sees a size before the bytes behind it.
-struct Chunk {
-    std::atomic<int64_t> size{0};   // 0 = not ready, > 0 = bytes in data, < 0 = failed
-    uint8_t* data = nullptr;
-};
+// One strip or tile on its way to the file (preparedwrite.h): a producer fills
+// data and then publishes size with release order; the writer reads size with
+// acquire order before touching data, so it never sees a size before the bytes
+// behind it.
+typedef PreparedChunk Chunk;
 
 // Chunk buffers go back to a pool once written and are reused. Producers stay
 // within a small window of the writer (see writeJob), so a few dozen buffers
@@ -170,8 +169,9 @@ struct WriteJob {
     int compression;         // COMPRESSION_NONE, COMPRESSION_LZW or COMPRESSION_ZSTD
     uint16_t sampleFormat;
 
-    // Uncompressed row-major strips go straight from the caller's buffer to the file.
-    bool direct() const { return compression == COMPRESSION_NONE && !transpose && !tileSize; }
+    // Uncompressed row-major strips go straight from the caller's buffer to the file (a
+    // prepared write's strips are made elsewhere: there is no buffer).
+    bool direct() const { return compression == COMPRESSION_NONE && !transpose && !tileSize && data; }
     // A pixel's samples (1 gray, 3 RGB or 4 RGBA) are stored together.
     uint64_t pixelBytes() const { return bytes*samples; }
     uint64_t sliceBytes() const { return x*y*pixelBytes(); }
@@ -569,13 +569,19 @@ struct ChunkClaims {
 // Write every slice in order: tags, its chunks (waiting for producers unless
 // produceInline, where this thread makes each chunk just before writing it),
 // then its directory. writerChunk tells producers how far the writer is;
-// while it waits, the writer prepares chunks from claims, if given.
-// Returns 0 on success.
+// while it waits, the writer prepares chunks from claims, if given. Without a
+// pool the chunks are a prepared write's, whose maker frees them. Returns 0 on
+// success; an error is printed, or given in whyOut.
 uint8_t writeSlices(const WriteJob& j, const char* fileName, const char* mode, Chunk* chunks,
                     std::atomic<int64_t>& writerChunk, std::atomic<bool>& failed,
-                    bool produceInline, uint8_t* scratch, BufferPool* pool, ChunkClaims* claims){
+                    bool produceInline, uint8_t* scratch, BufferPool* pool, ChunkClaims* claims,
+                    std::string* whyOut = NULL){
+    auto report = [&](const std::string& why){
+        if(whyOut) *whyOut = why;
+        else printf("Error: %s\n", why.c_str());
+    };
     if(strcmp(mode,"w") && strcmp(mode,"a")){
-        printf("Error: mode \"%s\" is not supported. Use w or a for mode type\n", mode);
+        report(std::string("mode \"")+mode+"\" is not supported. Use w or a for mode type");
         failed = true;
         return 1;
     }
@@ -591,7 +597,7 @@ uint8_t writeSlices(const WriteJob& j, const char* fileName, const char* mode, C
     tif = tiffOpenPath(fileName, append ? "a8" : "w8");
 #endif
     if(!tif){
-        printf("Error: File \"%s\" cannot be opened\n",fileName);
+        report(std::string("File \"")+fileName+"\" cannot be opened");
         failed = true;
         return 1;
     }
@@ -649,7 +655,8 @@ uint8_t writeSlices(const WriteJob& j, const char* fileName, const char* mode, C
             }
             const tmsize_t w = j.tileSize ? TIFFWriteRawTile(tif, (uint32_t)c, (void*)p, (tmsize_t)n)
                                           : TIFFWriteRawStrip(tif, (uint32_t)c, (void*)p, (tmsize_t)n);
-            if(ch){ pool->put(ch->data); ch->data = NULL; }
+            // (a prepared write's chunks are their maker's to free: no pool)
+            if(ch && pool){ pool->put(ch->data); ch->data = NULL; }
             if(w != (tmsize_t)n){ err = 1; what = "a strip could not be written (disk full or I/O error?)"; break; }
         }
         if(!err && !TIFFWriteDirectory(tif)){ err = 1; what = "a directory could not be written (disk full or I/O error?)"; }
@@ -663,7 +670,7 @@ uint8_t writeSlices(const WriteJob& j, const char* fileName, const char* mode, C
     if(!err && io.failed()){ err = 1; what = "the file could not be written or closed (disk full or I/O error?)"; }
 #endif
     if(err){
-        printf("Error: writing \"%s\" failed: %s. The file is incomplete.\n", fileName, what);
+        report(std::string("writing \"")+fileName+"\" failed: "+what+". The file is incomplete.");
         failed = true;
     }
     return err;
@@ -795,7 +802,7 @@ uint8_t writeJob(const WriteJob& j, const char* fileName, const char* mode, int 
         claims.writerScratch = writerScratch.get();
         std::future<uint8_t> writer = std::async(std::launch::async, writeSlices, std::cref(j), fileName, mode,
                                                  chunks.get(), std::ref(writerChunk), std::ref(failed), false, (uint8_t*)NULL, &pool,
-                                                 fullCores ? (ChunkClaims*)NULL : &claims);
+                                                 fullCores ? (ChunkClaims*)NULL : &claims, (std::string*)NULL);
         #pragma omp parallel num_threads(producers)
         {
             std::unique_ptr<uint8_t[]> scratch(needScratch ? new (std::nothrow) uint8_t[j.maxChunkBytes()] : NULL);
@@ -938,4 +945,34 @@ uint8_t writeTiffParallelHelper(const char* fileName, const void* tiffOld, uint6
 	uint64_t stripSize = 0;
 
     return writeTiffParallelWrapper(x, y, z, fileName, tiffOld, bits, startSlice, stripSize, mode, transpose, compression, sampleFormat, tileSize, samples);
+}
+
+uint64_t preparedStripRows(uint64_t x, uint64_t y, uint64_t nSlices, uint64_t pixelBytes){
+    return autoStripRows(x, y, nSlices, pixelBytes);
+}
+
+uint8_t writePreparedTiff(const char* fileName, const char* mode, uint64_t x, uint64_t y, uint64_t z, uint64_t bits,
+                          uint64_t samples, uint16_t sampleFormat, const std::string &compression, uint64_t stripSize,
+                          PreparedChunk* chunks, std::atomic<int64_t> &writerChunk, std::atomic<bool> &failed,
+                          std::string &why){
+    // (the parent folder, as writeTiffParallelHelper makes it)
+    char* folderName = strdup(fileName);
+    char* lastSlash = strrchr(folderName, '/');
+    #ifdef _WIN32
+    char* lastBackslash = strrchr(folderName, '\\');
+    if(lastBackslash && (!lastSlash || lastBackslash > lastSlash)) lastSlash = lastBackslash;
+    #endif
+    if(lastSlash){
+        *lastSlash = '\0';
+        mkdirRecursive(folderName);
+    }
+    free(folderName);
+    TIFFSetWarningHandler(DummyHandler);
+    WriteJob j;
+    if(makeJob(j, x, y, z, NULL, bits, 0, stripSize, false, compression, sampleFormat, 0, samples)){
+        why = "the write's dimensions, samples or compression are not ones the writer writes";
+        failed = true;
+        return 1;
+    }
+    return writeSlices(j, fileName, mode ? mode : "w", chunks, writerChunk, failed, false, NULL, NULL, NULL, &why);
 }

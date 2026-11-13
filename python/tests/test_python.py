@@ -846,8 +846,62 @@ def main():
         raises(ValueError, lambda: cpptiff.read_tiff(gpu_files[2], out=cupy.empty((5, 37, 51), dtype=np.uint16)), "GPU out of the wrong shape")
         raises(ValueError, lambda: cpptiff.read_tiff(gpu_files[2], out=cupy.empty((5, 37, 50), dtype=np.uint16, order="F")), "GPU out not C-contiguous")
         print(f"GPU reads checked{' (and into PyTorch tensors)' if torch is not None else ''}")
+
+        # GPU writes: CuPy arrays (and PyTorch tensors) written from the GPU, every data type, gray and color, one
+        # slice and several, both orders; LZW and uncompressed files are the CPU writer's byte for byte, zstd ones
+        # (compressed by nvCOMP) read back as the CPU writer's do; data that is not contiguous (copied); a tensor
+        # made on a side stream, written on it (the data's current stream, by default); data types refused
+        def to_f(a_, rgb_):
+            # the layout order='F' takes, of C-order data
+            if a_.ndim == 2 or (rgb_ and a_.ndim == 3):
+                return a_
+            return np.transpose(a_, (1, 2, 3, 0) if rgb_ else (1, 2, 0))
+
+        pg = os.path.join(tmp, "gw_gpu.tif")
+        pc = os.path.join(tmp, "gw_cpu.tif")
+        for comp in ("lzw", "zstd", "none"):
+            for dt in (np.uint8, np.uint16, np.int16, np.float32, np.float64):
+                for shape, rgb_ in (((5, 37, 50), False), ((37, 50), False), ((3, 20, 30, 3), True), ((20, 30, 4), True)):
+                    a = (rng_g.random(shape)*200).astype(dt)
+                    for o in ("C", "F"):
+                        h = a if o == "C" else to_f(a, rgb_)
+                        g = cupy.array(h, order=o)
+                        cpptiff.write_tiff(pg, g, comp, rgb=rgb_, order=o)
+                        cpptiff.write_tiff(pc, h, comp, rgb=rgb_, order=o)
+                        good = np.array_equal(cpptiff.read_tiff(pg), cpptiff.read_tiff(pc)) and np.array_equal(cpptiff.read_tiff(pg), a)
+                        if comp != "zstd":
+                            good = good and same_file(pg, pc)
+                        check(good, f"GPU write {comp} {np.dtype(dt).name} {shape} order={o}")
+        # (not contiguous: copied by CuPy first)
+        a = (rng_g.random((4, 30, 40))*200).astype(np.uint16)
+        cpptiff.write_tiff(pg, cupy.asarray(a)[:, ::2, :], "zstd")
+        check(np.array_equal(cpptiff.read_tiff(pg), a[:, ::2, :]), "GPU write of a strided CuPy array")
+        if torch is not None:
+            for dt in ("uint8", "int16", "float32", "float64"):
+                a = (rng_g.random((3, 25, 33))*100).astype(dt)
+                for comp in ("lzw", "zstd"):
+                    cpptiff.write_tiff(pg, torch.from_numpy(a).cuda(), comp)
+                    check(np.array_equal(cpptiff.read_tiff(pg), a), f"GPU write of a PyTorch tensor {dt} {comp}")
+                # (F-contiguous: a permuted view of a C-contiguous tensor)
+                cpptiff.write_tiff(pg, torch.from_numpy(np.ascontiguousarray(to_f(a, False).T)).cuda().permute(2, 1, 0), "zstd", order="F")
+                check(np.array_equal(cpptiff.read_tiff(pg), a), f"GPU write of an F-contiguous PyTorch tensor {dt}")
+            # A tensor made on a side stream and written there (its work is waited for): 64 MB of int16
+            side = torch.cuda.Stream()
+            with torch.cuda.stream(side):
+                t = torch.arange(32*1024*1024, device="cuda", dtype=torch.int32).remainder(30000)
+                for _ in range(20):
+                    t = (t*3 + 7).remainder(30000)
+                t = t.to(torch.int16).reshape(32, 1024, 1024)
+                cpptiff.write_tiff(pg, t, "zstd")
+                want_t = t.cpu().numpy()
+            check(np.array_equal(cpptiff.read_tiff(pg), want_t), "GPU write of a tensor made on a side stream")
+            raises(TypeError, lambda: cpptiff.write_tiff(pg, torch.zeros((4, 4), dtype=torch.bfloat16, device="cuda")), "GPU write of bfloat16")
+        raises(TypeError, lambda: cpptiff.write_tiff(pg, cupy.zeros((4, 4), dtype=cupy.bool_)), "GPU write of booleans")
+        raises(ValueError, lambda: cpptiff.write_tiff(pg, cupy.zeros((0, 4), dtype=cupy.uint8)), "GPU write of an empty array")
+        raises(ValueError, lambda: cpptiff.write_tiff(pg, cupy.zeros((2, 3, 4, 5), dtype=cupy.uint8)), "GPU write of 4D data of 5 samples")
+        print(f"GPU writes checked{' (and from PyTorch tensors)' if torch is not None else ''}")
     else:
-        print(f"GPU reads skipped: {gpu_why}")
+        print(f"GPU reads and writes skipped: {gpu_why}")
 
     if _failures:
         for f in _failures[:20]:

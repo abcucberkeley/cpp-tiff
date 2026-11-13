@@ -60,10 +60,11 @@ function build_mex(installDir, outDir)
     for i = 1:size(mexes, 1)
         mex(args{:}, '-output', mexes{i, 2}, fullfile(src, mexes{i, 1}));
     end
-    % parallelReadTiffGPU where the Parallel Computing Toolbox's GPU MEX API is (Linux; its tests skip without a
-    % GPU)
+    % parallelReadTiffGPU and parallelWriteTiffGPU where the Parallel Computing Toolbox's GPU MEX API is (Linux;
+    % their tests skip without a GPU)
     gpuInc = fullfile(matlabroot, 'toolbox', 'parallel', 'gpu', 'extern', 'include');
     if isunix && ~ismac && exist(gpuInc, 'dir')
         mex(args{:}, ['-I' gpuInc], '-lmwgpu', '-output', 'parallelReadTiffGPU', fullfile(src, 'parallelreadtiffgpumex.cpp'));
+        mex(args{:}, ['-I' gpuInc], '-lmwgpu', '-output', 'parallelWriteTiffGPU', fullfile(src, 'parallelwritetiffgpumex.cpp'));
     end
 end

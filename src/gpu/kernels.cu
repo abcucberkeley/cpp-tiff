@@ -257,3 +257,80 @@ extern "C" __global__ void ct_lzw(const u64* __restrict__ inPtr, const u64* __re
         got[i] = ok ? outBytes[i] : 0;
     }
 }
+
+// ---- GPU writes (gpuwritetiff.cpp)
+
+// MATLAB's column-major (y, x, c, z) data to row-major strips (rows, x, c), as the writer stores them: the transpose
+// of ct_place_f, through 32 x 32 tiles in shared memory, so that reads run along the input's columns and writes
+// along the strips' rows. strips: per strip its slice, first row, rows and the element its output starts at in out.
+// Block (s, t): strip s's tiles t, t + gridDim.y, ... (tiles of each sample in turn), 32 x 8 threads.
+#define GATHERF(NAME, T)                                                                               \
+extern "C" __global__ void NAME(const u64* __restrict__ strips, u32 n, const T* __restrict__ in, T* out, \
+                                u32 x, u32 y, u32 spp){                                                \
+    __shared__ T tile[TILE][TILE + 1];                                                                 \
+    const u32 si = blockIdx.x;                                                                         \
+    if(si >= n) return;                                                                                \
+    const u64 slice = strips[4*si], r0 = strips[4*si + 1], o = strips[4*si + 3];                       \
+    const u32 rows = (u32)strips[4*si + 2];                                                            \
+    const u64 plane = (u64)x * y;                                                                      \
+    const u32 tilesAcross = (x + TILE - 1) / TILE, tilesDown = (rows + TILE - 1) / TILE;               \
+    const u32 tiles = tilesAcross * tilesDown * spp;                                                   \
+    for(u32 t = blockIdx.y; t < tiles; t += gridDim.y){                                                \
+        const u32 c = t / (tilesAcross * tilesDown), rest = t % (tilesAcross * tilesDown);             \
+        const u32 c0 = (rest % tilesAcross) * TILE, rr0 = (rest / tilesAcross) * TILE;                 \
+        const T* src = in + slice * plane * spp + (u64)c * plane;                                      \
+        /* read: columns c0 + j, rows rr0 + threadIdx.x (consecutive in memory) */                     \
+        for(u32 j = threadIdx.y; j < TILE; j += blockDim.y){                                           \
+            const u32 col = c0 + j, r = rr0 + threadIdx.x;                                             \
+            if(col < x && r < rows) tile[j][threadIdx.x] = src[(u64)col * y + r0 + r];                 \
+        }                                                                                              \
+        __syncthreads();                                                                               \
+        /* write: rows rr0 + j, columns c0 + threadIdx.x */                                            \
+        for(u32 j = threadIdx.y; j < TILE; j += blockDim.y){                                           \
+            const u32 r = rr0 + j, col = c0 + threadIdx.x;                                             \
+            if(col < x && r < rows) out[o + ((u64)r * x + col) * spp + c] = tile[threadIdx.x][j];      \
+        }                                                                                              \
+        __syncthreads();                                                                               \
+    }                                                                                                  \
+}
+GATHERF(ct_gather_f8, u8)
+GATHERF(ct_gather_f16, u16)
+GATHERF(ct_gather_f32, u32)
+GATHERF(ct_gather_f64, u64)
+
+// Where each compressed strip goes in the packed buffer: offsets[i] the sum of the sizes before it, each rounded up to
+// 16 bytes, and *total the sum of them all. One block: each thread sums a run of the sizes, the block scans the
+// runs' sums, and each thread then writes its run's offsets.
+extern "C" __global__ void ct_scan(const u64* __restrict__ sizes, u64* offsets, u32 n, u64* total){
+    __shared__ u64 sums[1024];
+    const u32 t = threadIdx.x, T = blockDim.x;
+    const u32 per = (n + T - 1) / T, b = t * per, e = b + per < n ? b + per : n;
+    u64 s = 0;
+    for(u32 i = b; i < e; i++) s += (sizes[i] + 15) & ~15ull;
+    sums[t] = s;
+    __syncthreads();
+    for(u32 d = 1; d < T; d <<= 1){
+        const u64 v = t >= d ? sums[t - d] : 0;
+        __syncthreads();
+        sums[t] += v;
+        __syncthreads();
+    }
+    u64 run = t ? sums[t - 1] : 0;
+    for(u32 i = b; i < e; i++){ offsets[i] = run; run += (sizes[i] + 15) & ~15ull; }
+    if(t == T - 1) *total = sums[T - 1];
+}
+
+// Strips copied to their places in dst (the compressed strips packed together, or strips not aligned as nvCOMP
+// needs them copied to aligned places): a block a strip at a time, 16 bytes a thread where both ends are 16-byte
+// aligned, a byte a thread otherwise
+extern "C" __global__ void ct_pack(const u64* __restrict__ src, const u64* __restrict__ sizes, const u64* __restrict__ offsets,
+                                   u32 n, u8* dst){
+    for(u32 i = blockIdx.x; i < n; i += gridDim.x){
+        const u8* s = (const u8*)src[i];
+        u8* d = dst + offsets[i];
+        const u64 m = sizes[i];
+        const u64 words = (((u64)s | (u64)d) & 15) ? 0 : m / 16;
+        for(u64 k = threadIdx.x; k < words; k += blockDim.x) ((uint4*)d)[k] = ((const uint4*)s)[k];
+        for(u64 k = words * 16 + threadIdx.x; k < m; k += blockDim.x) d[k] = s[k];
+    }
+}
