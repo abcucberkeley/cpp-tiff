@@ -726,6 +726,38 @@ def main():
     got = cpptiff.read_tiff_batch([pp, (pw, (1, 3))])
     check(np.array_equal(got[0], v6) and np.array_equal(got[1], v6[1:3]), "pathlib.Path batch")
     raises(TypeError, lambda: cpptiff.read_tiff(5), "file_name=5")
+    raises(TypeError, lambda: cpptiff.read_tiff_batch([path, 5]), "read_tiff_batch file_name=5")
+
+    # A leading ~ or ~name is that home folder on Linux and macOS (as the MEX
+    # files and cpp-zarr expand it), and nothing else in a name is expanded:
+    # written there (into a new folder too), read, one slice, the shape, and in a
+    # batch, named as str, bytes and pathlib.Path; an unknown ~name, and on
+    # Windows any ~, is used as named
+    home = os.path.join(tmp, "home")
+    os.makedirs(home)
+    old_home, old_cwd = os.environ.get("HOME"), os.getcwd()
+    os.environ["HOME"] = home
+    os.chdir(tmp)
+    try:
+        for given, under_home in (("~/b.tif", "b.tif"), ("~/d (1)/e~f g.tif", os.path.join("d (1)", "e~f g.tif")),
+                                  ("~cpptiff_no_such_user/a.tif", None)):
+            real = os.path.join(tmp, given) if os.name == "nt" or under_home is None else os.path.join(home, under_home)
+            cpptiff.write_tiff(given, v6)
+            check(os.path.isfile(real), f"{given!r}: not written at {real!r}")
+            check(np.array_equal(cpptiff.read_tiff(given), v6) and np.array_equal(cpptiff.read_tiff(given, 2), v6[2])
+                  and cpptiff.get_image_shape(given) == v6.shape, f"{given!r}: read")
+            got = cpptiff.read_tiff_batch([given, os.fsencode(given), (pathlib.Path(given), (1, 3))])
+            check(np.array_equal(got[0], v6) and np.array_equal(got[1], v6) and np.array_equal(got[2], v6[1:3]),
+                  f"{given!r}: batch, as str, bytes and pathlib.Path")
+            if os.path.isfile(real):
+                os.remove(real)
+    finally:
+        os.chdir(old_cwd)
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home
+
     for bad in ("c", "A", "K", "f"):
         raises(ValueError, lambda: cpptiff.read_tiff(path, order=bad), f"read_tiff order={bad!r}")
         raises(ValueError, lambda: cpptiff.write_tiff(pw, v6, order=bad), f"write_tiff order={bad!r}")

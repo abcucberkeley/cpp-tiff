@@ -18,11 +18,14 @@ def _threads(num_threads):
 
 
 def _file_name(file_name):
-    # A path as str or bytes: os.PathLike names, such as pathlib.Path, too
+    # A path as str or bytes (os.PathLike names, such as pathlib.Path, too), with a leading ~ or ~name expanded to
+    # that home folder on Linux and macOS, as the MEX files and cpp-zarr expand it (os.path.expanduser): nothing else
+    # in the path is expanded, and on Windows it is used as named
     try:
-        return os.fspath(file_name)
+        file_name = os.fspath(file_name)
     except TypeError:
         raise TypeError(f'file_name must be a str, bytes or os.PathLike path, not {type(file_name).__name__}') from None
+    return file_name if os.name == 'nt' else os.path.expanduser(file_name)
 
 
 def _order(order):
@@ -262,7 +265,8 @@ def read_tiff_batch(requests, num_threads=None, order='C'):
     if not reqs:
         return []
     total = _threads(num_threads) or pybind11_default_threads()
-    sizes = sorted(os.path.getsize(r[0]) if os.path.isfile(r[0]) else 0 for r in reqs)
+    names = [_file_name(r[0]) for r in reqs]
+    sizes = sorted(os.path.getsize(f) if os.path.isfile(f) else 0 for f in names)
     per_read = min(total, max(1, round(sizes[len(sizes) // 2] / _BYTES_PER_THREAD)))
     at_once = max(1, min(len(reqs), round(total / per_read)))
     # (the threads split as evenly as they go: some reads may get one more)

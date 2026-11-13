@@ -32,7 +32,7 @@ The writer takes an output filename and a zyx numpy array, or a zyxc array for R
 
 By default, the writer uses lzw compression but you can also pass 'zstd' or 'none' (in any case) as the third argument. Passing a tile size (a multiple of 16) writes square tiles instead of strips
 
-File names can be strings or path objects such as pathlib.Path
+File names can be strings or path objects such as pathlib.Path. On Linux and macOS a name that starts with ~ or ~name is in that home folder, as a shell expands it; nothing else in a name is expanded
 
 #### Read and Write a tiff file
 ````
