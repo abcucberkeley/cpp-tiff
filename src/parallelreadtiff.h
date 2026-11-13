@@ -19,6 +19,14 @@ struct TiffInfo;
 // the read fails.
 void* readTiffParallelInfo(const char* fileName, const TiffInfo &info, void* tiff, uint8_t flipXY, const std::vector<uint64_t> &zRange = {});
 
+// Reads the same slices into one destination per slice: slices[k] gets slice k
+// of the read (the range's first is slice 0), x*y*samples*(bits/8) bytes in the
+// layout flipXY picks, (y, x[, c]) column-major with flipXY or (y, x[, c])
+// row-major without, aligned to its samples' size. There must be one for each
+// slice read. Returns true when every slice was read; false, after printing
+// why, when not (a slice may then be partly written).
+bool readTiffParallelInfo(const char* fileName, const TiffInfo &info, const std::vector<void*> &slices, uint8_t flipXY, const std::vector<uint64_t> &zRange = {});
+
 void* readTiffParallelWrapper(const char* fileName, const std::vector<uint64_t> &zRange = {});
 
 void* readTiffParallelWrapperNoXYFlip(const char* fileName, const std::vector<uint64_t> &zRange = {});

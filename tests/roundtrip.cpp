@@ -221,18 +221,20 @@ static bool writeReversedStripsTiff(const std::string& path, const uint8_t* data
 // Files the library's writer cannot produce, written by the libtiff built into
 // it: planar color (PLANARCONFIG=2: every strip or tile of the first color,
 // then of the next, one sample per pixel), any libtiff codec, any RowsPerStrip
-// (rps) or tile size, big-endian, a predictor, the other bit order (fillOrder).
-// data is chunky (z, y, x, c) in host order.
+// (rps) or tile size, big-endian, a predictor, the other bit order (fillOrder),
+// and another RowsPerStrip for the directories after the first (laterRps, or
+// rps when 0). data is chunky (z, y, x, c) in host order.
 static bool writeLibtiff(const std::string& path, const uint8_t* data, uint64_t x, uint64_t y, uint64_t z,
                          uint64_t spp, uint64_t bits, uint16_t fmt, uint16_t comp, uint32_t rps, uint32_t tile,
                          bool planar, bool bigEndian = false, uint16_t predictor = PREDICTOR_NONE,
-                         uint16_t fillOrder = FILLORDER_MSB2LSB){
+                         uint16_t fillOrder = FILLORDER_MSB2LSB, uint32_t laterRps = 0){
     TIFF* tif = TIFFOpen(path.c_str(), bigEndian ? "wb" : "wl");
     if(!tif) return false;
     const uint64_t es = bits/8, planes = planar ? spp : 1, px = planar ? es : spp*es;   // px: bytes per pixel of one plane
     std::vector<uint8_t> img(x*y*px), chunk;
     bool ok = true;
     for(uint64_t k = 0; k < z && ok; k++){
+        const uint32_t pageRps = (k && laterRps) ? laterRps : rps;
         TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, (uint32_t)x);
         TIFFSetField(tif, TIFFTAG_IMAGELENGTH, (uint32_t)y);
         TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, (uint16_t)bits);
@@ -248,7 +250,7 @@ static bool writeLibtiff(const std::string& path, const uint8_t* data, uint64_t 
         if(predictor != PREDICTOR_NONE) TIFFSetField(tif, TIFFTAG_PREDICTOR, predictor);
         if(fillOrder != FILLORDER_MSB2LSB) TIFFSetField(tif, TIFFTAG_FILLORDER, fillOrder);
         if(tile){ TIFFSetField(tif, TIFFTAG_TILEWIDTH, tile); TIFFSetField(tif, TIFFTAG_TILELENGTH, tile); }
-        else TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, rps);
+        else TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, pageRps);
         const uint8_t* slice = data + k*x*y*spp*es;
         for(uint64_t p = 0; p < planes && ok; p++){
             if(planar) for(uint64_t i = 0; i < x*y; i++) std::memcpy(&img[i*es], slice + (i*spp + p)*es, es);
@@ -265,7 +267,7 @@ static bool writeLibtiff(const std::string& path, const uint8_t* data, uint64_t 
                     }
             }
             else{
-                const uint64_t rows = std::min<uint64_t>(rps, y), strips = (y + rows - 1)/rows;
+                const uint64_t rows = std::min<uint64_t>(pageRps, y), strips = (y + rows - 1)/rows;
                 for(uint64_t s = 0; s < strips && ok; s++){
                     const uint64_t n = std::min<uint64_t>(rows, y - s*rows)*x*px;
                     chunk.assign(img.begin() + s*rows*x*px, img.begin() + s*rows*x*px + n);
@@ -1090,6 +1092,116 @@ int main(int argc, char** argv){
         std::remove(path.c_str());
         if(ok && used) std::printf("PASS  %-16s directory starts\n", "offsets");
         else { std::printf("FAIL  %-16s directory starts  (reads=%d used=%d)\n", "offsets", (int)ok, (int)used); failures++; }
+    }
+
+    // ---- Per-slice destinations: readTiffParallelInfo reading each slice into
+    // an allocation of its own. The allocations are poisoned (values the data
+    // never takes) and guarded on both sides, and given in the reverse of the
+    // order they were made in, so that a slice written at another's address, as
+    // if the slices were contiguous, past its end, or not at all, is caught.
+    // The first slice's allocation also has room after it for the rest of the
+    // read, which a reader taking the slices to follow the first writes over
+    // (and fails the check) instead of over the heap.
+    // Every reader path: strips decoded or copied raw, runs of one-row strips,
+    // tiles, chunky and planar color, planar tiles, a single image, stacks of
+    // a few large slices (read slice by slice, or in pieces), the ImageJ reader,
+    // and the scanline fallbacks (a stack whose first directory has three
+    // strips and the others one, which the strip readers cannot read); both
+    // layouts, whole and as slice ranges, with 1, 3 and 8 threads and every
+    // thread. Destinations that do not fit the read are refused.
+    {
+        // kind 0: written by libtiff; 1: an ImageJ stack (big-endian above 8
+        // bits); 2: libtiff, with one strip in every directory after the first
+        struct PS { const char* name; uint64_t x, y, z, spp, bits; uint16_t comp; uint32_t rps, tile; bool planar; int kind; };
+        const PS psCases[] = {
+            {"ps-u16-lzw",        40,   24, 9, 1, 16, COMPRESSION_LZW,   8,  0, false, 0},
+            {"ps-u8-none",        40,   24, 9, 1,  8, COMPRESSION_NONE,  8,  0, false, 0},
+            {"ps-f32-zstd",       40,   24, 9, 1, 32, COMPRESSION_ZSTD,  8,  0, false, 0},
+            {"ps-f64-rows",       37,   29, 6, 1, 64, COMPRESSION_LZW,   1,  0, false, 0},
+            {"ps-u16-tiled",      40,   24, 9, 1, 16, COMPRESSION_LZW,   0, 16, false, 0},
+            {"ps-rgb16-zstd",     40,   24, 5, 3, 16, COMPRESSION_ZSTD,  8,  0, false, 0},
+            {"ps-rgb8-tiled",     40,   24, 5, 3,  8, COMPRESSION_NONE,  0, 16, false, 0},
+            {"ps-rgb8-planar",    40,   24, 5, 3,  8, COMPRESSION_LZW,   8,  0, true,  0},
+            {"ps-rgba16-ptiled",  40,   24, 5, 4, 16, COMPRESSION_ZSTD,  0, 16, true,  0},
+            {"ps-u16-image",      40,   24, 1, 1, 16, COMPRESSION_LZW,   8,  0, false, 0},
+            {"ps-u32-two",      1024, 1024, 2, 1, 32, COMPRESSION_LZW,  16,  0, false, 0},
+            {"ps-u32-five",     1024, 1024, 5, 1, 32, COMPRESSION_LZW,  16,  0, false, 0},
+            {"ps-ij-g16",       1500, 1500, 4, 1, 16, COMPRESSION_NONE,  0,  0, false, 1},
+            {"ps-ij-rgb8",        40,   24, 9, 3,  8, COMPRESSION_NONE,  0,  0, false, 1},
+            {"ps-fallback-u16",   40,   24, 6, 1, 16, COMPRESSION_LZW,   8,  0, false, 2},
+            {"ps-fallback-rgb8",  40,   24, 6, 3,  8, COMPRESSION_ZSTD,  8,  0, true,  2},
+        };
+        const int prevThreads = omp_get_max_threads();
+        std::vector<int> threadCounts = {1, 3, 8};
+        if(prevThreads != 1 && prevThreads != 3 && prevThreads != 8) threadCounts.push_back(prevThreads);
+        const size_t guard = 64;
+        const uint8_t poison = 0xA5;
+        auto isPoison = [&](uint8_t v){ return v == poison; };
+        for(const PS& c : psCases){
+            total++;
+            const uint64_t es = c.bits/8, sliceBytes = c.x*c.y*c.spp*es;
+            std::vector<uint8_t> src(sliceBytes*c.z);
+            uint64_t st = 0x2545F4914F6CDD1Dull ^ (c.x*131 + c.y*7 + c.z*5 + c.bits*3 + c.spp);
+            for(uint8_t& b : src){ st = st*6364136223846793005ull + 1442695040888963407ull; b = (uint8_t)(st >> 60); }
+            const std::vector<uint8_t> flip = flipped(src.data(), c.x, c.y, c.z, c.spp, es);
+            const std::string path = dir + "/" + c.name + ".tif";
+            step(c.name, "per-slice", "write fixture");
+            const uint16_t fmt = std::strncmp(c.name, "ps-f", 4) == 0 ? SAMPLEFORMAT_IEEEFP : SAMPLEFORMAT_UINT;
+            bool made = c.kind == 1 ? writeImageJTiff(path, src.data(), c.x, c.y, c.z, c.spp, c.bits, c.bits > 8)
+                                    : writeLibtiff(path, src.data(), c.x, c.y, c.z, c.spp, c.bits, fmt, c.comp, c.rps, c.tile, c.planar,
+                                                   false, PREDICTOR_NONE, FILLORDER_MSB2LSB, c.kind == 2 ? (uint32_t)c.y : 0);
+            TiffInfo info;
+            made = made && !getTiffInfo(path.c_str(), info) && info.z == c.z && (info.imageJ != 0) == (c.kind == 1);
+            std::vector<std::vector<uint64_t>> ranges = {{}, {c.z - 1}};
+            if(c.z > 2) ranges.push_back({1, c.z - 1});
+            if(c.z > 1) ranges.push_back({0});
+            std::string bad = made ? "" : " fixture";
+            for(int t : threadCounts)
+                for(const std::vector<uint64_t>& r : ranges)
+                    for(uint8_t fl = 0; fl < 2 && made; fl++){
+                        omp_set_num_threads(t);
+                        const uint64_t first = r.empty() ? 0 : r[0], count = r.empty() ? c.z : r.size() == 2 ? r[1] - r[0] : 1;
+                        std::vector<std::vector<uint8_t>> bufs(count);
+                        std::vector<void*> table(count);
+                        for(uint64_t k = 0; k < count; k++){
+                            bufs[count - 1 - k].assign(guard + sliceBytes + (k ? 0 : count*sliceBytes) + guard, poison);
+                            table[k] = bufs[count - 1 - k].data() + guard;
+                        }
+                        step(c.name, "per-slice", "read");
+                        bool good = readTiffParallelInfo(path.c_str(), info, table, fl, r);
+                        const std::vector<uint8_t>& want = fl ? flip : src;
+                        for(uint64_t k = 0; k < count && good; k++){
+                            const std::vector<uint8_t>& b = bufs[count - 1 - k];
+                            good = std::memcmp(b.data() + guard, want.data() + (first + k)*sliceBytes, sliceBytes) == 0
+                                   && std::all_of(b.begin(), b.begin() + guard, isPoison) && std::all_of(b.begin() + guard + sliceBytes, b.end(), isPoison);
+                        }
+                        if(!good) bad += std::string(" ") + (fl ? "flip" : "no-flip") + "/" + (r.empty() ? "all" : r.size() == 2 ? "range" : "slice")
+                                         + std::to_string(first) + "/" + std::to_string(t) + "t";
+                    }
+            omp_set_num_threads(prevThreads);
+            // Refused, with nothing written: a destination too many or too few,
+            // a NULL one, and one not aligned to the samples (above 8 bits)
+            if(made && c.kind == 0 && c.z > 2){
+                step(c.name, "per-slice", "refusals");
+                std::vector<std::vector<uint8_t>> bufs(c.z + 1, std::vector<uint8_t>(guard + sliceBytes + guard, poison));
+                std::vector<void*> table(c.z + 1);
+                for(uint64_t k = 0; k <= c.z; k++) table[k] = bufs[k].data() + guard;
+                std::vector<void*> few(table.begin(), table.begin() + (c.z - 1)), withNull(table.begin(), table.begin() + c.z), skewed = withNull;
+                withNull[1] = nullptr;
+                skewed[2] = static_cast<uint8_t*>(skewed[2]) + 1;
+                bool refused = !readTiffParallelInfo(path.c_str(), info, table, 0, {})
+                               && !readTiffParallelInfo(path.c_str(), info, few, 1, {})
+                               && !readTiffParallelInfo(path.c_str(), info, withNull, 0, {})
+                               && !readTiffParallelInfo(path.c_str(), info, std::vector<void*>(table.begin(), table.begin() + 2), 0, {0, 3})
+                               && (es == 1 || !readTiffParallelInfo(path.c_str(), info, skewed, 0, {}));
+                for(const std::vector<uint8_t>& b : bufs)
+                    refused = refused && std::all_of(b.begin(), b.end(), isPoison);
+                if(!refused) bad += " refusals";
+            }
+            std::remove(path.c_str());
+            if(bad.empty()) std::printf("PASS  %-16s per-slice destinations\n", c.name);
+            else { std::printf("FAIL  %-16s per-slice destinations (%s)\n", c.name, bad.c_str() + 1); failures++; }
+        }
     }
 
     // ---- Pieces of slices. A compressed stack of large slices with fewer than
