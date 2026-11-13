@@ -119,8 +119,8 @@ uint8_t gpuWriteTiff(const char* fileName, const void* data, const uint64_t x, c
         errString = "unknown compression \""+compression+"\" (use lzw, zstd or none)";
         return 1;
     }
-    if(strcmp(mode, "w") && strcmp(mode, "a")){
-        errString = std::string("mode \"")+mode+"\" is not supported. Use w or a for mode type";
+    if(strcmp(mode, "w") && strcmp(mode, "wc") && strcmp(mode, "wf") && strcmp(mode, "a")){
+        errString = std::string("mode \"")+mode+"\" is not supported. Use w, wc or a for mode type";
         return 1;
     }
     if(bits != 8 && bits != 16 && bits != 32 && bits != 64){

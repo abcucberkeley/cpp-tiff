@@ -238,6 +238,30 @@ int main(int argc, char** argv){
     setEnv("CPPTIFF_GPU_PROFILE", nullptr);
     setEnv("CPPTIFF_GPU_WRITE_PART_MB", nullptr);
 
+    // Both layouts: "w" (every directory first) and "wc" (each slice's directory after its data), the CPU writer's
+    // files byte for byte
+    for(const char* mode : {"w", "wc", "wf"})
+        for(const char* comp : {"none", "lzw", "zstd"})
+            for(bool flip : {false, true}){
+                total++;
+                const std::string label = std::string("mode ")+mode+" "+comp+(flip ? " flip" : "");
+                const Case c{90, 70, 7, 1, 16, SAMPLEFORMAT_UINT};
+                const std::vector<uint8_t> data = make(c), in = flip ? toF(c, data) : data;
+                const std::string pg = dir + "/gw_gpu.tif", pc = dir + "/gw_cpu.tif";
+                const CUdeviceptr d = toGpu(in);
+                std::string err;
+                const uint8_t r = gpuWriteTiff(pg.c_str(), (void*)(uintptr_t)d, c.x, c.y, c.z, 16, 1, SAMPLEFORMAT_UINT, comp, mode, flip, 0,
+                                               nullptr, 4, err);
+                A->cuMemFree(d);
+                if(r){ fail(label, "the GPU write failed: "+err); continue; }
+                if(writeTiffParallelHelper(pc.c_str(), in.data(), 16, mode, c.x, c.y, c.z, 0, flip, comp, SAMPLEFORMAT_UINT, 0, 1)){
+                    fail(label, "the CPU write failed");
+                    continue;
+                }
+                if(std::string(comp) != "zstd" && fileBytes(pg) != fileBytes(pc)){ fail(label, "the file is not the CPU writer's"); continue; }
+                readsBack(pg, c, data, label);
+            }
+
     // Slices added to a file (mode "a"): the CPU writer's file made the same way
     for(const char* comp : {"none", "lzw", "zstd"})
         for(bool flip : {false, true}){

@@ -18,10 +18,15 @@
 #include <vector>
 #include <omp.h>
 #ifndef _WIN32
+#include <chrono>
 #include <csignal>
 #include <pwd.h>
+#include <spawn.h>
+#include <thread>
 #include <unistd.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
+extern char** environ;
 #endif
 
 #include "parallelreadtiff.h"
@@ -463,7 +468,98 @@ static bool fallbackMatches(bool twoD, const std::string& path, uint64_t x, uint
     return !err && guardOK && std::memcmp(out.data(), expected.data(), expected.size()) == 0;
 }
 
+#ifndef _WIN32
+// ---- Writes cut short (see main): a stack whose slice k is cutSlice(k), a
+// check that a file holds only whole slices of it, and the test run as a
+// child that writes it (--write-child), to be killed
+static const char* selfPath = "";
+static std::vector<uint16_t> cutSlice(uint64_t x, uint64_t y, uint64_t k){
+    std::vector<uint16_t> d(x*y);
+    for(uint64_t r = 0; r < y; r++)
+        for(uint64_t c = 0; c < x; c++) d[r*x + c] = (uint16_t)((k*1009 + r*31 + c*7 + ((r*c) % 13) + 13) & 0xFFFF);
+    return d;
+}
+static std::vector<uint16_t> cutStack(uint64_t x, uint64_t y, uint64_t z){
+    std::vector<uint16_t> d(x*y*z);
+    for(uint64_t k = 0; k < z; k++){ const std::vector<uint16_t> s = cutSlice(x, y, k); std::memcpy(&d[k*x*y], s.data(), s.size()*2); }
+    return d;
+}
+// Whether file f holds only whole slices of cutStack's stack: libtiff walks
+// directories whose every strip is in the file, getTiffInfo finds as many
+// slices, and each reads back as written (found: how many; no file, or a file
+// with no directory yet, holds 0)
+static bool onlyWholeSlices(const std::string& f, uint64_t x, uint64_t y, uint64_t maxZ, uint64_t& found, std::string& why){
+    found = 0;
+    FILE* fp = std::fopen(f.c_str(), "rb");
+    if(!fp) return true;
+    std::fseek(fp, 0, SEEK_END);
+    const uint64_t size = (uint64_t)std::ftell(fp);
+    std::fclose(fp);
+    const TIFFErrorHandler eh = TIFFSetErrorHandler(NULL), wh = TIFFSetWarningHandler(NULL);
+    uint64_t dirs = 0;
+    bool inFile = true;
+    TIFF* t = TIFFOpen(f.c_str(), "r");
+    if(t){
+        do{
+            for(uint32_t k = 0; k < TIFFNumberOfStrips(t) && inFile; k++){
+                const uint64_t o = TIFFGetStrileOffset(t, k), n = TIFFGetStrileByteCount(t, k);
+                inFile = n && o + n <= size;
+            }
+            if(!inFile) break;
+            dirs++;
+        } while(TIFFReadDirectory(t));
+        TIFFClose(t);
+    }
+    TIFFSetErrorHandler(eh);
+    TIFFSetWarningHandler(wh);
+    if(!inFile){ why = "directory " + std::to_string(dirs) + " has a strip that is not in the file"; return false; }
+    if(!dirs) return true;
+    TiffInfo info;
+    if(getTiffInfo(f.c_str(), info)){ why = "getTiffInfo failed, where libtiff walks " + std::to_string(dirs) + " directories"; return false; }
+    if(info.z != dirs || info.z > maxZ || info.x != x || info.y != y){
+        why = "getTiffInfo finds " + std::to_string(info.z) + " slices, libtiff " + std::to_string(dirs);
+        return false;
+    }
+    std::vector<uint16_t> got(x*y);
+    for(uint64_t k = 0; k < info.z; k++)
+        if(!readTiffParallelInfo(f.c_str(), info, got.data(), 0, {k}) || got != cutSlice(x, y, k)){
+            why = "slice " + std::to_string(k) + " does not read back as written";
+            return false;
+        }
+    found = info.z;
+    return true;
+}
+// Runs this test as a child writing cutStack's stack to f in mode, killed
+// (SIGKILL) after killAfter seconds unless that is negative; returns the
+// seconds it ran (negative if it could not run, or ran to the end and failed)
+static double runChild(const char* self, const std::string& f, const char* mode, uint64_t x, uint64_t y, uint64_t z, double killAfter){
+    const std::string sx = std::to_string(x), sy = std::to_string(y), sz = std::to_string(z);
+    const char* args[] = {self, "--write-child", f.c_str(), mode, sx.c_str(), sy.c_str(), sz.c_str(), NULL};
+    pid_t pid = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    if(posix_spawn(&pid, self, NULL, NULL, (char* const*)args, environ) != 0) return -1;
+    if(killAfter >= 0){
+        std::this_thread::sleep_for(std::chrono::duration<double>(killAfter));
+        kill(pid, SIGKILL);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if(killAfter < 0 && !(WIFEXITED(status) && WEXITSTATUS(status) == 0)) return -1;
+    return t;
+}
+#endif
+
 int main(int argc, char** argv){
+#ifndef _WIN32
+    // (the writer of a test of writes cut short: roundtripTest --write-child <file> <mode> <x> <y> <z>)
+    if(argc >= 7 && !std::strcmp(argv[1], "--write-child")){
+        const uint64_t cx = std::strtoull(argv[4], 0, 10), cy = std::strtoull(argv[5], 0, 10), cz = std::strtoull(argv[6], 0, 10);
+        const std::vector<uint16_t> d = cutStack(cx, cy, cz);
+        return writeTiffParallelWrapper(cx, cy, cz, argv[2], d.data(), 16, 0, 0, argv[3], false, "lzw", 1, 0) ? 1 : 0;
+    }
+    selfPath = argv[0];
+#endif
     const std::string dir = (argc > 1) ? argv[1] : ".";
 
     const uint64_t x = 40, y = 24, z = 3;
@@ -1251,6 +1347,223 @@ int main(int argc, char** argv){
             else { std::printf("FAIL  %-16s per-slice destinations (%s)\n", c.name, bad.c_str() + 1); failures++; }
         }
     }
+
+    // ---- The two layouts: mode "w" writes every directory, and its strip or
+    // tile arrays, before the first slice's data (DirectoriesFirst in
+    // parallelwritetiff.cpp), mode "wc" each slice's directory after its data.
+    // Both read back as the data, whole and as slice ranges, in both layouts,
+    // with one thread and every thread, and getTiffInfo finds the same in both:
+    // strips and tiles, LZW, zstd and none, gray and RGB, from row-major and
+    // MATLAB-layout data, one slice and many; with "w"'s directories linked
+    // slice by slice and 7 at a time (CPPTIFF_LINK_SLICES); "w"'s file the same
+    // byte for byte with every directory written by libtiff instead of copied
+    // (CPPTIFF_COPY_DIRECTORIES=0); and then with two slices added to each with
+    // "a".
+    for(const char* link : {"", "7"}){
+#ifdef _WIN32
+        _putenv_s("CPPTIFF_LINK_SLICES", link);
+#else
+        if(*link) setenv("CPPTIFF_LINK_SLICES", link, 1);
+        else unsetenv("CPPTIFF_LINK_SLICES");
+#endif
+        struct DF { const char* name; uint64_t x, y, z, spp, bits; const char* comp; uint64_t tile; bool transpose; };
+        const DF dfCases[] = {
+            {"df-u16-lzw",   40, 24, 9, 1, 16, "lzw",  0,  false},
+            {"df-u8-none",   40, 24, 9, 1,  8, "none", 0,  false},
+            {"df-f32-zstd",  40, 24, 9, 1, 32, "zstd", 0,  true},
+            {"df-u16-tiled", 40, 24, 5, 1, 16, "lzw",  16, false},
+            {"df-rgb8-zstd", 40, 24, 5, 3,  8, "zstd", 0,  false},
+            {"df-u16-one",   40, 24, 1, 1, 16, "lzw",  0,  false},
+            {"df-u16-many", 33, 17, 600, 1, 16, "none", 0, false},
+        };
+        const int prevThreads = omp_get_max_threads();
+        for(const DF& c : dfCases){
+            total++;
+            const uint64_t es = c.bits/8, sliceBytes = c.x*c.y*c.spp*es, zAll = c.z + 2;
+            std::vector<uint8_t> src(sliceBytes*zAll);
+            uint64_t st = 0x9E3779B97F4A7C15ull ^ (c.x*131 + c.y*7 + c.z*5 + c.bits*3 + c.spp);
+            for(uint8_t& b : src){ st = st*6364136223846793005ull + 1442695040888963407ull; b = (uint8_t)(st >> 59); }
+            // (the stack, then two more slices to add)
+            const std::vector<uint8_t> first(src.begin(), src.begin() + sliceBytes*c.z), more(src.begin() + sliceBytes*c.z, src.end());
+            const std::vector<uint8_t> flip = flipped(first.data(), c.x, c.y, c.z, c.spp, es);
+            const std::vector<uint8_t> flipMore = flipped(more.data(), c.x, c.y, 2, c.spp, es);
+            const std::vector<uint8_t> flipAll = flipped(src.data(), c.x, c.y, zAll, c.spp, es);
+            const std::string pc = dir + "/" + c.name + "-wc.tif", pf = dir + "/" + c.name + "-w.tif";
+            const uint16_t fmt = c.bits == 32 ? 3 : 1;
+            step(c.name, "layouts", "write both ways");
+            const std::vector<uint8_t>& in = c.transpose ? flip : first;
+            bool ok = !writeTiffParallelWrapper(c.x, c.y, c.z, pc.c_str(), in.data(), c.bits, 0, 8, "wc", c.transpose, c.comp, fmt, c.tile, c.spp)
+                      && !writeTiffParallelWrapper(c.x, c.y, c.z, pf.c_str(), in.data(), c.bits, 0, 8, "w", c.transpose, c.comp, fmt, c.tile, c.spp);
+            const std::string pl = dir + "/" + c.name + "-wl.tif";
+#ifdef _WIN32
+            _putenv_s("CPPTIFF_COPY_DIRECTORIES", "0");
+#else
+            setenv("CPPTIFF_COPY_DIRECTORIES", "0", 1);
+#endif
+            bool same = ok && !writeTiffParallelWrapper(c.x, c.y, c.z, pl.c_str(), in.data(), c.bits, 0, 8, "w", c.transpose, c.comp, fmt, c.tile, c.spp);
+#ifdef _WIN32
+            _putenv_s("CPPTIFF_COPY_DIRECTORIES", "");
+#else
+            unsetenv("CPPTIFF_COPY_DIRECTORIES");
+#endif
+            same = same && readFileBytes(pl) == readFileBytes(pf) && !readFileBytes(pf).empty();
+            std::remove(pl.c_str());
+            // The layouts: "w" every directory before the first slice's data and
+            // all the data after the last directory, "wc" each directory after its
+            // slice's data
+            auto layoutOf = [&](const std::string& f, bool& dirsFirst){
+                TIFF* t = TIFFOpen(f.c_str(), "r");
+                if(!t) return false;
+                uint64_t lastDir = 0, firstDir = UINT64_MAX, minData = UINT64_MAX, dirs = 0;
+                do{
+                    lastDir = std::max<uint64_t>(lastDir, TIFFCurrentDirOffset(t));
+                    firstDir = std::min<uint64_t>(firstDir, TIFFCurrentDirOffset(t));
+                    for(uint32_t k = 0; k < TIFFNumberOfStrips(t); k++) minData = std::min<uint64_t>(minData, TIFFGetStrileOffset(t, k));
+                    dirs++;
+                } while(TIFFReadDirectory(t));
+                TIFFClose(t);
+                dirsFirst = lastDir < minData;
+                return dirs == c.z && (dirsFirst || firstDir > minData);
+            };
+            bool firstF = false, firstC = true;
+            const bool layout = ok && layoutOf(pf, firstF) && layoutOf(pc, firstC) && firstF && !firstC;
+            TiffInfo ic, iff;
+            ok = ok && !getTiffInfo(pc.c_str(), ic) && !getTiffInfo(pf.c_str(), iff) && iff.z == c.z && iff.x == ic.x && iff.y == ic.y
+                 && iff.bits == ic.bits && iff.samples == ic.samples && iff.stripSize == ic.stripSize && iff.compression == ic.compression
+                 && iff.tiled == ic.tiled && iff.offsets.size() == c.z && ic.z == c.z;
+            const uint64_t a = c.z > 2 ? 1 : 0, e = c.z > 2 ? c.z - 1 : c.z;
+            for(const std::string& f : {pf, pc})
+                for(int t : {1, prevThreads}){
+                    omp_set_num_threads(t);
+                    step(c.name, "layouts", "reads");
+                    void* nf = ok ? readTiffParallelWrapperNoXYFlip(f.c_str(), {}) : nullptr;
+                    void* nr = ok ? readTiffParallelWrapperNoXYFlip(f.c_str(), {a, e}) : nullptr;
+                    void* fl = ok ? readTiffParallelWrapper(f.c_str()) : nullptr;
+                    void* fr = ok ? readTiffParallelWrapper(f.c_str(), {a, e}) : nullptr;
+                    ok = nf && std::memcmp(nf, first.data(), first.size()) == 0
+                         && nr && std::memcmp(nr, first.data() + a*sliceBytes, (e - a)*sliceBytes) == 0
+                         && fl && std::memcmp(fl, flip.data(), flip.size()) == 0
+                         && fr && std::memcmp(fr, flip.data() + a*sliceBytes, (e - a)*sliceBytes) == 0;
+                    free(nf); free(nr); free(fl); free(fr);
+                }
+            omp_set_num_threads(prevThreads);
+            // Two slices added to each with "a"
+            step(c.name, "layouts", "append");
+            const std::vector<uint8_t>& inMore = c.transpose ? flipMore : more;
+            bool appended = ok;
+            for(const std::string& f : {pf, pc}){
+                appended = appended && !writeTiffParallelWrapper(c.x, c.y, 2, f.c_str(), inMore.data(), c.bits, 0, 8, "a", c.transpose, c.comp, fmt, c.tile, c.spp);
+                void* nf = appended ? readTiffParallelWrapperNoXYFlip(f.c_str(), {}) : nullptr;
+                void* fl = appended ? readTiffParallelWrapper(f.c_str()) : nullptr;
+                TiffInfo ia;
+                appended = nf && fl && !getTiffInfo(f.c_str(), ia) && ia.z == zAll && std::memcmp(nf, src.data(), src.size()) == 0
+                           && std::memcmp(fl, flipAll.data(), flipAll.size()) == 0;
+                free(nf); free(fl);
+            }
+            std::remove(pc.c_str()); std::remove(pf.c_str());
+            const std::string how = *link ? std::string(", linked ") + link + " at a time" : "";
+            if(ok && layout && same && appended) std::printf("PASS  %-16s both layouts%s\n", c.name, how.c_str());
+            else { std::printf("FAIL  %-16s both layouts%s  (read back=%d layout=%d same as libtiff's=%d appended=%d)\n", c.name, how.c_str(), (int)ok, (int)layout, (int)same, (int)appended); failures++; }
+        }
+    }
+#ifdef _WIN32
+    _putenv_s("CPPTIFF_LINK_SLICES", "");
+#else
+    unsetenv("CPPTIFF_LINK_SLICES");
+
+    // ---- Writes cut short, in both layouts: by a full disk (a file-size limit
+    // in this process) and killed (SIGKILL: the test runs itself as the writer,
+    // --write-child, and kills it partway). The file must then hold exactly the
+    // slices that were finished: getTiffInfo's slices each read back as written,
+    // libtiff walks no other directory, and every strip it finds is in the file.
+    // Stacks of 2,000 slices of 64 x 64 (whose strips wait in the writer's
+    // queue) and of 120 of 512 x 512, LZW; mode "w" with its slices linked as it
+    // links them (1 MB at a time) and one at a time (CPPTIFF_LINK_SLICES=1).
+    // Mode "w"'s files then take two more slices with "a", after those left.
+    {
+        struct CS { const char* name; uint64_t x, y, z; };
+        const CS csCases[] = {{"cut-tiny", 64, 64, 2000}, {"cut-big", 512, 512, 120}};
+        struct rlimit oldLimit;
+        getrlimit(RLIMIT_FSIZE, &oldLimit);
+        void (*oldHandler)(int) = std::signal(SIGXFSZ, SIG_IGN);
+        for(const CS& c : csCases)
+            for(const char* how : {"w", "w1", "wc"}){
+                total++;
+                const std::string mode = how[1] == 'c' ? "wc" : "w";
+                if(how[1] == '1') setenv("CPPTIFF_LINK_SLICES", "1", 1);
+                else unsetenv("CPPTIFF_LINK_SLICES");
+                const std::string f = dir + "/" + c.name + "-" + how + ".tif";
+                std::string why;
+                uint64_t found = 0;
+                bool ok = true;
+                // (mode "w": two slices added with "a" to what is left, which
+                // then holds them too, after the slices it held)
+                auto addTwo = [&](const std::string& when){
+                    if(mode != "w") return true;
+                    std::vector<uint16_t> more(2*c.x*c.y);
+                    for(uint64_t k = 0; k < 2; k++){
+                        const std::vector<uint16_t> sl = cutSlice(c.x, c.y, found + k);
+                        std::memcpy(&more[k*c.x*c.y], sl.data(), sl.size()*2);
+                    }
+                    uint64_t now = 0;
+                    if(writeTiffParallelWrapper(c.x, c.y, 2, f.c_str(), more.data(), 16, 0, 0, "a", false, "lzw", 1, 0)){
+                        why = when + ": two slices could not be added to the " + std::to_string(found) + " left";
+                        return false;
+                    }
+                    if(!onlyWholeSlices(f, c.x, c.y, c.z + 2, now, why) || now != found + 2){
+                        why = when + ": with two slices added to the " + std::to_string(found) + " left, " + (why.empty() ? std::to_string(now) + " slices" : why);
+                        return false;
+                    }
+                    return true;
+                };
+                // whole: the file's size, and the time a child takes to make it
+                step(c.name, how, "whole");
+                const std::vector<uint16_t> data = cutStack(c.x, c.y, c.z);
+                ok = !writeTiffParallelWrapper(c.x, c.y, c.z, f.c_str(), data.data(), 16, 0, 0, mode.c_str(), false, "lzw", 1, 0)
+                     && onlyWholeSlices(f, c.x, c.y, c.z, found, why) && found == c.z;
+                if(!ok) why = "the whole write: " + why;
+                FILE* fp = ok ? std::fopen(f.c_str(), "rb") : NULL;
+                uint64_t size = 0;
+                if(fp){ std::fseek(fp, 0, SEEK_END); size = (uint64_t)std::ftell(fp); std::fclose(fp); }
+                // a full disk at 10%, 45% and 80% of the file
+                std::string seen;
+                for(double frac : {0.10, 0.45, 0.80}){
+                    if(!ok) break;
+                    step(c.name, how, "disk full");
+                    std::remove(f.c_str());
+                    struct rlimit lim = oldLimit;
+                    lim.rlim_cur = (rlim_t)(size*frac);
+                    setrlimit(RLIMIT_FSIZE, &lim);
+                    const bool failedAsItShould = writeTiffParallelWrapper(c.x, c.y, c.z, f.c_str(), data.data(), 16, 0, 0, mode.c_str(), false, "lzw", 1, 0) != 0;
+                    setrlimit(RLIMIT_FSIZE, &oldLimit);
+                    ok = failedAsItShould && onlyWholeSlices(f, c.x, c.y, c.z, found, why);
+                    if(!failedAsItShould) why = "a write past the limit reported success";
+                    else if(!ok) why = "disk full at " + std::to_string(frac) + ": " + why;
+                    seen += " " + std::to_string(found);
+                    ok = ok && addTwo("disk full at " + std::to_string(frac));
+                }
+                // killed at a quarter, half, three quarters and 95% of a child's run
+                const double whole = ok ? runChild(selfPath, f, mode.c_str(), c.x, c.y, c.z, -1) : 0;
+                ok = ok && whole > 0 && onlyWholeSlices(f, c.x, c.y, c.z, found, why) && found == c.z;
+                for(double frac : {0.25, 0.5, 0.75, 0.95}){
+                    if(!ok) break;
+                    step(c.name, how, "killed");
+                    std::remove(f.c_str());
+                    runChild(selfPath, f, mode.c_str(), c.x, c.y, c.z, whole*frac);
+                    ok = onlyWholeSlices(f, c.x, c.y, c.z, found, why);
+                    if(!ok) why = "killed at " + std::to_string(frac) + ": " + why;
+                    seen += " " + std::to_string(found);
+                    ok = ok && addTwo("killed at " + std::to_string(frac));
+                }
+                std::remove(f.c_str());
+                const std::string label = mode + (how[1] == '1' ? ", linked one at a time" : "");
+                if(ok) std::printf("PASS  %-16s cut short, mode %s (slices left:%s)\n", c.name, label.c_str(), seen.c_str());
+                else { std::printf("FAIL  %-16s cut short, mode %s  (%s)\n", c.name, label.c_str(), why.c_str()); failures++; }
+            }
+        unsetenv("CPPTIFF_LINK_SLICES");
+        std::signal(SIGXFSZ, oldHandler);
+    }
+#endif
 
     // ---- Directories unlike the first. The readers plan a read from the first
     // directory, and a directory laid out otherwise read wrong data with no

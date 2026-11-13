@@ -26,7 +26,7 @@ bool gpuWriteTiffAvailable(std::string &why);
 // Writes z slices of x by y pixels of samples samples (1 grayscale, 3 RGB, 4 RGBA) of bits bits (8, 16, 32 or
 // 64; sampleFormat as for writeTiffParallelWrapper, 0 to derive it from bits) from data, GPU memory holding
 // them row-major (z, y, x[, c]), or with flipXY column-major (y, x[, c], z) as MATLAB has it, to fileName
-// (mode "w", or "a" to add them to the file's slices), compressed as compression says ("lzw", "zstd" or
+// (mode "w", "wc" or "a", as for writeTiffParallelWrapper), compressed as compression says ("lzw", "zstd" or
 // "none"), in strips (tileSize 0) or tiles of tileSize pixels, with the GPU work on stream (a CUstream /
 // cudaStream_t, nullptr for the default stream) after the work queued on it before; returns once the file is
 // written: 0, or 1 with the reason in errString. threads: the host threads that compress strips nvCOMP does
