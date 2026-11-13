@@ -210,7 +210,7 @@ set(CPPTIFF_RUNTIME_SYMBOLS
     "_ZNSa*" "_ZNKSa*" "_ZNSb*" "_ZNKSb*" "_ZNSs*" "_ZNKSs*" "_ZNSi*" "_ZNKSi*" "_ZNSo*" "_ZNKSo*" "_ZNSd*" "_ZNKSd*"
     "_ZTISa*" "_ZTISb*" "_ZTISs*" "_ZTISi*" "_ZTISo*" "_ZTISd*" "_ZTSSa*" "_ZTSSb*" "_ZTSSs*" "_ZTSSi*" "_ZTSSo*" "_ZTSSd*"
     "_ZTVSa*" "_ZTVSb*" "_ZTVSs*" "_ZTVSi*" "_ZTVSo*" "_ZTVSd*" "_ZTTSi*" "_ZTTSo*" "_ZTTSd*"
-    "_ZThn*St*" "_ZTv*St*" "_ZTch*St*"
+    "_ZThn*St*" "_ZTv*St*" "_ZTch*St*" "_ZTh*_NS[abdios]*" "_ZTv*_NS[abdios]*" "_ZTc*_NS[abdios]*"
     "_ZN9__gnu_cxx*" "_ZNK9__gnu_cxx*" "_ZTIN9__gnu_cxx*" "_ZTSN9__gnu_cxx*" "_ZTVN9__gnu_cxx*" "_ZGVZN9__gnu_cxx*"
     "_ZN10__cxxabiv1*" "_ZNK10__cxxabiv1*" "_ZTIN10__cxxabiv1*" "_ZTSN10__cxxabiv1*" "_ZTVN10__cxxabiv1*"
     "_ZTI?" "_ZTS?" "_ZTIP?" "_ZTSP?" "_ZTIPK?" "_ZTSPK?" "_ZTID?" "_ZTSD?" "_ZTIPD?" "_ZTSPD?" "_ZTIPKD?" "_ZTSPKD?"
