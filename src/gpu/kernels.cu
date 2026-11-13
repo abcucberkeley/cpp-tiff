@@ -169,92 +169,135 @@ extern "C" __global__ void ct_check(const int* __restrict__ status, const u64* _
     }
 }
 
-// TIFF's LZW decoded on the GPU (CPPTIFF_GPU_LZW=1, a research setting, off by default: the host decodes LZW,
-// which nvCOMP does not have). Measured, it is no way to decode LZW: an 8 GB stack of 4,000 strips of 2 MB read in
-// 26.6 s with it on an A100, against 1.9 s decoded on 10 Xeon cores (each thread's codes are a chain of dependent
-// reads of GPU memory; a decoder that is to beat the host needs the table in shared memory and a warp a strip).
-// A stream a thread, as the library's CPU decoder (lzwdecode.cpp) decodes, each code's
-// string an offset and a length into the output already decoded, the code width growing one code early as libtiff
-// has it. A thread's table (5119 starts, then as many lengths) is in GPU memory, LZW_TABLE_BYTES a thread. A stream
-// the CPU decoder would hand to libtiff (old-style codes, bad or too little data) gets status 1, and its read is
-// read on the CPU.
+// TIFF's LZW decoded on the GPU, a warp a strip (nvCOMP has no LZW; which strips the GPU decodes: gpureadtiff.cpp's lzwOnGpu):
+// the strip's codes are read in order by one lane, which keeps the code table in shared memory (each code's prefix,
+// last byte and length in 32 bits, and its first byte), and between two Clear codes (a segment: at most 3,839 codes,
+// one table) the codes are kept in GPU memory (LZW_CODES_BYTES a block, at codesAll); at each segment's end the
+// warp's 32 lanes write the segment's strings out side by side, each lane a code at a time, its string from its last
+// byte back along the prefixes (a warp scan of the lengths places them), so that only the reading of codes is a chain
+// of dependent steps, and those read shared memory (19 KB a block of one warp) and the input, read up to 7 bytes at a
+// time. What the CPU decoder (lzwdecode.cpp) would hand to libtiff (old-style codes, bad or too little data), and
+// tables that fill without a Clear code (libtiff's encoder clears them at 4,094 codes), get status 1, and their read
+// is read on the CPU. Measured on an A100 against decoding on the host's 10 cores: the 8 GB stack of 2 MB strips read
+// warm in 1.72 s against 1.92 s, with 2.8 CPU seconds against 19, 2 GB of 256 KB strips with the predictor in 0.32 s
+// against 0.70 s, and cold from VAST in 3.5 s against 4.8 s. With the codes in shared memory too (27 KB a block) and
+// the input read a byte at a time, the 8 GB stack took 2.23 s; a thread a strip, with the table in GPU memory, took
+// 26.6 s (each code a chain of dependent reads of GPU memory).
 #define LZW_CLEAR 256u
 #define LZW_EOI 257u
 #define LZW_FIRST 258u
-#define LZW_CSIZE (4095u + 1024u)
-#define LZW_TABLE_BYTES 30720u
+#define LZW_ENTRIES 3838u     /* codes 258 to 4095 */
+#define LZW_CODES_BYTES 7680u
+#define LZW_FULL 0xFFFFFFFFu
 
-__device__ bool lzwDecodeOne(const u8* in, u64 inBytes, u8* out, u64 occ, u32* start, u16* len){
-    if(inBytes < 2 || (in[0] == 0 && (in[1] & 1)) || occ == 0 || occ > 0xFFFFFFFFull) return false;
-    u8* const end = out + occ;
-    u8* op = out;
-    const u8* bp = in;
-    const u8* const bend = in + inBytes;
-    u64 bitbuf = 0;
-    int bits = 0, nbits = 9;
-    u32 mask = (1u << 9) - 1, freeEnt = 0, maxcode = mask - 1;
-    u32 oldStart = 0, oldLen = 0;
-    u32 code;
-#define LZW_NEXT(c) {                                                                                  \
-        while(bits < nbits){ if(bp >= bend) return false; bitbuf = (bitbuf << 8) | *bp++; bits += 8; } \
+extern "C" __global__ void __launch_bounds__(32) ct_lzw(const u64* __restrict__ inPtr, const u64* __restrict__ inBytes,
+                                                         const u64* __restrict__ outBytes, const u64* __restrict__ outPtr,
+                                                         u64* got, int* status, u32 n, u8* codesAll){
+    __shared__ u32 ent[LZW_ENTRIES];      // prefix << 20 | last byte << 12 | length
+    __shared__ u8 firstOf[LZW_ENTRIES];
+    __shared__ u32 seg[3];                 // the segment's codes, where its output starts, and 1 done | 2 failed
+    u16* const codes = (u16*)(codesAll + (u64)blockIdx.x * LZW_CODES_BYTES);
+    const u32 lane = threadIdx.x;
+    for(u32 si = blockIdx.x; si < n; si += gridDim.x){
+        const u8* in = (const u8*)inPtr[si];
+        const u64 inN = inBytes[si], occ64 = outBytes[si];
+        u8* out = (u8*)outPtr[si];
+        const u32 occ = (u32)occ64;
+        // (lane 0's reading state, kept from segment to segment)
+        u64 bitbuf = 0, bp = 0;
+        int bits = 0, nbits = 9;
+        u32 mask = 511, maxcode = 510, freeEnt = LZW_FIRST, pos = 0;
+        u32 prev = LZW_FULL, prevLen = 0, prevFirst = 0;
+        bool clearPending = true;
+        if(lane == 0){
+            u32 flags = 0;
+            if(inN < 2 || (in[0] == 0 && (in[1] & 1)) || occ64 == 0 || occ64 > 0xFFFFFFFFull) flags = 2;
+            seg[2] = flags;
+        }
+        __syncwarp();
+        u32 flags = seg[2];
+        while(!flags){
+            if(lane == 0){
+                u32 nc = 0;
+                const u32 segStart = pos;
+#define LZW_NEXT(c) {                                                                                 \
+        if(bits < nbits){                                                                              \
+            while(bits <= 56 && bp < inN){ bitbuf = (bitbuf << 8) | __ldg(in + bp); bp++; bits += 8; }  \
+            if(bits < nbits){ flags = 2; break; }                                                      \
+        }                                                                                              \
         c = (u32)(bitbuf >> (bits - nbits)) & mask;                                                    \
         bits -= nbits;                                                                                 \
     }
-#define LZW_ADD {                                                                                      \
-        start[freeEnt] = oldStart; len[freeEnt] = (u16)(oldLen + 1);                                   \
-        if(++freeEnt > maxcode){ if(++nbits > 12) nbits = 12; mask = (1u << nbits) - 1; maxcode = mask - 1; } \
-    }
-    LZW_NEXT(code)
-    if(code != LZW_CLEAR) return false;
-    for(;;){
-        if(code == LZW_CLEAR){
-            freeEnt = LZW_FIRST; nbits = 9; mask = (1u << 9) - 1; maxcode = mask - 1;
-            do { LZW_NEXT(code) } while(code == LZW_CLEAR);
-            if(code >= LZW_EOI) return false;
-            oldStart = (u32)(op - out); oldLen = 1;
-            *op++ = (u8)code;
-            if(op == end) return true;
-            LZW_NEXT(code)
-            continue;
-        }
-        if(code == LZW_EOI || freeEnt >= LZW_CSIZE || (code > freeEnt && code >= LZW_FIRST)) return false;
-        if(code < 256){
-            LZW_ADD
-            oldStart = (u32)(op - out); oldLen = 1;
-            *op++ = (u8)code;
-            if(op == end) return true;
-            LZW_NEXT(code)
-            continue;
-        }
-        u32 s, l;
-        if(code == freeEnt){ s = oldStart; l = oldLen + 1; }
-        else { s = start[code]; l = len[code]; }
-        LZW_ADD
-        const u32 pos = (u32)(op - out);
-        oldStart = pos; oldLen = l;
-        const u8* src = out + s;
-        const u64 room = (u64)(end - op);
-        if(room <= l){
-            for(u64 i = 0; i < room; i++) op[i] = src[i];
-            return true;
-        }
-        for(u32 i = 0; i < l; i++) op[i] = src[i];
-        op += l;
-        LZW_NEXT(code)
-    }
+                for(;;){
+                    u32 code;
+                    if(clearPending){
+                        // (a new table: the codes after the Clear code, the first a byte)
+                        clearPending = false;
+                        freeEnt = LZW_FIRST; nbits = 9; mask = 511; maxcode = 510;
+                        do { LZW_NEXT(code) } while(code == LZW_CLEAR);
+                        if(flags) break;
+                        if(code >= LZW_EOI){ flags = 2; break; }
+                        codes[nc++] = (u16)code;
+                        prev = code; prevLen = 1; prevFirst = code;
+                        if(++pos >= occ){ flags = 1; break; }
+                    }
+                    LZW_NEXT(code)
+                    if(code == LZW_CLEAR){ clearPending = true; break; }
+                    if(code == LZW_EOI || freeEnt > 4095u || (code > freeEnt && code >= LZW_FIRST)){ flags = 2; break; }
+                    u32 len, first;
+                    if(code < 256){ len = 1; first = code; }
+                    else if(code < freeEnt){ len = ent[code - LZW_FIRST] & 0xFFFu; first = firstOf[code - LZW_FIRST]; }
+                    else { len = prevLen + 1; first = prevFirst; }   // (the code being added: the previous string and its first byte)
+                    if(prevLen + 1 > 4095u){ flags = 2; break; }
+                    ent[freeEnt - LZW_FIRST] = (prev << 20) | (first << 12) | (prevLen + 1);
+                    firstOf[freeEnt - LZW_FIRST] = (u8)prevFirst;
+                    if(++freeEnt > maxcode){ if(++nbits > 12) nbits = 12; mask = (1u << nbits) - 1; maxcode = mask - 1; }
+                    codes[nc++] = (u16)code;
+                    prev = code; prevLen = len; prevFirst = first;
+                    pos += len;
+                    if(pos >= occ){ flags = 1; break; }
+                }
 #undef LZW_NEXT
-#undef LZW_ADD
-}
-
-extern "C" __global__ void ct_lzw(const u64* __restrict__ inPtr, const u64* __restrict__ inBytes, const u64* __restrict__ outBytes,
-                                  const u64* __restrict__ outPtr, u64* got, int* status, u32 n, u8* tables){
-    const u32 tid = blockIdx.x * blockDim.x + threadIdx.x, nth = gridDim.x * blockDim.x;
-    u32* start = (u32*)(tables + (u64)tid * LZW_TABLE_BYTES);
-    u16* len = (u16*)(start + LZW_CSIZE);
-    for(u32 i = tid; i < n; i += nth){
-        const bool ok = lzwDecodeOne((const u8*)inPtr[i], inBytes[i], (u8*)outPtr[i], outBytes[i], start, len);
-        status[i] = ok ? 0 : 1;
-        got[i] = ok ? outBytes[i] : 0;
+                seg[0] = nc;
+                seg[1] = segStart;
+                seg[2] = flags;
+            }
+            __syncwarp();
+            const u32 nc = seg[0];
+            u32 base = seg[1];
+            flags = seg[2];
+            if(flags & 2) break;
+            // the segment's strings, 32 codes at a time
+            for(u32 r = 0; r < nc; r += 32){
+                const u32 k = r + lane;
+                u32 c = 0, len = 0;
+                if(k < nc){ c = codes[k]; len = c < 256 ? 1 : (ent[c - LZW_FIRST] & 0xFFFu); }
+                u32 inc = len;
+                for(u32 d = 1; d < 32; d <<= 1){
+                    const u32 v = __shfl_up_sync(LZW_FULL, inc, d);
+                    if(lane >= d) inc += v;
+                }
+                const u32 p = base + inc - len;
+                base += __shfl_sync(LZW_FULL, inc, 31);
+                if(k < nc){
+                    u32 j = len;
+                    while(c >= 256){
+                        const u32 e = ent[c - LZW_FIRST];
+                        j--;
+                        if(p + j < occ) out[p + j] = (u8)(e >> 12);
+                        c = e >> 20;
+                    }
+                    if(p < occ) out[p] = (u8)c;
+                }
+            }
+            __syncwarp();
+        }
+        if(lane == 0){
+            const bool ok = flags == 1;
+            status[si] = ok ? 0 : 1;
+            got[si] = ok ? occ64 : 0;
+        }
+        __syncwarp();
     }
 }
 

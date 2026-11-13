@@ -31,16 +31,26 @@ struct Unit {
 static_assert(sizeof(Unit) == 64, "a unit is 64 bytes, as the kernels have it");
 const uint64_t hostBit = 1ull << 63;
 
-// How a unit's stored bytes become its decoded ones: as they are, by nvCOMP, by the GPU's LZW decoder
-// (CPPTIFF_GPU_LZW=1, a research setting), or on the host
+// How a unit's stored bytes become its decoded ones: as they are, by nvCOMP, by the GPU's LZW decoder (kernels.cu's
+// ct_lzw), or on the host
 enum How : uint8_t { Raw = 0, GpuZstd = 1, GpuDeflate = 2, Host = 3, GpuLzw = 4 };
 // (kinds of GPU-decoded streams: nvCOMP's codecs, then the LZW kernel's)
 const int LzwKind = NCodecs, NKinds = NCodecs + 1;
-const uint64_t lzwTableBytes = 30720;   // (kernels.cu's LZW_TABLE_BYTES)
+const uint64_t lzwCodesBytes = 7680;    // (kernels.cu's LZW_CODES_BYTES)
 
-bool gpuLzw(){
-    static const bool on = std::getenv("CPPTIFF_GPU_LZW") && std::atoi(std::getenv("CPPTIFF_GPU_LZW")) == 1;
-    return on;
+// Whether the GPU decodes a directory's LZW strips (or tiles) of unitBytes bytes each: CPPTIFF_GPU_LZW=1 always, =0
+// never (the host decodes them), and by default when they are at most 1 MB. Each strip is a chain of codes that one
+// warp reads in order (kernels.cu's ct_lzw), so the GPU decodes as many at once as a part holds: 256 KB strips (with
+// the predictor) read 2.2 times as fast as decoded on the host's 10 cores of an A100 node and 2.6 times on the 16
+// cores of a B200's, while 2 MB strips, of which a part holds about 500, read 1.1 times as fast on the A100 node and
+// 0.55 times on the B200's, whose cores decode them at 15 GB/s (with a sixth of the CPU time either way).
+bool lzwOnGpu(uint64_t unitBytes){
+    static const int mode = [](){
+        const char* e = std::getenv("CPPTIFF_GPU_LZW");
+        if(!e || !*e) return -1;
+        return std::atoi(e) == 0 ? 0 : 1;
+    }();
+    return mode == 1 || (mode < 0 && unitBytes <= ((uint64_t)1 << 20));
 }
 
 // A unit as planned: where its stored bytes are in the file, how they are decoded, and where its bytes go
@@ -148,11 +158,11 @@ bool planRead(ReadState &rs, uint32_t ri, const Api* a, Handles &hs, int threads
         const bool planar = spp > 1 && pc == PLANARCONFIG_SEPARATE, tiled = TIFFIsTiled(tif);
         const bool byteSwapped = es > 1 && TIFFIsByteSwapped(tif);
         How gpuHow = Host;
-        if(fill == FILLORDER_MSB2LSB && (pred == PREDICTOR_NONE || pred == PREDICTOR_HORIZONTAL)){
+        const bool kernelsTake = fill == FILLORDER_MSB2LSB && (pred == PREDICTOR_NONE || pred == PREDICTOR_HORIZONTAL);
+        if(kernelsTake){
             if(comp == COMPRESSION_NONE) gpuHow = Raw;
             else if(comp == COMPRESSION_ZSTD && a->decompressAsync[Zstd]) gpuHow = GpuZstd;
             else if((comp == COMPRESSION_ADOBE_DEFLATE || comp == COMPRESSION_DEFLATE) && a->decompressAsync[Deflate]) gpuHow = GpuDeflate;
-            else if(comp == COMPRESSION_LZW && gpuLzw()) gpuHow = GpuLzw;
         }
         const uint64_t planes = planar ? spp : 1, unitSpp = planar ? 1 : spp;
         uint32_t tw = 0, th = 0, rps32 = 0;
@@ -171,6 +181,7 @@ bool planRead(ReadState &rs, uint32_t ri, const Api* a, Handles &hs, int threads
         }
         const uint64_t n = perPlane*planes;
         if(n != (uint64_t)(tiled ? TIFFNumberOfTiles(tif) : TIFFNumberOfStrips(tif))){ bad = 1; continue; }
+        if(kernelsTake && comp == COMPRESSION_LZW && lzwOnGpu(tiled ? (uint64_t)tw*th*unitSpp*es : rps*x*unitSpp*es)) gpuHow = GpuLzw;
         std::vector<Planned> &list = per[(size_t)k];
         list.reserve((size_t)n);
         for(uint64_t i = 0; i < n; i++){
@@ -494,9 +505,10 @@ uint8_t gpuReadTiff(const std::vector<GpuTiffRead> &reads, const bool flipXY, vo
             // network storage every read call costs). A part that only reads hands each thread runs of about a quarter
             // of its share at a time, in the file's order: one at a time each thread's reads jumped around the file,
             // which made cold reads of small deflate strips from VAST 1.7-2.2 times as slow (the NFS client's
-            // read-ahead follows each open file's reads); a part that decodes on the host (LZW) hands them out one at a
-            // time, which balances the decoding (warm LZW 1.13 times as fast as in runs; cold as fast), as runs of 16
-            // did not (a part of a few dozen big strips left most threads idle)
+            // read-ahead follows each open file's reads); a part that decodes on the host (LZW with CPPTIFF_GPU_LZW=0,
+            // and the codecs the GPU does not decode) hands them out one at a time, which balances the decoding (warm
+            // LZW 1.13 times as fast as in runs; cold as fast), as runs of 16 did not (a part of a few dozen big strips
+            // left most threads idle)
             std::vector<std::pair<size_t, size_t>> tasks;
             for(size_t i = p.begin; i < p.end; i++){
                 const Planned &q = units[i];
@@ -556,10 +568,10 @@ uint8_t gpuReadTiff(const std::vector<GpuTiffRead> &reads, const bool flipXY, vo
                 else if(q.how == GpuLzw) nActive[LzwKind]++;
             }
             const uint32_t nCodecStreams = nActive[Zstd] + nActive[Deflate] + nActive[LzwKind];
-            // (the LZW kernel's threads, each with a table of its own)
-            const uint32_t lzwThreads = std::min<uint32_t>(nActive[LzwKind], (uint32_t)std::max(1, c.sms)*128);
+            // (the LZW kernel's blocks, each with room for a segment's codes)
+            const uint32_t lzwBlocks = std::min<uint32_t>(nActive[LzwKind], 65535);
             const uint64_t tablesAt = 64 + alignUp((uint64_t)nCodecStreams*8, 64) + alignUp((uint64_t)nCodecStreams*4, 64);
-            const uint64_t workNeed = tablesAt + (uint64_t)lzwThreads*lzwTableBytes;
+            const uint64_t workNeed = tablesAt + (uint64_t)lzwBlocks*lzwCodesBytes;
             growDevice(a, sl.work, sl.workBytes, workNeed);
             Unit* table = reinterpret_cast<Unit*>(host + p.unitsAt);
             uint32_t* list = reinterpret_cast<uint32_t*>(host + p.listAt);
@@ -629,7 +641,7 @@ uint8_t gpuReadTiff(const std::vector<GpuTiffRead> &reads, const bool flipXY, vo
                 CUdeviceptr gp = gotAt + 8*(uint64_t)base, sp = statusAt + 4*(uint64_t)base, tables = sl.work + tablesAt;
                 uint32_t n = nActive[LzwKind];
                 void* args[] = {&ip, &ib, &ob, &op, &gp, &sp, &n, &tables};
-                launch(a, c.lzw, (lzwThreads + 63)/64, 1, 64, 1, ss, args);
+                launch(a, c.lzw, lzwBlocks, 1, 32, 1, ss, args);
                 base += n;
             }
             if(nCodecStreams){
