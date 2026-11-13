@@ -6,9 +6,8 @@
 
 // Reading TIFF files straight into GPU memory (NVIDIA GPUs, CUDA): each strip's (or tile's) stored bytes
 // are read on the host, copied to the GPU as they are and decompressed there (zstd and deflate with
-// nvCOMP, LZW strips of up to 1 MB, which nvCOMP does not have, with cpp-tiff's own decoder; bigger ones
-// and the other codecs are decoded on the host, into the same copy), and the GPU undoes the horizontal
-// predictor, swaps the bytes of
+// nvCOMP, LZW, which nvCOMP does not have, with cpp-tiff's own decoder; the other codecs are decoded on
+// the host, into the same copy), and the GPU undoes the horizontal predictor, swaps the bytes of
 // big-endian files and puts each strip in its place: what readTiffParallelInfo gives, in GPU memory, for
 // when the data is needed on the GPU anyway.
 //
@@ -22,10 +21,9 @@
 // on damaged data); CPPTIFF_GPU_PART_MAX_MB (a read goes to the GPU in parts of at most this many MB of
 // stored and decoded bytes, so that reading the next part overlaps the GPU's work on the one before and a
 // read's own buffers stay small next to its output; by default about 4 compressed strips for each of the
-// GPU's multiprocessors, 256 MB to 1 GB and at most an eighth of its free memory); CPPTIFF_GPU_LZW (=1: LZW
-// strips are always decoded on the GPU, =0: always on the host; by default on the GPU when they are at most
-// 1 MB: the GPU decodes a strip a warp, and many-core hosts decode big strips faster); CPPTIFF_GPU_STRICT=1
-// (for tests: a read that would be read on the CPU fails instead).
+// GPU's multiprocessors, 256 MB to 1 GB and at most an eighth of its free memory); CPPTIFF_GPU_LZW=0 (LZW
+// strips are decoded on the host instead); CPPTIFF_GPU_STRICT=1 (for tests: a read that would be read on
+// the CPU fails instead).
 
 // Whether GPU reads can run here; if not, why (no NVIDIA driver or GPU, no nvCOMP, ...)
 bool gpuReadTiffAvailable(std::string &why);

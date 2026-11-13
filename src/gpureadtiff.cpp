@@ -36,21 +36,14 @@ const uint64_t hostBit = 1ull << 63;
 enum How : uint8_t { Raw = 0, GpuZstd = 1, GpuDeflate = 2, Host = 3, GpuLzw = 4 };
 // (kinds of GPU-decoded streams: nvCOMP's codecs, then the LZW kernel's)
 const int LzwKind = NCodecs, NKinds = NCodecs + 1;
-const uint64_t lzwCodesBytes = 7680;    // (kernels.cu's LZW_CODES_BYTES)
 
-// Whether the GPU decodes a directory's LZW strips (or tiles) of unitBytes bytes each: CPPTIFF_GPU_LZW=1 always, =0
-// never (the host decodes them), and by default when they are at most 1 MB. Each strip is a chain of codes that one
-// warp reads in order (kernels.cu's ct_lzw), so the GPU decodes as many at once as a part holds: 256 KB strips (with
-// the predictor) read 2.2 times as fast as decoded on the host's 10 cores of an A100 node and 2.6 times on the 16
-// cores of a B200's, while 2 MB strips, of which a part holds about 500, read 1.1 times as fast on the A100 node and
-// 0.55 times on the B200's, whose cores decode them at 15 GB/s (with a sixth of the CPU time either way).
-bool lzwOnGpu(uint64_t unitBytes){
-    static const int mode = [](){
+// Whether the GPU decodes LZW (kernels.cu's ct_lzw; CPPTIFF_GPU_LZW=0: the host does)
+bool gpuLzw(){
+    static const bool on = [](){
         const char* e = std::getenv("CPPTIFF_GPU_LZW");
-        if(!e || !*e) return -1;
-        return std::atoi(e) == 0 ? 0 : 1;
+        return !(e && *e && std::atoi(e) == 0);
     }();
-    return mode == 1 || (mode < 0 && unitBytes <= ((uint64_t)1 << 20));
+    return on;
 }
 
 // A unit as planned: where its stored bytes are in the file, how they are decoded, and where its bytes go
@@ -181,7 +174,7 @@ bool planRead(ReadState &rs, uint32_t ri, const Api* a, Handles &hs, int threads
         }
         const uint64_t n = perPlane*planes;
         if(n != (uint64_t)(tiled ? TIFFNumberOfTiles(tif) : TIFFNumberOfStrips(tif))){ bad = 1; continue; }
-        if(kernelsTake && comp == COMPRESSION_LZW && lzwOnGpu(tiled ? (uint64_t)tw*th*unitSpp*es : rps*x*unitSpp*es)) gpuHow = GpuLzw;
+        if(kernelsTake && comp == COMPRESSION_LZW && gpuLzw()) gpuHow = GpuLzw;
         std::vector<Planned> &list = per[(size_t)k];
         list.reserve((size_t)n);
         for(uint64_t i = 0; i < n; i++){
@@ -568,10 +561,7 @@ uint8_t gpuReadTiff(const std::vector<GpuTiffRead> &reads, const bool flipXY, vo
                 else if(q.how == GpuLzw) nActive[LzwKind]++;
             }
             const uint32_t nCodecStreams = nActive[Zstd] + nActive[Deflate] + nActive[LzwKind];
-            // (the LZW kernel's blocks, each with room for a segment's codes)
-            const uint32_t lzwBlocks = std::min<uint32_t>(nActive[LzwKind], 65535);
-            const uint64_t tablesAt = 64 + alignUp((uint64_t)nCodecStreams*8, 64) + alignUp((uint64_t)nCodecStreams*4, 64);
-            const uint64_t workNeed = tablesAt + (uint64_t)lzwBlocks*lzwCodesBytes;
+            const uint64_t workNeed = 64 + alignUp((uint64_t)nCodecStreams*8, 64) + alignUp((uint64_t)nCodecStreams*4, 64);
             growDevice(a, sl.work, sl.workBytes, workNeed);
             Unit* table = reinterpret_cast<Unit*>(host + p.unitsAt);
             uint32_t* list = reinterpret_cast<uint32_t*>(host + p.listAt);
@@ -638,10 +628,10 @@ uint8_t gpuReadTiff(const std::vector<GpuTiffRead> &reads, const bool flipXY, vo
                 const CUdeviceptr arrays = sl.comp + p.arraysAt;
                 CUdeviceptr ip = arrays + 8*(uint64_t)base, ib = arrays + 8*((uint64_t)nCodecStreams + base);
                 CUdeviceptr ob = arrays + 8*(2*(uint64_t)nCodecStreams + base), op = arrays + 8*(3*(uint64_t)nCodecStreams + base);
-                CUdeviceptr gp = gotAt + 8*(uint64_t)base, sp = statusAt + 4*(uint64_t)base, tables = sl.work + tablesAt;
+                CUdeviceptr gp = gotAt + 8*(uint64_t)base, sp = statusAt + 4*(uint64_t)base;
                 uint32_t n = nActive[LzwKind];
-                void* args[] = {&ip, &ib, &ob, &op, &gp, &sp, &n, &tables};
-                launch(a, c.lzw, lzwBlocks, 1, 32, 1, ss, args);
+                void* args[] = {&ip, &ib, &ob, &op, &gp, &sp, &n};
+                launch(a, c.lzw, std::min<uint32_t>(n, 65535), 1, 32, 1, ss, args);
                 base += n;
             }
             if(nCodecStreams){

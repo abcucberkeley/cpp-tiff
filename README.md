@@ -116,7 +116,7 @@ cpptiff.write_tiff('outputFilename.tif', im, num_threads=4)
 ````
 
 #### Read straight into GPU memory
-For data needed on the GPU anyway, the strips' stored bytes are read, copied to the GPU and decompressed there: zstd and deflate with nvCOMP, LZW strips of up to 1 MB (nvCOMP has no LZW) with cpp-tiff's own GPU decoder, and bigger LZW strips and the other codecs on the CPU, into the same copy. The GPU then undoes the predictor, swaps the bytes of big-endian files and puts the slices in place, in either order. The values are the same as read_tiff's. Linux only for now
+For data needed on the GPU anyway, the strips' stored bytes are read, copied to the GPU and decompressed there: zstd and deflate with nvCOMP, LZW (which nvCOMP does not have) with cpp-tiff's own GPU decoder, and the other codecs on the CPU, into the same copy. The GPU then undoes the predictor, swaps the bytes of big-endian files and puts the slices in place, in either order. The values are the same as read_tiff's. Linux only for now
 ````
 import cpptiff
 # A CuPy array instead of a NumPy array (needs CuPy: pip install cupy-cuda12x)
@@ -134,7 +134,7 @@ ims = cpptiff.read_tiff_batch(['a.tif', ('b.tif', [0, 10])], gpu=True)
 # Whether GPU reads can run here, and if not, why
 ok, why = cpptiff.gpu_available()
 ````
-CPPTIFF_GPU_PROFILE=1 prints where each GPU read's time went; CPPTIFF_GPU_PART_MAX_MB sets the most a read sends to the GPU at once (a bigger read goes in parts, the next one read while the GPU works on the one before; by default sized to the GPU and the file's strips, 256 MB to 1 GB), CPPTIFF_GPU_TIMEOUT the seconds a read waits for the GPU (nvCOMP can hang on damaged data; by default 30 plus 1 per 50 MB), and CPPTIFF_GPU_LZW=1 or 0 decodes LZW strips of any size on the GPU or on the CPU (by default, strips of up to 1 MB on the GPU: it decodes a strip a warp, so with bigger strips, of which a read holds fewer, a host with many cores is faster)
+CPPTIFF_GPU_PROFILE=1 prints where each GPU read's time went; CPPTIFF_GPU_PART_MAX_MB sets the most a read sends to the GPU at once (a bigger read goes in parts, the next one read while the GPU works on the one before; by default sized to the GPU and the file's strips, 256 MB to 1 GB), CPPTIFF_GPU_TIMEOUT the seconds a read waits for the GPU (nvCOMP can hang on damaged data; by default 30 plus 1 per 50 MB), and CPPTIFF_GPU_LZW=0 decodes LZW on the CPU instead of the GPU
 
 #### Write from GPU memory
 write_tiff writes GPU data (a CuPy array, a PyTorch CUDA tensor, or anything with __cuda_array_interface__) from the GPU, which puts MATLAB's layout in the file's order and compresses zstd strips with nvCOMP, at nvCOMP's one level: the file reads as write_tiff's of the same data does, with other compressed bytes. LZW (which nvCOMP does not have) and uncompressed strips are copied back a part at a time and compressed here as write_tiff compresses them, so those files are write_tiff's, byte for byte. The file is written here while the GPU works on the next part. Tiled writes are copied back whole and written by the CPU writer. Linux only for now
