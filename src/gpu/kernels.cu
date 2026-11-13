@@ -168,3 +168,92 @@ extern "C" __global__ void ct_check(const int* __restrict__ status, const u64* _
         }
     }
 }
+
+// TIFF's LZW decoded on the GPU (CPPTIFF_GPU_LZW=1, a research setting, off by default: the host decodes LZW,
+// which nvCOMP does not have). Measured, it is no way to decode LZW: an 8 GB stack of 4,000 strips of 2 MB read in
+// 26.6 s with it on an A100, against 1.9 s decoded on 10 Xeon cores (each thread's codes are a chain of dependent
+// reads of GPU memory; a decoder that is to beat the host needs the table in shared memory and a warp a strip).
+// A stream a thread, as the library's CPU decoder (lzwdecode.cpp) decodes, each code's
+// string an offset and a length into the output already decoded, the code width growing one code early as libtiff
+// has it. A thread's table (5119 starts, then as many lengths) is in GPU memory, LZW_TABLE_BYTES a thread. A stream
+// the CPU decoder would hand to libtiff (old-style codes, bad or too little data) gets status 1, and its read is
+// read on the CPU.
+#define LZW_CLEAR 256u
+#define LZW_EOI 257u
+#define LZW_FIRST 258u
+#define LZW_CSIZE (4095u + 1024u)
+#define LZW_TABLE_BYTES 30720u
+
+__device__ bool lzwDecodeOne(const u8* in, u64 inBytes, u8* out, u64 occ, u32* start, u16* len){
+    if(inBytes < 2 || (in[0] == 0 && (in[1] & 1)) || occ == 0 || occ > 0xFFFFFFFFull) return false;
+    u8* const end = out + occ;
+    u8* op = out;
+    const u8* bp = in;
+    const u8* const bend = in + inBytes;
+    u64 bitbuf = 0;
+    int bits = 0, nbits = 9;
+    u32 mask = (1u << 9) - 1, freeEnt = 0, maxcode = mask - 1;
+    u32 oldStart = 0, oldLen = 0;
+    u32 code;
+#define LZW_NEXT(c) {                                                                                  \
+        while(bits < nbits){ if(bp >= bend) return false; bitbuf = (bitbuf << 8) | *bp++; bits += 8; } \
+        c = (u32)(bitbuf >> (bits - nbits)) & mask;                                                    \
+        bits -= nbits;                                                                                 \
+    }
+#define LZW_ADD {                                                                                      \
+        start[freeEnt] = oldStart; len[freeEnt] = (u16)(oldLen + 1);                                   \
+        if(++freeEnt > maxcode){ if(++nbits > 12) nbits = 12; mask = (1u << nbits) - 1; maxcode = mask - 1; } \
+    }
+    LZW_NEXT(code)
+    if(code != LZW_CLEAR) return false;
+    for(;;){
+        if(code == LZW_CLEAR){
+            freeEnt = LZW_FIRST; nbits = 9; mask = (1u << 9) - 1; maxcode = mask - 1;
+            do { LZW_NEXT(code) } while(code == LZW_CLEAR);
+            if(code >= LZW_EOI) return false;
+            oldStart = (u32)(op - out); oldLen = 1;
+            *op++ = (u8)code;
+            if(op == end) return true;
+            LZW_NEXT(code)
+            continue;
+        }
+        if(code == LZW_EOI || freeEnt >= LZW_CSIZE || (code > freeEnt && code >= LZW_FIRST)) return false;
+        if(code < 256){
+            LZW_ADD
+            oldStart = (u32)(op - out); oldLen = 1;
+            *op++ = (u8)code;
+            if(op == end) return true;
+            LZW_NEXT(code)
+            continue;
+        }
+        u32 s, l;
+        if(code == freeEnt){ s = oldStart; l = oldLen + 1; }
+        else { s = start[code]; l = len[code]; }
+        LZW_ADD
+        const u32 pos = (u32)(op - out);
+        oldStart = pos; oldLen = l;
+        const u8* src = out + s;
+        const u64 room = (u64)(end - op);
+        if(room <= l){
+            for(u64 i = 0; i < room; i++) op[i] = src[i];
+            return true;
+        }
+        for(u32 i = 0; i < l; i++) op[i] = src[i];
+        op += l;
+        LZW_NEXT(code)
+    }
+#undef LZW_NEXT
+#undef LZW_ADD
+}
+
+extern "C" __global__ void ct_lzw(const u64* __restrict__ inPtr, const u64* __restrict__ inBytes, const u64* __restrict__ outBytes,
+                                  const u64* __restrict__ outPtr, u64* got, int* status, u32 n, u8* tables){
+    const u32 tid = blockIdx.x * blockDim.x + threadIdx.x, nth = gridDim.x * blockDim.x;
+    u32* start = (u32*)(tables + (u64)tid * LZW_TABLE_BYTES);
+    u16* len = (u16*)(start + LZW_CSIZE);
+    for(u32 i = tid; i < n; i += nth){
+        const bool ok = lzwDecodeOne((const u8*)inPtr[i], inBytes[i], (u8*)outPtr[i], outBytes[i], start, len);
+        status[i] = ok ? 0 : 1;
+        got[i] = ok ? outBytes[i] : 0;
+    }
+}

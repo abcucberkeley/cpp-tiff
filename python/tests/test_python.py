@@ -819,6 +819,16 @@ def main():
                         tt = torch.empty(want.shape, dtype=getattr(torch, np.dtype(want.dtype).name), device="cuda")
                         cpptiff.read_tiff(p_, zr, out=tt)
                         check(np.array_equal(tt.cpu().numpy(), want), f"GPU read into PyTorch {os.path.basename(p_)} {zr}")
+        # Into a PyTorch tensor on a stream of PyTorch's (the work ordered on that stream); with
+        # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True the tensor's memory belongs to no CUDA context
+        if torch is not None:
+            want = cpptiff.read_tiff(gpu_files[2])
+            side = torch.cuda.Stream()
+            tt = torch.empty(want.shape, dtype=torch.int16, device="cuda")
+            with torch.cuda.stream(side):
+                cpptiff.read_tiff(gpu_files[2], out=tt.view(torch.uint16) if hasattr(torch, "uint16") else tt, stream=side)
+            side.synchronize()
+            check(np.array_equal(tt.cpu().numpy().view(np.uint16), want), "GPU read into PyTorch on a side stream")
         # A batch: several files, ranges and outs, in one GPU call
         # (gpu_files[2]: LZW uint16 (5, 37, 50); gpu_files[3]: LZW uint16 RGB (3, 20, 30, 3))
         reqs = [gpu_files[3], (gpu_files[2], [1, 4]), (gpu_files[-1], None, cupy.empty(ij_g16.shape, dtype=ij_g16.dtype))]

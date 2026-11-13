@@ -215,7 +215,11 @@ int main(int argc, char** argv){
     ck(A->cuDeviceGet(&dev, 0), "cuDeviceGet");
     ck(A->cuDevicePrimaryCtxRetain(&ctx, dev), "cuDevicePrimaryCtxRetain");
     ck(A->cuCtxSetCurrent(ctx), "cuCtxSetCurrent");
-    std::printf("GPU reads with %s (nvCOMP %d)\n", A->nvcompPath.c_str(), A->nvcompMajor);
+    std::printf("GPU reads with %s (nvCOMP %d)%s\n", A->nvcompPath.c_str(), A->nvcompMajor,
+                std::getenv("CPPTIFF_GPU_LZW") ? ", LZW decoded on the GPU" : "");
+    // (every read here must be read on the GPU: none passes by being read on the CPU, as a file the GPU path does
+    // not take would be)
+    setEnv("CPPTIFF_GPU_STRICT", "1");
     std::mt19937 rng(91);
     // (smooth data, so that the predictor and the codecs have something to do, with noise in the low bits)
     auto make = [&](const Spec &s){

@@ -34,6 +34,7 @@ Ctx& context(const Api* a, CUcontext c){
     }
     ck(a, a->cuModuleGetFunction(&x->unpredict, x->mod, "ct_unpredict"), "cuModuleGetFunction");
     ck(a, a->cuModuleGetFunction(&x->check, x->mod, "ct_check"), "cuModuleGetFunction");
+    ck(a, a->cuModuleGetFunction(&x->lzw, x->mod, "ct_lzw"), "cuModuleGetFunction");
     CUdevice dev = 0;
     ck(a, a->cuCtxGetDevice(&dev), "cuCtxGetDevice");
     a->cuDeviceGetAttribute(&x->sms, 16 /* CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT */, dev);

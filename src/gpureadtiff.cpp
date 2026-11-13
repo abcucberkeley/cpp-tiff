@@ -31,8 +31,17 @@ struct Unit {
 static_assert(sizeof(Unit) == 64, "a unit is 64 bytes, as the kernels have it");
 const uint64_t hostBit = 1ull << 63;
 
-// How a unit's stored bytes become its decoded ones: as they are, by nvCOMP, or on the host
-enum How : uint8_t { Raw = 0, GpuZstd = 1, GpuDeflate = 2, Host = 3 };
+// How a unit's stored bytes become its decoded ones: as they are, by nvCOMP, by the GPU's LZW decoder
+// (CPPTIFF_GPU_LZW=1, a research setting), or on the host
+enum How : uint8_t { Raw = 0, GpuZstd = 1, GpuDeflate = 2, Host = 3, GpuLzw = 4 };
+// (kinds of GPU-decoded streams: nvCOMP's codecs, then the LZW kernel's)
+const int LzwKind = NCodecs, NKinds = NCodecs + 1;
+const uint64_t lzwTableBytes = 30720;   // (kernels.cu's LZW_TABLE_BYTES)
+
+bool gpuLzw(){
+    static const bool on = std::getenv("CPPTIFF_GPU_LZW") && std::atoi(std::getenv("CPPTIFF_GPU_LZW")) == 1;
+    return on;
+}
 
 // A unit as planned: where its stored bytes are in the file, how they are decoded, and where its bytes go
 // in its part's staging (stored ones, or for a unit decoded on the host its decoded ones) and nvCOMP's output
@@ -150,6 +159,7 @@ bool planRead(ReadState &rs, uint32_t ri, const Api* a, Handles &hs, int threads
             if(comp == COMPRESSION_NONE) gpuHow = Raw;
             else if(comp == COMPRESSION_ZSTD && a->decompressAsync[Zstd]) gpuHow = GpuZstd;
             else if((comp == COMPRESSION_ADOBE_DEFLATE || comp == COMPRESSION_DEFLATE) && a->decompressAsync[Deflate]) gpuHow = GpuDeflate;
+            else if(comp == COMPRESSION_LZW && gpuLzw()) gpuHow = GpuLzw;
         }
         const uint64_t planes = planar ? spp : 1, unitSpp = planar ? 1 : spp;
         uint32_t tw = 0, th = 0, rps32 = 0;
@@ -194,7 +204,7 @@ bool planRead(ReadState &rs, uint32_t ri, const Api* a, Handles &hs, int threads
             p.stored = TIFFGetStrileByteCount(tif, (uint32_t)i);
             How how = gpuHow;
             // (a short or empty uncompressed strip, or an empty compressed one: libtiff's to decode)
-            if(!p.stored || (how == Raw && p.stored < decoded) || (how == GpuDeflate && p.stored < 7)) how = Host;
+            if(!p.stored || (how == Raw && p.stored < decoded) || (how == GpuDeflate && p.stored < 7) || (how == GpuLzw && p.stored < 2)) how = Host;
             if(how == Raw) p.stored = decoded;
             const bool gpu = how != Host;
             p.u = unitFor(out, (uint64_t)k, row0, col0, rows, cols, pitch, x, y, spp, planar ? (uint16_t)plane : (uint16_t)0xFFFF,
@@ -218,8 +228,8 @@ struct Part {
     size_t begin = 0, end = 0;
     uint64_t staging = 0, decoded = 0;
     uint64_t unitsAt = 0, listAt = 0, arraysAt = 0;   // (offsets in the staging: the unit table, the predictor list, nvCOMP's arrays)
-    uint32_t nGpu[NCodecs] = {0, 0}, nList = 0;
-    uint64_t maxChunk[NCodecs] = {0, 0}, total[NCodecs] = {0, 0};
+    uint32_t nGpu[NKinds] = {0, 0, 0}, nList = 0;
+    uint64_t maxChunk[NKinds] = {0, 0, 0}, total[NKinds] = {0, 0, 0};
     uint32_t esCount[4] = {0, 0, 0, 0};               // (units of 1-, 2-, 4- and 8-byte elements, in that order in the table)
     uint32_t maxRows[4] = {0, 0, 0, 0}, maxTiles[4] = {0, 0, 0, 0};
 };
@@ -231,10 +241,10 @@ int esIndex(uint64_t es){ return es == 1 ? 0 : es == 2 ? 1 : es == 4 ? 2 : 3; }
 // and nvCOMP's outputs in the decode buffer
 void layOut(std::vector<Planned> &units, Part &p, const Ctx &c){
     uint64_t off = 0, dec = 0;
-    for(int pass = 0; pass < 3; pass++)
+    for(int pass = 0; pass < 4; pass++)
         for(size_t i = p.begin; i < p.end; i++){
             Planned &q = units[i];
-            const int codec = q.how == GpuZstd ? Zstd : q.how == GpuDeflate ? Deflate : -1;
+            const int codec = q.how == GpuZstd ? Zstd : q.how == GpuDeflate ? Deflate : q.how == GpuLzw ? LzwKind : -1;
             if(pass == 0 && codec == Zstd){
                 off = alignUp(off, std::max<uint64_t>(c.align[Zstd].input, 8));
                 q.stage = off;
@@ -245,14 +255,19 @@ void layOut(std::vector<Planned> &units, Part &p, const Ctx &c){
                 q.stage = off;
                 off += q.stored;
             }
-            else if(pass == 2 && codec < 0){
+            else if(pass == 2 && codec == LzwKind){
+                off = alignUp(off, 8);
+                q.stage = off;
+                off += q.stored;
+            }
+            else if(pass == 3 && codec < 0){
                 off = alignUp(off, 16);
                 q.stage = off;
                 off += q.decoded;
             }
             else continue;
             if(codec >= 0){
-                dec = alignUp(dec, std::max<uint64_t>(c.align[codec].output, 16));
+                dec = alignUp(dec, codec == LzwKind ? 16 : std::max<uint64_t>(c.align[codec].output, 16));
                 q.decOff = dec;
                 dec += q.decoded;
                 p.nGpu[codec]++;
@@ -278,8 +293,9 @@ void layOut(std::vector<Planned> &units, Part &p, const Ctx &c){
     p.listAt = off;
     off += alignUp((uint64_t)p.nList*4, 64);
     p.arraysAt = off;
-    // nvCOMP's arrays, zstd's streams then deflate's: input pointers, input sizes, output sizes, output pointers
-    off += 4*8*(uint64_t)(p.nGpu[Zstd] + p.nGpu[Deflate]);
+    // nvCOMP's arrays, zstd's streams then deflate's, then the LZW kernel's: input pointers, input sizes, output
+    // sizes, output pointers
+    off += 4*8*(uint64_t)(p.nGpu[Zstd] + p.nGpu[Deflate] + p.nGpu[LzwKind]);
     p.staging = off;
     p.decoded = dec;
 }
@@ -340,7 +356,7 @@ uint8_t gpuReadTiff(const std::vector<GpuTiffRead> &reads, const bool flipXY, vo
     const bool profile = std::getenv("CPPTIFF_GPU_PROFILE") && *std::getenv("CPPTIFF_GPU_PROFILE");
     const auto tStart = std::chrono::steady_clock::now();
     double tInfo = 0, tPlan = 0, tFill = 0, tWait = 0, tCpu = 0;
-    uint64_t bRaw = 0, bGpu = 0, bGpuOut = 0, bHost = 0, nCpu = 0;
+    uint64_t bRaw = 0, bGpu = 0, bGpuOut = 0, bHost = 0, bLzw = 0, bLzwOut = 0, nCpu = 0;
     size_t nParts = 0;
     try{
         // Every read's output in one context, the one the GPU work runs in
@@ -395,6 +411,7 @@ uint8_t gpuReadTiff(const std::vector<GpuTiffRead> &reads, const bool flipXY, vo
         for(const Planned &q : units){
             if(q.how == Raw) bRaw += q.stored;
             else if(q.how == Host) bHost += q.decoded;
+            else if(q.how == GpuLzw){ bLzw += q.stored; bLzwOut += q.decoded; }
             else{ bGpu += q.stored; bGpuOut += q.decoded; }
         }
         // Parts of at most CPPTIFF_GPU_PART_MAX_MB (256) MB of staging and of decoded bytes (a unit bigger than
@@ -406,8 +423,9 @@ uint8_t gpuReadTiff(const std::vector<GpuTiffRead> &reads, const bool flipXY, vo
             uint64_t st = 0, de = 0;
             for(size_t i = 0; i < units.size(); i++){
                 const Planned &q = units[i];
-                const uint64_t sb = (q.how == GpuZstd || q.how == GpuDeflate ? q.stored : q.decoded) + 64;
-                const uint64_t db = q.how == GpuZstd || q.how == GpuDeflate ? q.decoded + 64 : 0;
+                const bool onGpu = q.how == GpuZstd || q.how == GpuDeflate || q.how == GpuLzw;
+                const uint64_t sb = (onGpu ? q.stored : q.decoded) + 64;
+                const uint64_t db = onGpu ? q.decoded + 64 : 0;
                 if(i > p.begin && (st + sb > partMax || de + db > partMax)){
                     p.end = i;
                     parts.push_back(p);
@@ -433,7 +451,16 @@ uint8_t gpuReadTiff(const std::vector<GpuTiffRead> &reads, const bool flipXY, vo
             const Api* a; Ctx &c; Slot** s;
             ~Give(){ for(int k = 0; k < 2; k++){ if(s[k]->done && a->cuEventQuery(s[k]->done) != 0) s[k]->lost = true; giveSlot(c, *s[k]); } }
         } give{a, c, slots};
+        // Each slot's parts on a stream of its own, so that one part's copy to the GPU overlaps the other's
+        // decompression (on the caller's stream alone, each copy waited for the part before), both after the
+        // caller's work on its stream
+        CUevent callerDone = nullptr;
+        ck(a, a->cuEventCreate(&callerDone, 2 /* CU_EVENT_DISABLE_TIMING */), "cuEventCreate");
+        struct EventGone { const Api* a; CUevent e; ~EventGone(){ a->cuEventDestroy(e); } } callerGone{a, callerDone};
+        ck(a, a->cuEventRecord(callerDone, s), "cuEventRecord");
         for(Slot* sl : slots){
+            if(!sl->stream) ck(a, a->cuStreamCreate(&sl->stream, 1 /* CU_STREAM_NON_BLOCKING */), "cuStreamCreate");
+            ck(a, a->cuStreamWaitEvent(sl->stream, callerDone, 0), "cuStreamWaitEvent");
             if(!sl->done) ck(a, a->cuEventCreate(&sl->done, 2 /* CU_EVENT_DISABLE_TIMING */), "cuEventCreate");
             if(!sl->small){
                 void* q = nullptr;
@@ -473,9 +500,35 @@ uint8_t gpuReadTiff(const std::vector<GpuTiffRead> &reads, const bool flipXY, vo
             const auto tf = std::chrono::steady_clock::now();
             std::unique_ptr<std::atomic<uint8_t>[]> readBad(new std::atomic<uint8_t>[rs.size()]);
             for(size_t i = 0; i < rs.size(); i++) readBad[i] = 0;
-            #pragma omp parallel for num_threads(threads) schedule(dynamic, 16)
-            for(int64_t i = (int64_t)p.begin; i < (int64_t)p.end; i++){
-                Planned &q = units[(size_t)i];
+            // The part's reads: a unit each, but runs of uncompressed units that follow each other in the file and in
+            // the staging read with one call each, of at most 4 MB (as the CPU reader reads a slice's strips: on
+            // network storage every read call costs). A part that only reads hands each thread runs of about a quarter
+            // of its share at a time, in the file's order: one at a time each thread's reads jumped around the file,
+            // which made cold reads of small deflate strips from VAST 1.7-2.2 times as slow (the NFS client's
+            // read-ahead follows each open file's reads); a part that decodes on the host (LZW) hands them out one at a
+            // time, which balances the decoding (warm LZW 1.13 times as fast as in runs; cold as fast), as runs of 16
+            // did not (a part of a few dozen big strips left most threads idle)
+            std::vector<std::pair<size_t, size_t>> tasks;
+            for(size_t i = p.begin; i < p.end; i++){
+                const Planned &q = units[i];
+                if(!tasks.empty() && q.how == Raw){
+                    const size_t f = tasks.back().first, l = tasks.back().second - 1;
+                    const Planned &prev = units[l];
+                    if(prev.how == Raw && prev.read == q.read && prev.at + prev.stored == q.at && prev.stage + prev.stored == q.stage &&
+                       q.stage + q.stored - units[f].stage <= ((uint64_t)4 << 20)){
+                        tasks.back().second = i + 1;
+                        continue;
+                    }
+                }
+                tasks.push_back({i, i + 1});
+            }
+            bool decodes = false;
+            for(size_t i = p.begin; i < p.end && !decodes; i++) decodes = units[i].how == Host;
+            const int64_t run = decodes ? 1 : std::max<int64_t>(1, (int64_t)tasks.size()/(4*(int64_t)threads));
+            #pragma omp parallel for num_threads(threads) schedule(dynamic, run)
+            for(int64_t ti = 0; ti < (int64_t)tasks.size(); ti++){
+                Planned &q = units[tasks[(size_t)ti].first];
+                const Planned &last = units[tasks[(size_t)ti].second - 1];
                 if(rs[q.read].cpu || readBad[q.read]) continue;
                 const int t = omp_get_thread_num();
                 TIFF* tif = hs.get(t, q.read);
@@ -488,9 +541,10 @@ uint8_t gpuReadTiff(const std::vector<GpuTiffRead> &reads, const bool flipXY, vo
                     ok = ok && n == (tmsize_t)q.decoded;
                 }
                 else if(ok){
+                    const uint64_t n = last.stage + last.stored - q.stage;
                     thandle_t h = TIFFClientdata(tif);
                     ok = TIFFGetSeekProc(tif)(h, (toff_t)q.at, SEEK_SET) == (toff_t)q.at &&
-                         (uint64_t)TIFFGetReadProc(tif)(h, dst, (tmsize_t)q.stored) == q.stored;
+                         (uint64_t)TIFFGetReadProc(tif)(h, dst, (tmsize_t)n) == n;
                     // (a zlib stream nvCOMP takes: deflate, no preset dictionary, a valid header check)
                     if(ok && q.how == GpuDeflate)
                         ok = (dst[0] & 0x0F) == 8 && (dst[0] >> 4) <= 7 && !(dst[1] & 0x20) && ((dst[0] << 8) | dst[1]) % 31 == 0;
@@ -504,15 +558,19 @@ uint8_t gpuReadTiff(const std::vector<GpuTiffRead> &reads, const bool flipXY, vo
             growDevice(a, sl.comp, sl.compBytes, p.staging);
             growDevice(a, sl.dec, sl.decBytes, std::max<uint64_t>(p.decoded, 16));
             // (streams of reads read on the CPU instead left out of nvCOMP's arrays)
-            uint32_t nActive[NCodecs] = {0, 0};
+            uint32_t nActive[NKinds] = {0, 0, 0};
             for(size_t i = p.begin; i < p.end; i++){
                 const Planned &q = units[i];
                 if(rs[q.read].cpu) continue;
                 if(q.how == GpuZstd) nActive[Zstd]++;
                 else if(q.how == GpuDeflate) nActive[Deflate]++;
+                else if(q.how == GpuLzw) nActive[LzwKind]++;
             }
-            const uint32_t nCodecStreams = nActive[Zstd] + nActive[Deflate];
-            const uint64_t workNeed = 64 + alignUp((uint64_t)nCodecStreams*8, 64) + alignUp((uint64_t)nCodecStreams*4, 64);
+            const uint32_t nCodecStreams = nActive[Zstd] + nActive[Deflate] + nActive[LzwKind];
+            // (the LZW kernel's threads, each with a table of its own)
+            const uint32_t lzwThreads = std::min<uint32_t>(nActive[LzwKind], (uint32_t)std::max(1, c.sms)*128);
+            const uint64_t tablesAt = 64 + alignUp((uint64_t)nCodecStreams*8, 64) + alignUp((uint64_t)nCodecStreams*4, 64);
+            const uint64_t workNeed = tablesAt + (uint64_t)lzwThreads*lzwTableBytes;
             growDevice(a, sl.work, sl.workBytes, workNeed);
             Unit* table = reinterpret_cast<Unit*>(host + p.unitsAt);
             uint32_t* list = reinterpret_cast<uint32_t*>(host + p.listAt);
@@ -523,15 +581,15 @@ uint8_t gpuReadTiff(const std::vector<GpuTiffRead> &reads, const bool flipXY, vo
             uint64_t* outPtr = arr + 3*nCodecStreams;
             uint32_t esAt[4] = {0, p.esCount[0], p.esCount[0] + p.esCount[1], p.esCount[0] + p.esCount[1] + p.esCount[2]};
             uint32_t esFill[4] = {esAt[0], esAt[1], esAt[2], esAt[3]};
-            uint32_t nList = 0, zs = 0, ds = nActive[Zstd];
+            uint32_t nList = 0, zs = 0, ds = nActive[Zstd], ls = nActive[Zstd] + nActive[Deflate];
             for(size_t i = p.begin; i < p.end; i++){
                 Planned &q = units[i];
                 Unit u = q.u;
                 const bool skip = rs[q.read].cpu;
-                if(q.how == GpuZstd || q.how == GpuDeflate){
+                if(q.how == GpuZstd || q.how == GpuDeflate || q.how == GpuLzw){
                     u.src = q.decOff;
                     if(!skip){
-                        const uint32_t j = q.how == GpuZstd ? zs++ : ds++;
+                        const uint32_t j = q.how == GpuZstd ? zs++ : q.how == GpuDeflate ? ds++ : ls++;
                         const uint64_t skipHead = q.how == GpuDeflate ? 2 : 0, skipTail = q.how == GpuDeflate ? 4 : 0;
                         inPtr[j] = sl.comp + q.stage + skipHead;
                         inBytes[j] = q.stored - skipHead - skipTail;
@@ -547,18 +605,19 @@ uint8_t gpuReadTiff(const std::vector<GpuTiffRead> &reads, const bool flipXY, vo
                 if(u.predictor == PREDICTOR_HORIZONTAL && !skip) list[nList++] = at;
             }
 
-            // The GPU's work: the copy, the decompression and its check, the predictor, the placing
-            ck(a, a->cuMemcpyHtoDAsync(sl.comp, host, p.staging, s), "cuMemcpyHtoDAsync");
+            // The GPU's work: the copy, the decompression and its check, the predictor, the placing (on the slot's stream)
+            const CUstream ss = sl.stream;
+            ck(a, a->cuMemcpyHtoDAsync(sl.comp, host, p.staging, ss), "cuMemcpyHtoDAsync");
             const CUdeviceptr checkAt = sl.work, gotAt = sl.work + 64, statusAt = gotAt + alignUp((uint64_t)nCodecStreams*8, 64);
-            ck(a, a->cuMemsetD8Async(checkAt, 0, 4, s), "cuMemsetD8Async");
-            ck(a, a->cuMemsetD8Async(checkAt + 4, 0xFF, 4, s), "cuMemsetD8Async");
+            ck(a, a->cuMemsetD8Async(checkAt, 0, 4, ss), "cuMemsetD8Async");
+            ck(a, a->cuMemsetD8Async(checkAt + 4, 0xFF, 4, ss), "cuMemsetD8Async");
             uint32_t base = 0;
             for(int codec = 0; codec < NCodecs; codec++){
                 const uint32_t n = nActive[codec];
                 if(!n) continue;
                 NvcompOpts o{};
                 size_t temp = 0;
-                const int tr = a->tempSize6[codec] ? a->tempSize6[codec](n, p.maxChunk[codec], o, &temp, p.total[codec], s)
+                const int tr = a->tempSize6[codec] ? a->tempSize6[codec](n, p.maxChunk[codec], o, &temp, p.total[codec], ss)
                                                    : a->tempSize5[codec](n, p.maxChunk[codec], o, &temp, p.total[codec]);
                 if(tr) throw Fail("nvCOMP could not size its temporary memory (status "+std::to_string(tr)+")");
                 growDevice(a, sl.temp, sl.tempBytes, std::max<size_t>(temp, 16));
@@ -570,8 +629,18 @@ uint8_t gpuReadTiff(const std::vector<GpuTiffRead> &reads, const bool flipXY, vo
                     reinterpret_cast<size_t*>(gotAt + 8*(uint64_t)base), n,
                     reinterpret_cast<void*>(sl.temp), sl.tempBytes,
                     reinterpret_cast<void* const*>(arrays + 8*(3*(uint64_t)nCodecStreams + base)), o,
-                    reinterpret_cast<int*>(statusAt + 4*(uint64_t)base), s);
+                    reinterpret_cast<int*>(statusAt + 4*(uint64_t)base), ss);
                 if(dr) throw Fail("nvCOMP could not start decompressing (status "+std::to_string(dr)+")");
+                base += n;
+            }
+            if(nActive[LzwKind]){
+                const CUdeviceptr arrays = sl.comp + p.arraysAt;
+                CUdeviceptr ip = arrays + 8*(uint64_t)base, ib = arrays + 8*((uint64_t)nCodecStreams + base);
+                CUdeviceptr ob = arrays + 8*(2*(uint64_t)nCodecStreams + base), op = arrays + 8*(3*(uint64_t)nCodecStreams + base);
+                CUdeviceptr gp = gotAt + 8*(uint64_t)base, sp = statusAt + 4*(uint64_t)base, tables = sl.work + tablesAt;
+                uint32_t n = nActive[LzwKind];
+                void* args[] = {&ip, &ib, &ob, &op, &gp, &sp, &n, &tables};
+                launch(a, c.lzw, (lzwThreads + 63)/64, 1, 64, 1, ss, args);
                 base += n;
             }
             if(nCodecStreams){
@@ -579,24 +648,24 @@ uint8_t gpuReadTiff(const std::vector<GpuTiffRead> &reads, const bool flipXY, vo
                 CUdeviceptr badp = checkAt, firstp = checkAt + 4;
                 uint32_t n = nCodecStreams;
                 void* args[] = {&st, &got, &want, &n, &badp, &firstp};
-                launch(a, c.check, std::min<uint32_t>(1024, (n + 255)/256), 1, 256, 1, s, args);
+                launch(a, c.check, std::min<uint32_t>(1024, (n + 255)/256), 1, 256, 1, ss, args);
             }
-            ck(a, a->cuMemcpyDtoHAsync(sl.small, checkAt, 8, s), "cuMemcpyDtoHAsync");
+            ck(a, a->cuMemcpyDtoHAsync(sl.small, checkAt, 8, ss), "cuMemcpyDtoHAsync");
             CUdeviceptr unitsDev = sl.comp + p.unitsAt, dec = sl.dec, hostDev = sl.comp;
             if(nList){
                 CUdeviceptr listDev = sl.comp + p.listAt;
                 void* args[] = {&unitsDev, &listDev, &nList, &dec, &hostDev};
-                launch(a, c.unpredict, nList, 1, 128, 1, s, args);
+                launch(a, c.unpredict, nList, 1, 128, 1, ss, args);
             }
             for(int e = 0; e < 4; e++){
                 uint32_t n = p.esCount[e];
                 if(!n) continue;
                 CUdeviceptr tab = unitsDev + (uint64_t)esAt[e]*sizeof(Unit);
                 void* args[] = {&tab, &n, &dec, &hostDev};
-                if(flipXY) launch(a, c.placeF[e], n, std::max<uint32_t>(1, std::min<uint32_t>(p.maxTiles[e], 65535)), 32, 8, s, args);
-                else launch(a, c.placeC[e], n, std::max<uint32_t>(1, std::min<uint32_t>((p.maxRows[e] + 3)/4, 65535)), 256, 1, s, args);
+                if(flipXY) launch(a, c.placeF[e], n, std::max<uint32_t>(1, std::min<uint32_t>(p.maxTiles[e], 65535)), 32, 8, ss, args);
+                else launch(a, c.placeC[e], n, std::max<uint32_t>(1, std::min<uint32_t>((p.maxRows[e] + 3)/4, 65535)), 256, 1, ss, args);
             }
-            ck(a, a->cuEventRecord(sl.done, s), "cuEventRecord");
+            ck(a, a->cuEventRecord(sl.done, ss), "cuEventRecord");
             inSlot[k] = (long long)pi;
         }
         checkSlot(0);
@@ -605,8 +674,12 @@ uint8_t gpuReadTiff(const std::vector<GpuTiffRead> &reads, const bool flipXY, vo
         // The reads the GPU path did not take, read on the CPU and copied (after the GPU's work, which may have
         // written parts of them)
         t0 = std::chrono::steady_clock::now();
+        // (CPPTIFF_GPU_STRICT=1, for tests: such a read fails instead, so that a GPU path that does not work cannot
+        // pass for one that does)
+        const bool strict = std::getenv("CPPTIFF_GPU_STRICT") && std::atoi(std::getenv("CPPTIFF_GPU_STRICT")) == 1;
         for(auto &q : rs){
             if(!q.cpu) continue;
+            if(strict) throw Fail("\""+q.r->fileName+"\" would have been read on the CPU (CPPTIFF_GPU_STRICT)");
             nCpu++;
             std::vector<uint8_t> buf(q.bytes);
             std::vector<uint64_t> zr;
@@ -619,9 +692,10 @@ uint8_t gpuReadTiff(const std::vector<GpuTiffRead> &reads, const bool flipXY, vo
         tCpu = secondsSince(t0);
         if(profile)
             std::fprintf(stderr, "cpp-tiff GPU read: %zu reads in %zu parts; %.1f MB stored as is, %.1f MB for nvCOMP (%.1f MB decoded), "
-                         "%.1f MB decoded on the host; %zu read on the CPU instead. Info %.3f s, plan %.3f s, host reads and decoding "
-                         "%.3f s, waiting for the GPU %.3f s, CPU reads %.3f s; %.3f s in all\n", reads.size(), nParts, bRaw/1e6, bGpu/1e6,
-                         bGpuOut/1e6, bHost/1e6, (size_t)nCpu, tInfo, tPlan, tFill, tWait, tCpu, secondsSince(tStart));
+                         "%.1f MB for the GPU's LZW decoder (%.1f MB decoded), %.1f MB decoded on the host; %zu read on the CPU instead. "
+                         "Info %.3f s, plan %.3f s, host reads and decoding %.3f s, waiting for the GPU %.3f s, CPU reads %.3f s; %.3f s in "
+                         "all\n", reads.size(), nParts, bRaw/1e6, bGpu/1e6, bGpuOut/1e6, bLzw/1e6, bLzwOut/1e6, bHost/1e6, (size_t)nCpu,
+                         tInfo, tPlan, tFill, tWait, tCpu, secondsSince(tStart));
     }
     catch(const Fail &e){
         errString = e.what();

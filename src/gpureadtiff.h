@@ -20,7 +20,8 @@
 // read waits for the GPU before it fails, 0 for no limit; by default 30 plus 1 per 50 MB: nvCOMP can hang
 // on damaged data); CPPTIFF_GPU_PART_MAX_MB (a read goes to the GPU in parts of at most this many MB of
 // stored and decoded bytes, 256 by default, so that reading the next part overlaps the GPU's work on the
-// one before and a read's own buffers stay small next to its output).
+// one before and a read's own buffers stay small next to its output); CPPTIFF_GPU_STRICT=1 (for tests: a read that
+// would be read on the CPU fails instead).
 
 // Whether GPU reads can run here; if not, why (no NVIDIA driver or GPU, no nvCOMP, ...)
 bool gpuReadTiffAvailable(std::string &why);

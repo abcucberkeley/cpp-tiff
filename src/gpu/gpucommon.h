@@ -28,6 +28,7 @@ struct Slot {
     CUdeviceptr comp = 0, dec = 0, temp = 0, work = 0;   // the staging's copy, nvCOMP's output and temporary memory, statuses
     size_t compBytes = 0, decBytes = 0, tempBytes = 0, workBytes = 0;
     CUevent done = nullptr;          // recorded after the part's GPU work
+    CUstream stream = nullptr;       // its parts' GPU work: the copy, the decompression, the kernels (two slots' parts overlap)
 };
 
 // The kernels and reusable buffers of one CUDA context
@@ -36,7 +37,7 @@ struct Ctx {
     CUmodule mod = nullptr;
     CUfunction placeC[4] = {nullptr, nullptr, nullptr, nullptr};   // (by element size: 1, 2, 4, 8 bytes)
     CUfunction placeF[4] = {nullptr, nullptr, nullptr, nullptr};
-    CUfunction unpredict = nullptr, check = nullptr;
+    CUfunction unpredict = nullptr, check = nullptr, lzw = nullptr;
     int sms = 1;
     NvcompAlignments align[NCodecs];
     std::mutex m;
