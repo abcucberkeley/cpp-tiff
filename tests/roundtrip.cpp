@@ -8,6 +8,7 @@
 // Progress is written (flushed) to stderr before each operation so that if a
 // build segfaults, the CTest log shows exactly which step/dtype/compression died.
 #include <algorithm>
+#include <functional>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -272,6 +273,53 @@ static bool writeLibtiff(const std::string& path, const uint8_t* data, uint64_t 
                     const uint64_t n = std::min<uint64_t>(rows, y - s*rows)*x*px;
                     chunk.assign(img.begin() + s*rows*x*px, img.begin() + s*rows*x*px + n);
                     ok = TIFFWriteEncodedStrip(tif, (uint32_t)(p*strips + s), chunk.data(), (tmsize_t)n) == (tmsize_t)n;
+                }
+            }
+        }
+        ok = ok && TIFFWriteDirectory(tif);
+    }
+    TIFFClose(tif);
+    return ok;
+}
+
+// ---- Stacks of directories unlike each other ------------------------------
+// One directory a slice, each as its MixedDir says (size, pixels, rows per
+// strip or tile size, codec, planar), its data chunky (y, x, c) in host order.
+struct MixedDir { uint32_t x, y, bits, spp, rps, tile; uint16_t comp; bool planar; };
+static bool writeMixedTiff(const std::string& path, const std::vector<MixedDir>& dirs, const std::vector<std::vector<uint8_t>>& data){
+    TIFF* tif = TIFFOpen(path.c_str(), "w8");
+    if(!tif) return false;
+    bool ok = true;
+    for(size_t k = 0; k < dirs.size() && ok; k++){
+        const MixedDir& d = dirs[k];
+        const uint64_t es = d.bits/8, planes = d.planar ? d.spp : 1, px = d.planar ? es : d.spp*es;
+        TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, d.x);
+        TIFFSetField(tif, TIFFTAG_IMAGELENGTH, d.y);
+        TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, (uint16_t)d.bits);
+        TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, (uint16_t)d.spp);
+        TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, d.spp >= 3 ? PHOTOMETRIC_RGB : PHOTOMETRIC_MINISBLACK);
+        TIFFSetField(tif, TIFFTAG_PLANARCONFIG, d.planar ? PLANARCONFIG_SEPARATE : PLANARCONFIG_CONTIG);
+        TIFFSetField(tif, TIFFTAG_COMPRESSION, d.comp);
+        if(d.tile){ TIFFSetField(tif, TIFFTAG_TILEWIDTH, d.tile); TIFFSetField(tif, TIFFTAG_TILELENGTH, d.tile); }
+        else TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, d.rps);
+        std::vector<uint8_t> img((uint64_t)d.x*d.y*px), chunk;
+        for(uint64_t p = 0; p < planes && ok; p++){
+            if(d.planar) for(uint64_t i = 0; i < (uint64_t)d.x*d.y; i++) std::memcpy(&img[i*es], &data[k][(i*d.spp + p)*es], es);
+            else img = data[k];
+            if(d.tile){
+                for(uint32_t ty = 0; ty < d.y && ok; ty += d.tile)
+                    for(uint32_t tx = 0; tx < d.x && ok; tx += d.tile){
+                        chunk.assign((uint64_t)d.tile*d.tile*px, 0);
+                        for(uint32_t r = 0; r < d.tile && ty + r < d.y; r++)
+                            std::memcpy(&chunk[(uint64_t)r*d.tile*px], &img[((uint64_t)(ty + r)*d.x + tx)*px], std::min(d.tile, d.x - tx)*px);
+                        ok = TIFFWriteEncodedTile(tif, TIFFComputeTile(tif, tx, ty, 0, (uint16_t)p), chunk.data(), (tmsize_t)chunk.size()) >= 0;
+                    }
+            }
+            else{
+                const uint32_t rows = std::min(d.rps, d.y), strips = (d.y + rows - 1)/rows;
+                for(uint32_t st = 0; st < strips && ok; st++){
+                    const uint64_t n = (uint64_t)std::min(rows, d.y - st*rows)*d.x*px;
+                    ok = TIFFWriteEncodedStrip(tif, (uint32_t)(p*strips + st), &img[(uint64_t)st*rows*d.x*px], (tmsize_t)n) == (tmsize_t)n;
                 }
             }
         }
@@ -1201,6 +1249,122 @@ int main(int argc, char** argv){
             std::remove(path.c_str());
             if(bad.empty()) std::printf("PASS  %-16s per-slice destinations\n", c.name);
             else { std::printf("FAIL  %-16s per-slice destinations (%s)\n", c.name, bad.c_str() + 1); failures++; }
+        }
+    }
+
+    // ---- Directories unlike the first. The readers plan a read from the first
+    // directory, and a directory laid out otherwise read wrong data with no
+    // error (more rows per strip in the first, planar after chunky) or failed
+    // (tiles after strips, tiles of another size); one of another size or
+    // pixel read as garbage or overflowed the scanline fallback. Now one laid
+    // out otherwise reads right, by its own layout, and one that does not fit
+    // fails the read, writing nothing past the output: whole stacks and slice
+    // ranges, in both layouts, with 1 thread and 8, stacks of a few large
+    // slices (read slice by slice, or in pieces) included, and the scanline
+    // fallbacks called directly.
+    {
+        struct MX { const char* name; std::vector<MixedDir> dirs; bool fits; };
+        const MixedDir g16{40, 24, 16, 1, 8, 0, COMPRESSION_LZW, false};
+        auto with = [](MixedDir d, std::function<void(MixedDir&)> f){ f(d); return d; };
+        const std::vector<MX> mxCases = {
+            {"mx-rps-larger",    {with(g16, [](MixedDir& d){ d.rps = 24; }), g16, g16}, true},
+            {"mx-rps-smaller",   {g16, with(g16, [](MixedDir& d){ d.rps = 24; }), with(g16, [](MixedDir& d){ d.rps = 3; })}, true},
+            {"mx-rps-none",      {with(g16, [](MixedDir& d){ d.rps = 24; d.comp = COMPRESSION_NONE; }), with(g16, [](MixedDir& d){ d.comp = COMPRESSION_NONE; }),
+                                  with(g16, [](MixedDir& d){ d.rps = 1; d.comp = COMPRESSION_NONE; })}, true},
+            {"mx-codecs",        {g16, with(g16, [](MixedDir& d){ d.comp = COMPRESSION_NONE; }), with(g16, [](MixedDir& d){ d.comp = COMPRESSION_ZSTD; })}, true},
+            {"mx-codecs-none",   {with(g16, [](MixedDir& d){ d.comp = COMPRESSION_NONE; }), g16, with(g16, [](MixedDir& d){ d.comp = COMPRESSION_ZSTD; })}, true},
+            {"mx-tiles-strips",  {g16, with(g16, [](MixedDir& d){ d.tile = 16; }), g16}, true},
+            {"mx-strips-tiles",  {with(g16, [](MixedDir& d){ d.tile = 16; }), g16, with(g16, [](MixedDir& d){ d.tile = 32; })}, true},
+            {"mx-planar",        {with(g16, [](MixedDir& d){ d.spp = 3; }), with(g16, [](MixedDir& d){ d.spp = 3; d.planar = true; }),
+                                  with(g16, [](MixedDir& d){ d.spp = 3; d.planar = true; d.tile = 16; })}, true},
+            {"mx-chunky",        {with(g16, [](MixedDir& d){ d.spp = 3; d.planar = true; }), with(g16, [](MixedDir& d){ d.spp = 3; d.rps = 5; }),
+                                  with(g16, [](MixedDir& d){ d.spp = 3; d.planar = true; d.rps = 24; })}, true},
+            {"mx-planar-strips", {with(g16, [](MixedDir& d){ d.spp = 3; }), with(g16, [](MixedDir& d){ d.spp = 3; d.planar = true; }),
+                                  with(g16, [](MixedDir& d){ d.spp = 3; })}, true},
+            {"mx-chunky-strips", {with(g16, [](MixedDir& d){ d.spp = 3; d.planar = true; }), with(g16, [](MixedDir& d){ d.spp = 3; d.planar = true; }),
+                                  with(g16, [](MixedDir& d){ d.spp = 3; })}, true},
+            {"mx-pieces",        {MixedDir{1024, 1024, 16, 1, 64, 0, COMPRESSION_LZW, false}, MixedDir{1024, 1024, 16, 1, 16, 0, COMPRESSION_LZW, false},
+                                  MixedDir{1024, 1024, 16, 1, 64, 0, COMPRESSION_ZSTD, false}}, true},
+            {"mx-slice-by-slice",{MixedDir{1024, 1024, 32, 1, 64, 0, COMPRESSION_LZW, false}, MixedDir{1024, 1024, 32, 1, 16, 0, COMPRESSION_LZW, false}}, true},
+            {"mx-smaller",       {g16, with(g16, [](MixedDir& d){ d.x = 20; d.y = 12; }), g16}, false},
+            {"mx-larger",        {g16, with(g16, [](MixedDir& d){ d.x = 80; d.y = 48; }), g16}, false},
+            {"mx-larger-raw",    {with(g16, [](MixedDir& d){ d.comp = COMPRESSION_NONE; d.rps = 4; }),
+                                  with(g16, [](MixedDir& d){ d.comp = COMPRESSION_NONE; d.x = 80; d.y = 48; d.rps = 48; }),
+                                  with(g16, [](MixedDir& d){ d.comp = COMPRESSION_NONE; })}, false},
+            {"mx-bits",          {g16, with(g16, [](MixedDir& d){ d.bits = 32; }), g16}, false},
+            {"mx-samples",       {g16, with(g16, [](MixedDir& d){ d.spp = 3; }), g16}, false},
+        };
+        const int prevThreads = omp_get_max_threads();
+        for(const MX& c : mxCases){
+            total++;
+            const MixedDir& d0 = c.dirs[0];
+            const uint64_t es = d0.bits/8, sliceBytes = (uint64_t)d0.x*d0.y*d0.spp*es, z = c.dirs.size();
+            std::vector<std::vector<uint8_t>> data;
+            uint64_t st = 0x51AF0DD5EEDull ^ (uint64_t)std::strlen(c.name);
+            for(const MixedDir& d : c.dirs){
+                data.emplace_back((uint64_t)d.x*d.y*d.spp*(d.bits/8));
+                for(uint8_t& b : data.back()){ st = st*6364136223846793005ull + 1442695040888963407ull; b = (uint8_t)(st >> 59); }
+            }
+            // What the read of the slices that fit returns (dir 1 is the odd one out of those that do not)
+            std::vector<uint8_t> src, flip;
+            for(uint64_t k = 0; k < z; k++) src.insert(src.end(), data[k].begin(), data[k].end());
+            if(c.fits) flip = flipped(src.data(), d0.x, d0.y, z, d0.spp, es);
+            const std::string path = dir + "/" + c.name + ".tif";
+            step(c.name, "mixed dirs", "write fixture");
+            const bool made = writeMixedTiff(path, c.dirs, data);
+            TiffInfo info;
+            std::string bad = made && !getTiffInfo(path.c_str(), info) && info.z == z ? "" : " fixture";
+            std::vector<std::vector<uint64_t>> ranges = {{}, {1}, {1, z}, {z - 1}};
+            for(int t : {1, 8})
+                for(const std::vector<uint64_t>& r : ranges)
+                    for(uint8_t fl = 0; fl < 2 && bad.empty(); fl++){
+                        omp_set_num_threads(t);
+                        const uint64_t first = r.empty() ? 0 : r[0], count = r.empty() ? z : r.size() == 2 ? r[1] - r[0] : 1;
+                        // (the odd directory of those that do not fit is 1; a read without it reads right)
+                        const bool shouldRead = c.fits || first > 1 || first + count <= 1;
+                        std::vector<uint8_t> out(sliceBytes*count + 4096, 0xA5);
+                        step(c.name, "mixed dirs", "read");
+                        const bool read = readTiffParallelInfo(path.c_str(), info, out.data(), fl, r) != NULL;
+                        bool good = read == shouldRead && std::all_of(out.begin() + sliceBytes*count, out.end(), [](uint8_t v){ return v == 0xA5; });
+                        if(good && read){
+                            if(c.fits) good = std::memcmp(out.data(), (fl ? flip : src).data() + first*sliceBytes, sliceBytes*count) == 0;
+                            else{
+                                const std::vector<uint8_t> f = flipped(data[first].data(), d0.x, d0.y, 1, d0.spp, es);
+                                good = count == 1 && std::memcmp(out.data(), (fl ? f : data[first]).data(), sliceBytes) == 0;
+                            }
+                        }
+                        if(!good) bad += std::string(" ") + (fl ? "flip" : "C") + "/" + (r.empty() ? "all" : r.size() == 2 ? "range" : "slice")
+                                         + std::to_string(first) + "/" + std::to_string(t) + "t";
+                    }
+            // The per-slice form, and the scanline fallbacks, of the whole stack
+            if(bad.empty()){
+                omp_set_num_threads(prevThreads);
+                step(c.name, "mixed dirs", "per-slice read and fallbacks");
+                std::vector<std::vector<uint8_t>> bufs(z, std::vector<uint8_t>(sliceBytes + 64, 0xA5));
+                std::vector<void*> table;
+                for(auto& b : bufs) table.push_back(b.data());
+                bool good = readTiffParallelInfo(path.c_str(), info, table, 0, {}) == c.fits;
+                for(uint64_t k = 0; k < z && good; k++)
+                    good = std::all_of(bufs[k].begin() + sliceBytes, bufs[k].end(), [](uint8_t v){ return v == 0xA5; })
+                           && (!c.fits || std::memcmp(bufs[k].data(), data[k].data(), sliceBytes) == 0);
+                for(uint8_t fl = 0; fl < 2 && good; fl++){
+                    std::vector<uint8_t> out(sliceBytes*z + 4096, 0xA5);
+                    const bool read = !readTiffParallelBak(d0.x, d0.y, z, path.c_str(), out.data(), d0.bits, 0, fl);
+                    good = read == c.fits && std::all_of(out.begin() + sliceBytes*z, out.end(), [](uint8_t v){ return v == 0xA5; })
+                           && (!c.fits || std::memcmp(out.data(), (fl ? flip : src).data(), sliceBytes*z) == 0);
+                    // (the single-image fallback, of the odd directory)
+                    std::vector<uint8_t> one(sliceBytes + 4096, 0xA5);
+                    const bool read1 = !readTiffParallel2DBak(d0.x, d0.y, 1, path.c_str(), one.data(), d0.bits, 1, fl);
+                    const bool strips1 = c.dirs[1].tile == 0;
+                    good = good && std::all_of(one.begin() + sliceBytes, one.end(), [](uint8_t v){ return v == 0xA5; })
+                           && (c.fits && strips1 ? read1 && std::memcmp(one.data(), (fl ? flip : src).data() + sliceBytes, sliceBytes) == 0 : !c.fits ? !read1 : true);
+                }
+                if(!good) bad += " per-slice/fallbacks";
+            }
+            omp_set_num_threads(prevThreads);
+            std::remove(path.c_str());
+            if(bad.empty()) std::printf("PASS  %-18s mixed directories\n", c.name);
+            else { std::printf("FAIL  %-18s mixed directories (%s)\n", c.name, bad.c_str() + 1); failures++; }
         }
     }
 

@@ -622,6 +622,123 @@ static bool setDirectoryWithRetry(TIFF* tif, uint64_t dir, const std::vector<uin
     return false;
 }
 
+// ---- Directories unlike the first -----------------------------------------
+// A reader plans a read from the first directory: the output's size and its
+// pixels (width, height, bits and samples per pixel), and how the directories
+// are laid out, which sizes its buffers and the strips or tiles it hands out
+// (strips of so many rows, or tiles of a size; chunky or planar). A directory
+// laid out otherwise was read with the first's layout, which returned wrong
+// data without an error (more rows per strip in the first, planar after
+// chunky) or failed (tiles after strips); one of another size or pixel was
+// read as garbage, or overflowed the scanline fallback's buffer. Now each
+// directory read is compared with the plan: one of another layout is read by
+// its own (readOwnLayout), and one that does not fit the output fails the read.
+struct DirPlan {
+    uint64_t x, y, bits, samples, rowsPerStrip;   // (rowsPerStrip limited to the height)
+    uint32_t tileWidth, tileLength;
+    bool tiled, planar;
+};
+
+enum class DirFit { same, otherLayout, none };
+
+// How the current directory compares with the plan. Its tags are in memory
+// once the directory is read, so this costs a few lookups a slice.
+static DirFit compareDirectory(TIFF* tif, const DirPlan& p){
+    uint32_t w = 0, h = 0;
+    uint16_t b = 1, spp = 1;
+    TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &w);
+    TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &h);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_BITSPERSAMPLE, &b);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
+    if(w != p.x || h != p.y || b != p.bits || spp != p.samples) return DirFit::none;
+    const bool tiled = TIFFIsTiled(tif) != 0;
+    if(tiled != p.tiled || (planesOf(tif) > 1) != p.planar) return DirFit::otherLayout;
+    if(tiled){
+        uint32_t tw = 0, tl = 0;
+        TIFFGetField(tif, TIFFTAG_TILEWIDTH, &tw);
+        TIFFGetField(tif, TIFFTAG_TILELENGTH, &tl);
+        return (tw == p.tileWidth && tl == p.tileLength) ? DirFit::same : DirFit::otherLayout;
+    }
+    uint32_t rps = 0;
+    TIFFGetFieldDefaulted(tif, TIFFTAG_ROWSPERSTRIP, &rps);
+    return std::max<uint64_t>(1, std::min<uint64_t>(rps, p.y)) == p.rowsPerStrip ? DirFit::same : DirFit::otherLayout;
+}
+
+// Why the current directory, number dir, does not fit the read (into s)
+static void describeMisfit(char* s, size_t n, TIFF* tif, uint64_t dir, const DirPlan& p){
+    uint32_t w = 0, h = 0;
+    uint16_t b = 1, spp = 1;
+    TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &w);
+    TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &h);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_BITSPERSAMPLE, &b);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
+    snprintf(s, n, "Directory %llu is %u x %u with %u-bit samples, %u per pixel, where the first is %llu x %llu with %llu-bit samples, %llu per pixel: they cannot be read as one stack\n",
+             (unsigned long long)dir, (unsigned)w, (unsigned)h, (unsigned)b, (unsigned)spp, (unsigned long long)p.x,
+             (unsigned long long)p.y, (unsigned long long)p.bits, (unsigned long long)p.samples);
+}
+
+// Transposes `rows` decoded chunky rows (from image row rowOff) into one slice
+// of the flip (column-major) layout, as the strip readers do.
+static void flipRows(uint8_t* slice, const uint8_t* buf, uint64_t x, uint64_t y, uint64_t bits, uint64_t samples,
+                     uint64_t rowOff, uint64_t rows){
+    const int64_t X = (int64_t)x, Y = (int64_t)y, R = (int64_t)rows, O = (int64_t)rowOff, S = (int64_t)samples;
+    if(samples == 1){
+        switch(bits){
+            case 8:  flipTransposeStrip<uint8_t>(slice, buf, X, Y, R, O, 0); break;
+            case 16: flipTransposeStrip<uint16_t>(reinterpret_cast<uint16_t*>(slice), reinterpret_cast<const uint16_t*>(buf), X, Y, R, O, 0); break;
+            case 32: flipTransposeStrip<float>(reinterpret_cast<float*>(slice), reinterpret_cast<const float*>(buf), X, Y, R, O, 0); break;
+            case 64: flipTransposeStrip<double>(reinterpret_cast<double*>(slice), reinterpret_cast<const double*>(buf), X, Y, R, O, 0); break;
+        }
+        return;
+    }
+    switch(bits){
+        case 8:  flipTransposeStripRGB<uint8_t>(slice, buf, X, Y, R, O, 0, S); break;
+        case 16: flipTransposeStripRGB<uint16_t>(reinterpret_cast<uint16_t*>(slice), reinterpret_cast<const uint16_t*>(buf), X, Y, R, O, 0, S); break;
+        case 32: flipTransposeStripRGB<float>(reinterpret_cast<float*>(slice), reinterpret_cast<const float*>(buf), X, Y, R, O, 0, S); break;
+        case 64: flipTransposeStripRGB<double>(reinterpret_cast<double*>(slice), reinterpret_cast<const double*>(buf), X, Y, R, O, 0, S); break;
+    }
+}
+
+// Reads the current directory into slice by its own layout: its strips, of
+// whatever rows, one at a time, or its tiles, whatever their size, chunky or
+// planar. The directory must fit the read (compareDirectory). Returns the
+// strip or tile that cannot be read, or -1.
+static int64_t readOwnLayout(TIFF* tif, uint8_t* slice, uint64_t x, uint64_t y, uint64_t bits, uint64_t samples,
+                             uint8_t flipXY, std::vector<uint8_t>& lzwRaw){
+    const bool planar = planesOf(tif) > 1;
+    if(TIFFIsTiled(tif)){
+        uint32_t tw = 0, tl = 0;
+        TIFFGetField(tif, TIFFTAG_TILEWIDTH, &tw);
+        TIFFGetField(tif, TIFFTAG_TILELENGTH, &tl);
+        const tmsize_t tileBytes = TIFFTileSize(tif);
+        if(!tw || !tl || tileBytes <= 0) return 0;
+        std::unique_ptr<uint8_t[]> buffer(new uint8_t[(size_t)tileBytes]);
+        const int64_t across = (int64_t)((x + tw - 1)/tw), down = (int64_t)((y + tl - 1)/tl);
+        int64_t failed = -1;
+        readTilesInto(tif, buffer.get(), (int64_t)tileBytes, slice, (int64_t)x, (int64_t)y, (int64_t)bits, (int64_t)samples, planar,
+                      (int64_t)tw, (int64_t)tl, across, 0, across*down, 0, flipXY, &failed, lzwRaw);
+        return failed;
+    }
+    uint32_t rps = 0;
+    TIFFGetFieldDefaulted(tif, TIFFTAG_ROWSPERSTRIP, &rps);
+    const uint64_t rows = std::max<uint64_t>(1, std::min<uint64_t>(rps, y)), planes = planar ? samples : 1;
+    const uint64_t rowBytes = (planar ? x : x*samples)*(bits/8), perPlane = (y + rows - 1)/rows;
+    std::unique_ptr<uint8_t[]> buffer(new uint8_t[rows*rowBytes]);
+    for(uint64_t p = 0; p < planes; p++)
+        for(uint64_t s = 0; s < perPlane; s++){
+            const uint64_t r0 = s*rows, n = std::min<uint64_t>(rows, y - r0);
+            const uint32_t strip = (uint32_t)(p*perPlane + s);
+            // (a chunky strip read row-major goes straight into place)
+            uint8_t* dst = (!flipXY && !planar) ? slice + r0*rowBytes : buffer.get();
+            if(readEncodedStrip(tif, strip, dst, (tmsize_t)(n*rowBytes), lzwRaw) < 0) return strip;
+            if(dst != buffer.get()) continue;
+            if(!planar) flipRows(slice, buffer.get(), x, y, bits, samples, r0, n);
+            else if(flipXY) flipPlanarRows(slice, buffer.get(), (int64_t)x, (int64_t)y, (int64_t)bits, (int64_t)samples, (int64_t)r0, (int64_t)n, 0, (int64_t)p);
+            else for(uint64_t r = 0; r < n; r++) placePlanarScanline(slice, buffer.get() + r*rowBytes, x, y, samples, p, bits, r0 + r, 0, flipXY);
+        }
+    return -1;
+}
+
 // Backup method in case there are errors reading strips: re-read every slice a
 // scanline at a time, each worker taking a block of whole slices. Reports an
 // error if a row still cannot be read rather than leaving it unwritten.
@@ -652,9 +769,11 @@ static uint8_t readTiffParallelBakAt(uint64_t x, uint64_t y, uint64_t z, const c
         }
         uint16_t spp = 1;
         TIFFGetFieldDefaulted(tif.get(), TIFFTAG_SAMPLESPERPIXEL, &spp);
-        const uint16_t planes = planesOf(tif.get());
         std::unique_ptr<uint8_t[]> line(new uint8_t[x*spp*bytes]);
         const uint64_t sliceBytes = x*y*spp*bytes;
+        // (the first directory's size and pixels; scanlines suit any rows per strip)
+        const DirPlan plan{x, y, bits, spp, 1, 0, 0, false, false};
+        std::vector<uint8_t> lzwRaw;
         for(int64_t dir = first; dir < last && !err; dir++){
             uint8_t* const slice = out.at((uint64_t)(dir - (int64_t)startSlice), sliceBytes);
             if(!setDirectoryWithRetry(tif.get(), (uint64_t)dir, offsets)){
@@ -665,6 +784,28 @@ static uint8_t readTiffParallelBakAt(uint64_t x, uint64_t y, uint64_t z, const c
                 }
                 break;
             }
+            // A directory that does not fit fails the read (its scanlines would
+            // overflow the line, or the slice); tiles have no scanlines.
+            if(compareDirectory(tif.get(), plan) == DirFit::none){
+                #pragma omp critical
+                {
+                    err = 1;
+                    describeMisfit(errString, sizeof errString, tif.get(), (uint64_t)dir, plan);
+                }
+                break;
+            }
+            if(TIFFIsTiled(tif.get())){
+                const int64_t failed = readOwnLayout(tif.get(), slice, x, y, bits, spp, flipXY, lzwRaw);
+                if(failed >= 0){
+                    #pragma omp critical
+                    {
+                        err = 1;
+                        sprintf(errString,"Thread %d: Tile %ld of directory %ld cannot be read\n",w,(long)failed,(long)dir);
+                    }
+                }
+                continue;
+            }
+            const uint16_t planes = planesOf(tif.get());
             for(uint16_t p = 0; p < planes && !err; p++)
             for(uint64_t i = 0; i < y; i++){
                 if(TIFFReadScanline(tif.get(), line.get(), (uint32_t)i, p) < 0){
@@ -859,6 +1000,8 @@ static uint8_t readTiffParallelAt(uint64_t x, uint64_t y, uint64_t z, const char
         // Strips (per color when planar) or tiles in a slice; readPart takes a
         // range of them.
         const int64_t units = tiled ? (int64_t)(tilesAcross*tilesDown) : nStrips;
+        // What every directory read is compared with (see DirPlan)
+        const DirPlan plan{x, y, bits, samples, stripSize, tw, tl, tiled, planar};
 
         // Read strips (or tiles) [uBegin, uEnd) of one slice into their place
         // in the output.
@@ -889,6 +1032,31 @@ static uint8_t readTiffParallelAt(uint64_t x, uint64_t y, uint64_t z, const char
                     }
                     return;
                 }
+            }
+            // A directory unlike the first: one that does not fit the output
+            // fails the read, and one laid out otherwise is read by its own
+            // layout, whole, by the thread handed the slice's first piece.
+            const DirFit fit = compareDirectory(tif.get(), plan);
+            if(fit == DirFit::none){
+                #pragma omp critical
+                {
+                    err = 1;
+                    describeMisfit(errString, sizeof errString, tif.get(), (uint64_t)dir, plan);
+                }
+                return;
+            }
+            if(fit == DirFit::otherLayout){
+                const int64_t failed = uBegin ? -1 : readOwnLayout(tif.get(), slice, x, y, bits, samples, flipXY, lzwRaw);
+                if(failed >= 0){
+                    #pragma omp critical
+                    {
+                        // (strips can be read again by scanlines; tiles not)
+                        if(!TIFFIsTiled(tif.get())) errBak = 1;
+                        err = 1;
+                        sprintf(errString,"Thread %d: Strip or tile %ld of directory %ld cannot be read\n",w,(long)failed,(long)dir);
+                    }
+                }
+                return;
             }
 
             if(tiled){
@@ -1107,8 +1275,21 @@ static uint8_t readTiffParallel2DBakAt(uint64_t x, uint64_t y, uint64_t z, const
     uint32_t rowsPerStrip = 0;
     {
         TiffPtr probe(openReaderTiff(fileName));
-        if(probe && setDirectoryWithRetry(probe.get(), startSlice, offsets))
+        uint16_t spp0 = 1;
+        if(probe) TIFFGetFieldDefaulted(probe.get(), TIFFTAG_SAMPLESPERPIXEL, &spp0);
+        if(probe && setDirectoryWithRetry(probe.get(), startSlice, offsets)){
+            // A directory that does not fit the output (the first's size and
+            // pixels) fails the read: its scanlines would overflow the line
+            // below, or the output.
+            const DirPlan first{x, y, bits, spp0, 1, 0, 0, false, false};
+            if(compareDirectory(probe.get(), first) == DirFit::none){
+                char why[512];
+                describeMisfit(why, sizeof why, probe.get(), startSlice, first);
+                printf("%s", why);
+                return 1;
+            }
             TIFFGetFieldDefaulted(probe.get(), TIFFTAG_ROWSPERSTRIP, &rowsPerStrip);
+        }
     }
     if(!rowsPerStrip || rowsPerStrip > y) rowsPerStrip = (uint32_t)y;
     const uint64_t numStrips = (y + rowsPerStrip - 1) / rowsPerStrip;
@@ -1176,11 +1357,7 @@ uint8_t readTiffParallel2DBak(uint64_t x, uint64_t y, uint64_t z, const char* fi
 // readTiffParallel2D, given where the directories start when the caller knows (TiffInfo::offsets)
 static uint8_t readTiffParallel2DAt(uint64_t x, uint64_t y, uint64_t z, const char* fileName, void* tiff, uint64_t bits, uint64_t startSlice, uint64_t stripSize, uint8_t flipXY,
                                     const std::vector<uint64_t>* offsets){
-    // More rows per strip than the image has is one strip (see readTiffParallel).
-    stripSize = std::max<uint64_t>(1, std::min(stripSize, y));
     int32_t numWorkers = omp_get_max_threads();
-    uint64_t stripsPerDir = (uint64_t)ceil((double)y/(double)stripSize);
-    int32_t batchSize = (stripsPerDir-1)/numWorkers+1;
     uint64_t bytes = bits/8;
 
     int32_t w;
@@ -1194,7 +1371,35 @@ static uint8_t readTiffParallel2DAt(uint64_t x, uint64_t y, uint64_t z, const ch
     }
     uint16_t spp = 1;
     TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
-    const uint64_t samples = spp;          // 1=grayscale, 3=RGB, 4=RGBA
+    const uint64_t samples = spp;          // 1=grayscale, 3=RGB, 4=RGBA (the first directory's, as the output's)
+    // The directory read, which must fit the output (the first directory's size
+    // and pixels), is read by its own layout: the tags below, and the caller's
+    // stripSize, were the first directory's, which read another laid out
+    // otherwise as garbage (see DirPlan).
+    if(startSlice){
+        knowDirectory(tif, startSlice, offsets);
+        if(!TIFFSetDirectory(tif, (tdir_t)startSlice)){
+            printf("File \"%s\": TIFFSetDirectory(%llu) failed\n", fileName, (unsigned long long)startSlice);
+            TIFFClose(tif);
+            return 1;
+        }
+    }
+    {
+        const DirPlan first{x, y, bits, samples, 1, 0, 0, false, false};
+        if(compareDirectory(tif, first) == DirFit::none){
+            char why[512];
+            describeMisfit(why, sizeof why, tif, startSlice, first);
+            printf("%s", why);
+            TIFFClose(tif);
+            return 1;
+        }
+    }
+    uint32_t rowsPerStrip = 0;
+    TIFFGetFieldDefaulted(tif, TIFFTAG_ROWSPERSTRIP, &rowsPerStrip);
+    // More rows per strip than the image has is one strip (see readTiffParallel).
+    stripSize = std::max<uint64_t>(1, std::min<uint64_t>(rowsPerStrip, y));
+    uint64_t stripsPerDir = (uint64_t)ceil((double)y/(double)stripSize);
+    int32_t batchSize = (stripsPerDir-1)/numWorkers+1;
     const uint64_t xs = x * samples;       // interleaved row width (xs==x when grayscale)
     // Planar color: each color is its own image, one sample per pixel per row,
     // read through the buffer in both layouts (see readPlanarStrips).
