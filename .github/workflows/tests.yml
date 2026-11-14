@@ -113,6 +113,45 @@ jobs:
           fi
           PYTHONPATH=python python python/tests/test_python.py
 
+  # The release's Windows toolchain, MinGW-builds GCC 12.2 (UCRT), which emulates thread-local storage, as the MSYS2
+  # GCC of the other Windows jobs does not: built with it, the unload test crashed before src/winruntime.cpp
+  windows-release-gcc:
+    name: C++ (Windows, the release's GCC 12.2)
+    runs-on: windows-2025
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      # the MinGW-builds project's release (github.com/niXman/mingw-builds-binaries), the toolchain whose name the
+      # released DLL carries; the release publishes no digest, so the archive's SHA-256 is pinned here
+      - name: Get MinGW-w64 12.2.0 (UCRT)
+        run: |
+          url=https://github.com/niXman/mingw-builds-binaries/releases/download/12.2.0-rt_v10-rev2/x86_64-12.2.0-release-posix-seh-ucrt-rt_v10-rev2.7z
+          curl -sSL --fail -o "$RUNNER_TEMP/mingw.7z" "$url"
+          sha=$(sha256sum < "$RUNNER_TEMP/mingw.7z" | cut -d' ' -f1)
+          if [ "$sha" != "dc1f299e8450c96f59f4b8f7c1290ebb78ee00ddb71f9ed4ca0efaf5462f8c4e" ]; then
+            echo "::error::unexpected MinGW archive $sha"
+            exit 1
+          fi
+          7z x -y -o"$RUNNER_TEMP" "$RUNNER_TEMP/mingw.7z" > /dev/null
+          bin=$(cygpath -m "$RUNNER_TEMP/mingw64/bin")
+          echo "$bin" >> "$GITHUB_PATH"
+          echo "MINGW_BIN=$bin" >> "$GITHUB_ENV"
+          python -m pip install --quiet ninja
+          echo "NINJA=$(python -c 'import ninja, os; print(os.path.join(ninja.BIN_DIR, "ninja.exe").replace(chr(92), "/"))')" >> "$GITHUB_ENV"
+
+      - name: Build library and C++ tests
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_MAKE_PROGRAM="$NINJA" -DCMAKE_C_COMPILER="$MINGW_BIN/gcc.exe" \
+            -DCMAKE_CXX_COMPILER="$MINGW_BIN/g++.exe" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
+          cmake --build build --parallel 4
+
+      - name: C++ tests
+        run: ctest --test-dir build --output-on-failure
+
   matlab:
     name: MATLAB (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
