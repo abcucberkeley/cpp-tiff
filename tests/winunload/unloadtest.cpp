@@ -2,8 +2,8 @@
 // runs it, unloads it and lets the thread exit, as MATLAB does with a MEX file at "clear mex" and at exit.
 //   unloadtest <file.tif> <write 0|1> <loads> <unload 0|1> [check]
 // Exit code 0: the thread exited cleanly; 3: an access violation, reported with the module it fell in (one that was
-// unloaded, if the address is in its old range); 5 (with check): after an unload, the library was still loaded
-// (clear mex unloads it) or libgomp was not (the library keeps it loaded, src/winruntime.cpp); other: a failed step.
+// unloaded, if the address is in its old range); 5 (with check): after an unload, the library or libgomp was not
+// loaded (the library keeps itself loaded, and with it libgomp, src/winruntime.cpp); other: a failed step.
 #include <windows.h>
 #include <process.h>
 #include <cstdarg>
@@ -75,7 +75,7 @@ unsigned __stdcall worker(void* p){
         if(a->unload){
             FreeLibrary(h);
             states("after FreeLibrary");
-            if(a->check && (GetModuleHandleW(L"libcppTiff.dll") || !GetModuleHandleW(L"libgomp-1.dll"))) return 5;
+            if(a->check && (!GetModuleHandleW(L"libcppTiff.dll") || !GetModuleHandleW(L"libgomp-1.dll"))) return 5;
         }
     }
     say("thread %lu exits\n", GetCurrentThreadId());

@@ -138,7 +138,7 @@ add_dependencies(tiff libzstd_static)
 set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 add_library(cppTiff_shared SHARED ${SRC_DIR}/helperfunctions.cpp ${SRC_DIR}/pathutil.cpp ${SRC_DIR}/lzwencode.cpp ${SRC_DIR}/lzwdecode.cpp ${SRC_DIR}/parallelreadtiff.cpp ${SRC_DIR}/parallelwritetiff.cpp)
-# Windows: the GCC runtime DLLs the library loads stay loaded until the process ends (src/winruntime.cpp)
+# Windows: the library stays loaded until the process ends (src/winruntime.cpp)
 if(WIN32)
     target_sources(cppTiff_shared PRIVATE ${SRC_DIR}/winruntime.cpp)
 endif()
@@ -189,15 +189,8 @@ target_link_libraries(cppTiff_shared PRIVATE
 # (std::async failing at a thread limit, or running out of memory) was unwound
 # by that private copy, and a caller catching it with its own C++ runtime
 # (Python, a C++ program) aborted instead.
-# On Windows it links the shared libgcc too (libgcc_s_seh-1.dll, which libgomp-1.dll loads anyway): with a static
-# copy, GCC 12.2's emulated thread-local storage (std::future::get's std::call_once, exceptions) was the library's own,
-# whose destructor libwinpthread-1.dll ran when a thread that had written exited, after the library was unloaded by
-# clear mex or as MATLAB exited, and the thread crashed (src/winruntime.cpp); the library also exported that copy's
-# unwinder.
 if(UNIX AND NOT APPLE)
     target_link_options(cppTiff_shared PRIVATE "-Wl,-Bsymbolic")
-elseif(WIN32)
-    target_link_libraries(cppTiff_shared PRIVATE -shared-libgcc)
 else()
     target_link_libraries(cppTiff_shared PRIVATE -static-libgcc)
 endif()
@@ -273,14 +266,21 @@ if(BUILD_TESTS)
     target_link_libraries(roundtripTest PRIVATE cppTiff_shared OpenMP::OpenMP_CXX)
     add_test(NAME roundtrip COMMAND roundtripTest ${CMAKE_CURRENT_BINARY_DIR})
     # Windows: a thread that wrote and read through a DLL that loads the library, as MATLAB calls a mex file, exits
-    # cleanly after that DLL and the library are unloaded, three times over, with the library unloaded each time and
-    # libgomp kept (tests/winunload/unloadtest.cpp); built with the release's GCC 12.2, it crashed before the fix
+    # cleanly after that DLL is unloaded, three times over, with the library and libgomp kept loaded each time
+    # (tests/winunload/unloadtest.cpp); built with the release's GCC 12.2, it crashed before src/winruntime.cpp
     if(WIN32)
         add_library(fakemex SHARED ${CMAKE_CURRENT_SOURCE_DIR}/tests/winunload/fakemex.cpp)
         set_target_properties(fakemex PROPERTIES PREFIX "")
         target_include_directories(fakemex PRIVATE ${SRC_DIR})
-        # (its own C++ runtime and threads library inside it, as MATLAB links the mex files)
-        target_link_libraries(fakemex PRIVATE cppTiff_shared -static)
+        # Linked as build_mex.m links the mex files: their own C++ runtime and threads library inside them, and
+        # libgcc_eh.a before the library, which exports its static libgcc's unwinder too
+        execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libgcc_eh.a
+                        OUTPUT_VARIABLE CPPTIFF_GCC_EH OUTPUT_STRIP_TRAILING_WHITESPACE)
+        file(TO_CMAKE_PATH "${CPPTIFF_GCC_EH}" CPPTIFF_GCC_EH)
+        if(NOT IS_ABSOLUTE "${CPPTIFF_GCC_EH}" OR NOT EXISTS "${CPPTIFF_GCC_EH}")
+            set(CPPTIFF_GCC_EH "")
+        endif()
+        target_link_libraries(fakemex PRIVATE ${CPPTIFF_GCC_EH} cppTiff_shared -static)
         add_executable(unloadTest ${CMAKE_CURRENT_SOURCE_DIR}/tests/winunload/unloadtest.cpp)
         target_link_libraries(unloadTest PRIVATE -static)
         add_dependencies(unloadTest fakemex)
