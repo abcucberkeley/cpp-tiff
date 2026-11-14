@@ -80,8 +80,11 @@ jobs:
         run: |
           cp "$MINGW_BIN/libgomp-1.dll" "$MINGW_BIN/libwinpthread-1.dll" install/bin/
           if [ -f "$MINGW_BIN/libgcc_s_seh-1.dll" ]; then cp "$MINGW_BIN/libgcc_s_seh-1.dll" install/bin/; fi
+          # (libgcc_eh.a before the library, as build_mex.m links it: a library linked with a static libgcc exports
+          # its unwinder too)
+          gcceh=$("$MINGW_BIN/g++" -print-file-name=libgcc_eh.a)
           "$MINGW_BIN/g++" -O2 -std=c++11 -shared -static tests/winunload/fakemex.cpp -o install/bin/fakemex.dll \
-            -Iinstall/include -Linstall/lib -lcppTiff.dll
+            -Iinstall/include "$gcceh" -Linstall/lib -lcppTiff.dll
           "$MINGW_BIN/g++" -O2 -std=c++11 -static tests/winunload/unloadtest.cpp -o install/bin/unloadtest.exe
           for f in libcppTiff.dll libgomp-1.dll fakemex.dll; do
             echo "== $f imports:"; "$MINGW_BIN/objdump" -p "install/bin/$f" | grep 'DLL Name' | grep -v -i -E 'api-ms|KERNEL32'
@@ -101,4 +104,128 @@ jobs:
               ./unloadtest.exe "$f" $args
               echo "== exit code $?"
             done
+          done
+
+  # the same in MATLAB: the mex files built with the release's toolchain, a write and a read, then MATLAB exits (each
+  # step a MATLAB of its own), with and without clear mex first, and under cdb, which logs a second-chance access
+  # violation's stack and the modules (tests/winunload/unload_probe.m)
+  matlab:
+    name: MATLAB unload probe (${{ matrix.name }})
+    runs-on: windows-2025
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: 'GCC 12.2, as released',                         pin: 0, sharedgcc: OFF }
+          - { name: 'GCC 12.2, pin the library',                     pin: 1, sharedgcc: OFF }
+          - { name: 'GCC 12.2, shared libgcc, pin libgomp+libgcc_s', pin: 2, sharedgcc: ON }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Get MinGW-w64 12.2.0 (UCRT)
+        run: |
+          url=https://github.com/niXman/mingw-builds-binaries/releases/download/12.2.0-rt_v10-rev2/x86_64-12.2.0-release-posix-seh-ucrt-rt_v10-rev2.7z
+          curl -sSL --fail -o "$RUNNER_TEMP/mingw.7z" "$url"
+          sha=$(sha256sum < "$RUNNER_TEMP/mingw.7z" | cut -d' ' -f1)
+          if [ "$sha" != "dc1f299e8450c96f59f4b8f7c1290ebb78ee00ddb71f9ed4ca0efaf5462f8c4e" ]; then
+            echo "::error::unexpected MinGW archive $sha"
+            exit 1
+          fi
+          7z x -y -o"$RUNNER_TEMP" "$RUNNER_TEMP/mingw.7z" > /dev/null
+          bin=$(cygpath -m "$RUNNER_TEMP/mingw64/bin")
+          echo "$bin" >> "$GITHUB_PATH"
+          echo "MINGW_BIN=$bin" >> "$GITHUB_ENV"
+          echo "MW_MINGW64_LOC=$(cygpath -w "$RUNNER_TEMP/mingw64")" >> "$GITHUB_ENV"
+          python -m pip install --quiet ninja
+          echo "NINJA=$(python -c 'import ninja, os; print(os.path.join(ninja.BIN_DIR, "ninja.exe").replace(chr(92), "/"))')" >> "$GITHUB_ENV"
+
+      - name: Build the library
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_MAKE_PROGRAM="$NINJA" -DCMAKE_C_COMPILER="$MINGW_BIN/gcc.exe" \
+            -DCMAKE_CXX_COMPILER="$MINGW_BIN/g++.exe" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCPPTIFF_WIN_PIN=${{ matrix.pin }} -DCPPTIFF_WIN_SHARED_LIBGCC=${{ matrix.sharedgcc }}
+          cmake --build build --parallel 4
+          cmake --install build --prefix install
+
+      - name: Find cdb
+        shell: pwsh
+        run: |
+          $cdb = @("${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\cdb.exe", "$env:ProgramFiles\Windows Kits\10\Debuggers\x64\cdb.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($cdb) { Add-Content -Path $env:GITHUB_ENV -Value "CDB_PATH=$cdb"; "cdb: $cdb" } else { "no cdb on this runner" }
+          New-Item -ItemType Directory -Force -Path probe-results | Out-Null
+
+      - uses: matlab-actions/setup-matlab@v3
+        with:
+          release: R2024b
+          cache: true
+
+      - name: Build the mex files
+        uses: matlab-actions/run-command@v3
+        with:
+          command: addpath('.github/scripts'); build_mex(fullfile(pwd, 'install'), fullfile(pwd, 'mex'));
+
+      - name: Exit 1, no clear mex
+        id: plain1
+        continue-on-error: true
+        uses: matlab-actions/run-command@v3
+        with:
+          command: addpath('tests/winunload'); unload_probe(fullfile(pwd, 'mex'), '', false);
+
+      - name: Exit 2, no clear mex
+        id: plain2
+        continue-on-error: true
+        uses: matlab-actions/run-command@v3
+        with:
+          command: addpath('tests/winunload'); unload_probe(fullfile(pwd, 'mex'), '', false);
+
+      - name: Exit 3, clear mex first
+        id: plain3
+        continue-on-error: true
+        uses: matlab-actions/run-command@v3
+        with:
+          command: addpath('tests/winunload'); unload_probe(fullfile(pwd, 'mex'), '', true);
+
+      - name: Exit 4, clear mex first
+        id: plain4
+        continue-on-error: true
+        uses: matlab-actions/run-command@v3
+        with:
+          command: addpath('tests/winunload'); unload_probe(fullfile(pwd, 'mex'), '', true);
+
+      - name: Exit under cdb, no clear mex
+        id: cdb1
+        continue-on-error: true
+        env:
+          PROBE_CDB: ${{ env.CDB_PATH }}
+        uses: matlab-actions/run-command@v3
+        with:
+          command: addpath('tests/winunload'); unload_probe(fullfile(pwd, 'mex'), fullfile(pwd, 'probe-results', 'cdb_noclear.txt'), false);
+
+      - name: Exit under cdb, clear mex first
+        id: cdb2
+        continue-on-error: true
+        env:
+          PROBE_CDB: ${{ env.CDB_PATH }}
+        uses: matlab-actions/run-command@v3
+        with:
+          command: addpath('tests/winunload'); unload_probe(fullfile(pwd, 'mex'), fullfile(pwd, 'probe-results', 'cdb_clear.txt'), true);
+
+      - name: Results
+        if: always()
+        run: |
+          echo "MATLAB exits: 1 ${{ steps.plain1.outcome }}, 2 ${{ steps.plain2.outcome }}, 3 (clear mex) ${{ steps.plain3.outcome }}, 4 (clear mex) ${{ steps.plain4.outcome }}; under cdb: ${{ steps.cdb1.outcome }}, clear mex ${{ steps.cdb2.outcome }}"
+          sleep 5
+          taskkill //F //IM cdb.exe > /dev/null 2>&1 || true
+          for f in probe-results/*.txt; do
+            [ -f "$f" ] || continue
+            echo "===== $f"
+            if grep -q 'second-chance access violation' "$f"; then
+              sed -n '/== second-chance access violation/,/== end/p' "$f" | grep -v -E '^\s*$' | head -120
+            else
+              echo "(no second-chance access violation)"; tail -5 "$f"
+            fi
           done
