@@ -21,6 +21,10 @@ test-command = "python {project}/tests/test_python.py"
 [tool.cibuildwheel.linux]
 skip = "pp* *musllinux*"
 environment = {CXX="g++", CC="gcc", LD_LIBRARY_PATH="/project/build/install/lib64:$LD_LIBRARY_PATH"}
+# The image that built 1.7.3, pinned so that the wheels keep bundling the same libgomp (libgomp-e985bcbb.so.1.0.0,
+# named after the image's own) as cpp-zarr's, built from the same image: a module that links that copy shares one
+# OpenMP runtime with both. A change here goes with the same change in cpp-zarr.
+manylinux-x86_64-image = "quay.io/pypa/manylinux_2_28_x86_64:2026.06.04-1"
 
 [tool.cibuildwheel.macos]
 # Homebrew gcc on Apple Silicon. If the x86 mac build is re-enabled, its compiler
