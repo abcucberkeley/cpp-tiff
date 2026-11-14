@@ -1,14 +1,16 @@
 // Windows: loads fakemex.dll (and through it the library and the GCC runtime DLLs it loads) on a thread of its own,
 // runs it, unloads it and lets the thread exit, as MATLAB does with a MEX file at "clear mex" and at exit.
-//   unloadtest <file.tif> <write 0|1> <loads> <unload 0|1>
+//   unloadtest <file.tif> <write 0|1> <loads> <unload 0|1> [check]
 // Exit code 0: the thread exited cleanly; 3: an access violation, reported with the module it fell in (one that was
-// unloaded, if the address is in its old range); other: a failed step.
+// unloaded, if the address is in its old range); 5 (with check): after an unload, the library was still loaded
+// (clear mex unloads it) or libgomp was not (the library keeps it loaded, src/winruntime.cpp); other: a failed step.
 #include <windows.h>
 #include <process.h>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace {
 
@@ -56,7 +58,7 @@ LONG CALLBACK onException(EXCEPTION_POINTERS* e){
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-struct Args { const char* file; int write, loads, unload; };
+struct Args { const char* file; int write, loads, unload; bool check; };
 
 unsigned __stdcall worker(void* p){
     const Args* a = static_cast<const Args*>(p);
@@ -73,6 +75,7 @@ unsigned __stdcall worker(void* p){
         if(a->unload){
             FreeLibrary(h);
             states("after FreeLibrary");
+            if(a->check && (GetModuleHandleW(L"libcppTiff.dll") || !GetModuleHandleW(L"libgomp-1.dll"))) return 5;
         }
     }
     say("thread %lu exits\n", GetCurrentThreadId());
@@ -82,10 +85,13 @@ unsigned __stdcall worker(void* p){
 }
 
 int main(int argc, char** argv){
-    if(argc != 5){ say("usage: unloadtest <file.tif> <write 0|1> <loads> <unload 0|1>\n"); return 1; }
+    if(argc != 5 && !(argc == 6 && !strcmp(argv[5], "check"))){
+        say("usage: unloadtest <file.tif> <write 0|1> <loads> <unload 0|1> [check]\n");
+        return 1;
+    }
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
     AddVectoredExceptionHandler(1, onException);
-    Args a = {argv[1], atoi(argv[2]), atoi(argv[3]), atoi(argv[4])};
+    Args a = {argv[1], atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), argc == 6};
     HANDLE t = reinterpret_cast<HANDLE>(_beginthreadex(NULL, 0, worker, &a, 0, NULL));
     if(!t){ say("no thread\n"); return 1; }
     WaitForSingleObject(t, INFINITE);

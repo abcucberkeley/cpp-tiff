@@ -184,6 +184,9 @@ maxNumCompThreads(8);
 im = parallelReadTiff('path/to/file.tif');
 ````
 
+#### Unloading on Windows
+clear mex unloads the mex files and libcppTiff.dll, so they can be replaced while MATLAB runs. The GCC runtime DLLs they load (libgomp-1.dll, libgcc_s_seh-1.dll and libwinpthread-1.dll) stay loaded until MATLAB exits: a thread that had run a mex file crashed as it exited once they were unloaded
+
 ## Reference
 
 Please cite our software if you find it useful in your work:
