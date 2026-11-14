@@ -138,6 +138,13 @@ add_dependencies(tiff libzstd_static)
 set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 add_library(cppTiff_shared SHARED ${SRC_DIR}/helperfunctions.cpp ${SRC_DIR}/pathutil.cpp ${SRC_DIR}/lzwencode.cpp ${SRC_DIR}/lzwdecode.cpp ${SRC_DIR}/parallelreadtiff.cpp ${SRC_DIR}/parallelwritetiff.cpp)
+# EXPERIMENT (branch win-runtime-unload): see src/winruntime.cpp
+if(WIN32)
+    set(CPPTIFF_WIN_PIN 0 CACHE STRING "Experiment: 0 none, 1 the library, 2 its GCC runtime DLLs")
+    option(CPPTIFF_WIN_SHARED_LIBGCC "Experiment: link libgcc_s instead of a static libgcc" OFF)
+    target_sources(cppTiff_shared PRIVATE ${SRC_DIR}/winruntime.cpp)
+    target_compile_definitions(cppTiff_shared PRIVATE CPPTIFF_WIN_PIN=${CPPTIFF_WIN_PIN})
+endif()
 set_target_properties(cppTiff_shared PROPERTIES OUTPUT_NAME cppTiff)
 # Every function of the library starts on a 64-byte boundary, so its speed
 # depends on its own code only. Without it, the LZW codecs ran 2-6% faster or
@@ -187,7 +194,7 @@ target_link_libraries(cppTiff_shared PRIVATE
 # (Python, a C++ program) aborted instead.
 if(UNIX AND NOT APPLE)
     target_link_options(cppTiff_shared PRIVATE "-Wl,-Bsymbolic")
-else()
+elseif(NOT (WIN32 AND CPPTIFF_WIN_SHARED_LIBGCC))
     target_link_libraries(cppTiff_shared PRIVATE -static-libgcc)
 endif()
 

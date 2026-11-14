@@ -1,0 +1,104 @@
+name: Windows unload probe
+
+# EXPERIMENT (branch win-runtime-unload): does a thread that used the library crash when it exits after the library
+# is unloaded, as MATLAB's threads do at exit after "clear mex"? Built with the release's toolchain (MinGW-builds GCC
+# 12.2, UCRT) and with MSYS2's, as released and with each way of keeping DLLs loaded (src/winruntime.cpp).
+on:
+  push:
+    branches: [win-runtime-unload]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Unload probe (${{ matrix.name }})
+    runs-on: windows-2025
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: 'GCC 12.2, as released',                         toolchain: mingw-builds, shell: bash,        pin: 0, sharedgcc: OFF }
+          - { name: 'GCC 12.2, pin the library',                     toolchain: mingw-builds, shell: bash,        pin: 1, sharedgcc: OFF }
+          - { name: 'GCC 12.2, pin libgomp and libgcc_s',            toolchain: mingw-builds, shell: bash,        pin: 2, sharedgcc: OFF }
+          - { name: 'GCC 12.2, shared libgcc, pin libgomp+libgcc_s', toolchain: mingw-builds, shell: bash,        pin: 2, sharedgcc: ON }
+          - { name: 'GCC 12.2, shared libgcc, no pin',               toolchain: mingw-builds, shell: bash,        pin: 0, sharedgcc: ON }
+          - { name: 'MSYS2 GCC, as released',                        toolchain: msys2,        shell: 'msys2 {0}', pin: 0, sharedgcc: OFF }
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # the MinGW-builds project's release (github.com/niXman/mingw-builds-binaries), the toolchain of the released
+      # Windows binaries; the release publishes no digest, so the archive's SHA-256 is pinned here
+      - name: Get MinGW-w64 12.2.0 (UCRT)
+        if: matrix.toolchain == 'mingw-builds'
+        run: |
+          url=https://github.com/niXman/mingw-builds-binaries/releases/download/12.2.0-rt_v10-rev2/x86_64-12.2.0-release-posix-seh-ucrt-rt_v10-rev2.7z
+          curl -sSL --fail -o "$RUNNER_TEMP/mingw.7z" "$url"
+          sha=$(sha256sum < "$RUNNER_TEMP/mingw.7z" | cut -d' ' -f1)
+          echo "sha256 $sha"
+          if [ "$sha" != "dc1f299e8450c96f59f4b8f7c1290ebb78ee00ddb71f9ed4ca0efaf5462f8c4e" ]; then
+            echo "::error::unexpected MinGW archive"
+            exit 1
+          fi
+          7z x -y -o"$RUNNER_TEMP" "$RUNNER_TEMP/mingw.7z" > /dev/null
+          bin=$(cygpath -m "$RUNNER_TEMP/mingw64/bin")
+          echo "$bin" >> "$GITHUB_PATH"
+          echo "MINGW_BIN=$bin" >> "$GITHUB_ENV"
+          python -m pip install --quiet ninja
+          echo "NINJA=$(python -c 'import ninja, os; print(os.path.join(ninja.BIN_DIR, "ninja.exe").replace(chr(92), "/"))')" >> "$GITHUB_ENV"
+
+      - name: Set up MSYS2
+        if: matrix.toolchain == 'msys2'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          pacboy: gcc:p libgomp:p cmake:p ninja:p
+
+      - name: MSYS2 paths
+        if: matrix.toolchain == 'msys2'
+        run: |
+          echo "MINGW_BIN=$(cygpath -m /ucrt64/bin)" >> "$GITHUB_ENV"
+          echo "NINJA=ninja" >> "$GITHUB_ENV"
+
+      - name: Build the library
+        run: |
+          "$MINGW_BIN/g++" --version | head -1
+          cmake -S . -B build -G Ninja -DCMAKE_MAKE_PROGRAM="$NINJA" -DCMAKE_C_COMPILER="$MINGW_BIN/gcc.exe" \
+            -DCMAKE_CXX_COMPILER="$MINGW_BIN/g++.exe" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCPPTIFF_WIN_PIN=${{ matrix.pin }} -DCPPTIFF_WIN_SHARED_LIBGCC=${{ matrix.sharedgcc }}
+          cmake --build build --parallel 4
+          cmake --install build --prefix install
+
+      # as the release folder: the library, its GCC runtime DLLs and the mex files (here fakemex.dll) side by side
+      - name: Build the probe
+        run: |
+          cp "$MINGW_BIN/libgomp-1.dll" "$MINGW_BIN/libwinpthread-1.dll" install/bin/
+          if [ -f "$MINGW_BIN/libgcc_s_seh-1.dll" ]; then cp "$MINGW_BIN/libgcc_s_seh-1.dll" install/bin/; fi
+          "$MINGW_BIN/g++" -O2 -std=c++11 -shared -static tests/winunload/fakemex.cpp -o install/bin/fakemex.dll \
+            -Iinstall/include -Linstall/lib -lcppTiff.dll
+          "$MINGW_BIN/g++" -O2 -std=c++11 -static tests/winunload/unloadtest.cpp -o install/bin/unloadtest.exe
+          for f in libcppTiff.dll libgomp-1.dll fakemex.dll; do
+            echo "== $f imports:"; "$MINGW_BIN/objdump" -p "install/bin/$f" | grep 'DLL Name' | grep -v -i -E 'api-ms|KERNEL32'
+          done
+          echo "== libcppTiff.dll's own emulated TLS: $("$MINGW_BIN/objdump" -t install/bin/libcppTiff.dll | grep -c -E ' (emutls_destroy|emutls_key)$') symbols"
+          echo "== libcppTiff.dll imports from libgcc_s:"
+          "$MINGW_BIN/objdump" -p install/bin/libcppTiff.dll | awk '/DLL Name: libgcc_s/{f=1;next} /DLL Name:/{f=0} f && $2 ~ /^[0-9]+$/ {print "   ", $3}' | head -20
+
+      - name: Run the probe
+        run: |
+          set +e
+          cd install/bin
+          f="$(cygpath -m "$RUNNER_TEMP")/unload.tif"
+          for args in "1 1 0" "1 1 1" "0 1 1" "1 3 1"; do
+            for k in 1 2 3; do
+              echo "== unloadtest $args (run $k)"
+              ./unloadtest.exe "$f" $args
+              echo "== exit code $?"
+            done
+          done
