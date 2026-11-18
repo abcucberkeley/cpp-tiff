@@ -110,9 +110,12 @@ ext_modules = [
         # The module's static C++ runtime stays private to it. On macOS the module exports its entry point alone:
         # the loader merges the exported weak definitions of one name across every image a process loads, so that
         # next to another GCC-built Python module (cpp-zarr's 1.7.3 wheel), whichever of the two was loaded second
-        # ran the other's copy of pybind11's std::call_once code, on the other's runtime, and its first write crashed
+        # ran the other's copy of pybind11's std::call_once code, on the other's runtime, and its first write crashed.
+        # On macOS it is linked without a debug map (-S), which names the build's object files by their absolute paths
+        # (the 1.8.0 build's modules named /Users/<user>/.../python/build/temp.macosx-.../cpptiff.o), and is of no use
+        # once those files are gone
         extra_link_args=['-static-libstdc++'] + (['-Wl,--exclude-libs,ALL'] if system == "Linux" else
-                                                 ['-Wl,-exported_symbol,_PyInit_cpptiff'] if system == "Darwin" else [])
+                                                 ['-Wl,-exported_symbol,_PyInit_cpptiff', '-Wl,-S'] if system == "Darwin" else [])
     ),
 ]
 
@@ -120,7 +123,7 @@ ext_modules = [
 # Packaging for PyPI
 setup(
     name="cpp-tiff",
-    version="1.7.3",
+    version="1.8.0",
     description="Python wrappers for cpp-tiff",
     url='https://github.com/abcucberkeley/cpp-tiff',
     author='Matthew Mueller',

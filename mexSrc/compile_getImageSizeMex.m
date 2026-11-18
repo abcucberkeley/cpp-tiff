@@ -11,13 +11,11 @@ if isunix && ~ismac
     if debug
         % (a debug build: the line below with -g -O0 in place of -O3)
     else
-        mex -outdir ../linux -output getImageSizeMex.mexa64 -v CXXOPTIMFLAGS="-DNDEBUG -O3" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O3 -DNDEBUG" CXXFLAGS='$CXXFLAGS -O3' LDFLAGS='$LDFLAGS -O3' -I'../jenkinsBuild/install/include' -L'../jenkinsBuild/install/lib64' -lstdc++ -lcppTiff getimagesizemex.cpp
+        mex -outdir ../linux -output getImageSizeMex.mexa64 -v CXXOPTIMFLAGS="-DNDEBUG -O3" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O3 -DNDEBUG" CXXFLAGS='$CXXFLAGS -O3' LDFLAGS='$LDFLAGS -O3 -static-libstdc++' -I'../jenkinsBuild/install/include' -L'../jenkinsBuild/install/lib64' -lcppTiff getimagesizemex.cpp
     end
 
-    % Need to change the library name because matlab preloads their own version
-    % of libstdc++
-    % Setting it to libstdc++.so.6.0.32 as of MATLAB R2022b
-    system(['patchelf --replace-needed libstdc++.so.6 libstdc++.so.6.0.32 ' releaseFolder '/getImageSizeMex.mexa64']);
+    % libstdc++ is linked in statically (as CI's build_mex.m links it), so the MEX file loads no libstdc++,
+    % neither MATLAB's nor one next to it: the release folder ships libgomp alone with the library
     % The RPATH $ORIGIN alone (a Spack-built GCC adds its own lib64), kept an RPATH: a RUNPATH would let
     % MATLAB's LD_LIBRARY_PATH win over the libraries next to the MEX file
     system(['patchelf --force-rpath --set-rpath ''$ORIGIN'' ' releaseFolder '/getImageSizeMex.mexa64']);
