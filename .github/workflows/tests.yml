@@ -88,8 +88,10 @@ jobs:
 
       # Compiles the extension straight against the library built above, linked
       # as setup.py links the wheels' (its static C++ runtime kept private to it,
-      # and on macOS only its entry point exported), then runs the same test file
-      # cibuildwheel runs against the release wheels.
+      # and on macOS only its entry point exported) and with setup.py's
+      # -ffile-prefix-map flags, checks that it names none of the folders those
+      # are for, then runs the same test file cibuildwheel runs against the
+      # release wheels.
       - name: Python tests
         run: |
           EXT=$(python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
@@ -106,8 +108,14 @@ jobs:
               FLAGS="-I$PYINC -lpython$PYVER"
               cp install/bin/libcppTiff.dll python/cpptiff/ ;;
           esac
+          MAPLIST=$(python .github/scripts/module_prefix_maps.py python/setup.py | tr -d '\r')
+          MAPS=()
+          while IFS= read -r f; do
+            MAPS+=("$f")
+          done <<< "$MAPLIST"
           "${CXX:-g++}" -O2 -std=c++17 -shared python/cpptiff.cpp -o "python/cpptiff/cpptiff$EXT" \
-            -Iinstall/include -Linstall/lib -lcppTiff $FLAGS
+            -Iinstall/include -Linstall/lib -lcppTiff $FLAGS "${MAPS[@]}"
+          bash .github/scripts/check_module_paths.sh python/setup.py "python/cpptiff/cpptiff$EXT"
           if [ "$RUNNER_OS" = macOS ]; then
             bash .github/scripts/check_exports.sh install/lib/libcppTiff.dylib "python/cpptiff/cpptiff$EXT"
           fi
