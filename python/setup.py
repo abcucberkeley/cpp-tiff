@@ -120,7 +120,7 @@ ext_modules = [
 # Packaging for PyPI
 setup(
     name="cpp-tiff",
-    version="1.7.3",
+    version="1.8.0",
     description="Python wrappers for cpp-tiff",
     url='https://github.com/abcucberkeley/cpp-tiff',
     author='Matthew Mueller',

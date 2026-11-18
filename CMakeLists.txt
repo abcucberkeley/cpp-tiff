@@ -14,7 +14,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
 
 project(
   cpp-tiff
-  VERSION 1.7.3
+  VERSION 1.8.0
   LANGUAGES CXX)
 
 # Set the RPATH to $ORIGIN when installing if applicable, and only that: entries the toolchain itself adds when
