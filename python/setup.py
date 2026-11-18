@@ -49,6 +49,15 @@ def prefix_map_flags():
 
 
 class PrefixMapBuildExt(build_ext):
+    # On Windows the library is built with MinGW-w64 and its API passes C++ types, so the module is compiled with that
+    # MinGW's gcc and g++, on PATH, as the released wheels' modules were, not with MSVC, setuptools' default there,
+    # which could not link the library either (cpp-zarr's setup.py does the same); a compiler named by an option or a
+    # config file still wins
+    def initialize_options(self):
+        super().initialize_options()
+        if system == "Windows":
+            self.compiler = "mingw32"
+
     # The maps are GCC's and Clang's options; MSVC, which an sdist may be built with, does not take them
     def build_extensions(self):
         if self.compiler.compiler_type != "msvc":
