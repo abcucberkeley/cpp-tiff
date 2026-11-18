@@ -275,6 +275,26 @@ def check_archive(path, patterns, forbid):
     return findings
 
 
+def expand_paths(paths, suffixes=ARCHIVE_SUFFIXES, noun="archives"):
+    """The archives that the arguments name: a file as it is, a folder as its files (not its subfolders') whose names
+    end with one of suffixes, sorted. On a missing path or a folder with no such file, print why and return None."""
+    archives = []
+    for p in paths:
+        if os.path.isdir(p):
+            found = sorted(os.path.join(p, f) for f in os.listdir(p)
+                           if f.lower().endswith(suffixes) and os.path.isfile(os.path.join(p, f)))
+            if not found:
+                print("no %s in %s" % (noun, p), file=sys.stderr)
+                return None
+            archives += found
+        elif os.path.isfile(p):
+            archives.append(p)
+        else:
+            print("no archive or folder at %s" % p, file=sys.stderr)
+            return None
+    return archives
+
+
 def main(argv=None, suffixes=ARCHIVE_SUFFIXES, noun="archives"):
     ap = argparse.ArgumentParser(description="Fail if any release archive names a build machine's folders.")
     ap.add_argument("--forbid", action="append", default=[], metavar="REGEX",
@@ -291,20 +311,9 @@ def main(argv=None, suffixes=ARCHIVE_SUFFIXES, noun="archives"):
             return 2
     patterns = [(label, re.compile(rx)) for label, rx in PATTERNS] + forbid
 
-    archives = []
-    for p in args.paths:
-        if os.path.isdir(p):
-            found = sorted(os.path.join(p, f) for f in os.listdir(p)
-                           if f.lower().endswith(suffixes) and os.path.isfile(os.path.join(p, f)))
-            if not found:
-                print("no %s in %s" % (noun, p), file=sys.stderr)
-                return 2
-            archives += found
-        elif os.path.isfile(p):
-            archives.append(p)
-        else:
-            print("no archive or folder at %s" % p, file=sys.stderr)
-            return 2
+    archives = expand_paths(args.paths, suffixes, noun)
+    if archives is None:
+        return 2
 
     bad = 0
     for a in archives:
