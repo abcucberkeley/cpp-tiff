@@ -22,7 +22,9 @@
 # pybind11-include), a bare /tmp or /tmp/<name> and a bare /var/folders, which system libraries hold, are no
 # failure. Compressed ELF sections (SHF_COMPRESSED, .zdebug_*) are searched after decompression, so compressed debug
 # information can hide nothing, and an archive inside an archive (by its name) is opened and searched the same way.
-# Archive owner names (a tar member's user and group) are listed in a note and searched by --forbid patterns only.
+# A tar member's owner or group name, other than root, is a finding too: the release's tar files are made with
+# --numeric-owner, which stores none (the build account's name had been stored with every member of the 1.8.0 Linux and
+# Mac archives' first builds); a numeric owner is searched by --forbid patterns only.
 # usage: check_release_paths.py [--forbid REGEX ...] <archive or folder> ...  (a folder means every *.whl, *.zip,
 #        *.tar, *.tar.gz and *.tgz in it, not in its subfolders)
 # exit: 0 if all is clean, 1 on any finding, 2 on bad arguments or a missing or unreadable archive
@@ -219,7 +221,7 @@ def _member_data(name, data, depth):
 
 def check_archive(path, patterns, forbid):
     """Print the findings of one archive and its summary line; return its number of findings."""
-    findings, members, notes, owners = 0, 0, [], set()
+    findings, members, notes, owners, named = 0, 0, [], set(), set()
     with open(path, "rb") as f:
         kind = _open_archive(f)
         if kind is None:
@@ -234,7 +236,15 @@ def check_archive(path, patterns, forbid):
                 notes.append("%s: %s" % (name, data.decode()))
                 continue
             if what == "owner":
-                owners.add(data.decode("utf-8", "replace"))
+                text = data.decode("utf-8", "replace")
+                owners.add(text)
+                if [n for n in text.split("/") if n and not n.isdigit() and n != "root"]:
+                    # one finding for each owner, at its first member
+                    if text not in named:
+                        named.add(text)
+                        findings += 1
+                        print("%s: %s (owner): %s is named (tar --numeric-owner stores no names)" % (path, name, text))
+                    continue
                 parts = [(name + " (owner)", data)]
                 pats = forbid
             elif what == "text":
