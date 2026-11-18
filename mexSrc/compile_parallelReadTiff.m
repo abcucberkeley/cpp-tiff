@@ -14,8 +14,11 @@ if isunix && ~ismac
         mex -outdir ../linux -output parallelReadTiff.mexa64 -v CXXOPTIMFLAGS="-DNDEBUG -O3" LDOPTIMFLAGS="-Wl',-rpath='''$ORIGIN'''' -O3 -DNDEBUG" CXXFLAGS='$CXXFLAGS -O3' LDFLAGS='$LDFLAGS -O3 -static-libstdc++' -I'../jenkinsBuild/install/include' -L'../jenkinsBuild/install/lib64' -lcppTiff parallelreadtiffmex.cpp
     end
 
-    % libstdc++ is linked in statically (as CI's build_mex.m links it), so the MEX file loads no libstdc++,
-    % neither MATLAB's nor one next to it: the release folder ships libgomp alone with the library
+    % The MEX file loads MATLAB's own libstdc++.so.6, as CI's build_mex.m's do: MATLAB's mex links -lstdc++ itself
+    % (its LINKLIBS start with it), which takes the shared libstdc++, and -static-libstdc++ only changes the one g++
+    % adds, so it takes no effect here. The MEX file needs nothing newer than GLIBCXX_3.4.21 and CXXABI_1.3.9, which
+    % MATLAB's has (R2022a to R2024a ship libstdc++ 6.0.28, with up to GLIBCXX_3.4.28; R2024b and R2025b 6.0.30), so
+    % the release folder ships libgomp alone with the library
     % The RPATH $ORIGIN alone (a Spack-built GCC adds its own lib64), kept an RPATH: a RUNPATH would let
     % MATLAB's LD_LIBRARY_PATH win over the libraries next to the MEX file
     system(['patchelf --force-rpath --set-rpath ''$ORIGIN'' ' releaseFolder '/parallelReadTiff.mexa64']);

@@ -52,8 +52,9 @@ function build_mex(installDir, outDir)
                        ['LDFLAGS=-bundle -Wl,-twolevel_namespace -isysroot ' sdk ' -Wl,-rpath,' lib], ...
                        ['LINKLIBS=-L"' fullfile(matlabroot, 'bin', 'maca64') '" -lmx -lmex -lmat -L"' lib '" -lcppTiff']}];
     else
-        % Static libstdc++ keeps the mex files independent of the older
-        % libstdc++ that MATLAB loads itself.
+        % The mex files load MATLAB's own libstdc++: mex links -lstdc++
+        % itself (its LINKLIBS start with it), which takes the shared
+        % libstdc++, and -static-libstdc++ only changes the one g++ adds.
         args = [args, {['LDFLAGS=$LDFLAGS -static-libstdc++ -Wl,-rpath,' lib], '-lcppTiff'}];
     end
 
