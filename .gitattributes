@@ -1,0 +1,8 @@
+# The license files are kept byte for byte as their authors ship them, in every checkout: a Windows checkout with
+# core.autocrlf would otherwise give them CRLF line endings, in the Windows wheels and MATLAB folder too
+/LICENSE -text
+/THIRD_PARTY_NOTICES.md -text
+/licenses/** -text
+/python/LICENSE -text
+/python/THIRD_PARTY_NOTICES.md -text
+/python/licenses/** -text

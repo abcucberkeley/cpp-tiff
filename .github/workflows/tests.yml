@@ -13,6 +13,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The wheels take their license files from python/ (setuptools takes none from outside the project folder), so
+  # python/ holds copies of the repository's own, which must not drift from them
+  license-copies:
+    name: License files in python/ match the root's
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compare the copies
+        run: cmp LICENSE python/LICENSE && cmp THIRD_PARTY_NOTICES.md python/THIRD_PARTY_NOTICES.md && diff -r licenses python/licenses
+
   cpp-python:
     name: C++ and Python (${{ matrix.name }})
     runs-on: ${{ matrix.os }}

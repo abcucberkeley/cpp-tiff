@@ -128,6 +128,10 @@ setup(
     url='https://github.com/abcucberkeley/cpp-tiff',
     author='Matthew Mueller',
     author_email='matthewmueller@berkeley.edu',
+    # License-Expression (license= would write the legacy License: field); the license files, copies of the
+    # repository's own (the CI checks they match), go to the wheel's .dist-info/licenses/
+    license_expression="BSD-3-Clause",
+    license_files=["LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/**/*"],
     packages=find_packages(),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExt} if system=="Linux" else {"build_ext": PrefixMapBuildExt},

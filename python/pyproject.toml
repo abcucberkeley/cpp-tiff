@@ -1,6 +1,7 @@
 [build-system]
 requires = [
-    "setuptools>=42",
+    # 77 is the first that takes license_expression (setup.py); older ones drop it with a warning
+    "setuptools>=77",
     "pybind11>=2.10.0",
     # Only the manylinux build container needs a pinned cmake; native mac/windows
     # agents use their own. The marker keeps this Linux-only.
